@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>API 测试 · 云逸蓝奏</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+<style>
+[x-cloak]{display:none!important}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif}
+pre{font-family:Consolas,Monaco,Menlo,monospace}
+.bg-mesh{background:#0f172a radial-gradient(at 20% 10%,rgba(59,130,246,.25) 0,transparent 50%),radial-gradient(at 80% 20%,rgba(139,92,246,.2) 0,transparent 50%)}
+</style>
+</head>
+<body class="bg-slate-50 min-h-screen" x-data="testApp()" x-init="init()" x-cloak>
+
+<header class="bg-mesh text-white p-6">
+  <div class="max-w-5xl mx-auto">
+    <h1 class="text-2xl font-bold">云逸蓝奏 · API 测试面板</h1>
+    <p class="text-slate-300 text-sm mt-1">本地测试工具 · Key 已写死</p>
+    <div class="mt-5 grid md:grid-cols-2 gap-3 text-sm">
+      <label class="block">
+        <span class="text-slate-300 text-xs">HOST</span>
+        <input x-model="host" @change="saveHost" class="mt-1 w-full px-3 py-2 rounded-lg bg-white/10 border border-white/20 text-white focus:outline-none focus:ring-2 focus:ring-blue-400">
+      </label>
+      <label class="block">
+        <span class="text-slate-300 text-xs">API KEY</span>
+        <div class="flex gap-2 mt-1">
+          <input :type="showKey?'text':'password'" :value="apiKey" readonly class="flex-1 px-3 py-2 rounded-lg bg-white/10 border border-white/20 text-white font-mono text-xs">
+          <button @click="showKey=!showKey" class="px-3 rounded-lg bg-white/10 border border-white/20 text-xs"><span x-text="showKey?'隐藏':'显示'"></span></button>
+        </div>
+      </label>
+    </div>
+    <div class="mt-4 flex items-center gap-3">
+      <button @click="testConn" class="px-4 py-2 rounded-lg bg-blue-500 hover:bg-blue-600 text-white text-sm font-medium">连通性测试</button>
+      <span x-show="connStatus" :class="connOk?'text-green-400':'text-red-400'" class="text-xs" x-text="connStatus"></span>
+    </div>
+  </div>
+</header>
+
+<div x-show="showCorsWarning" class="max-w-5xl mx-auto mt-4 px-4">
+  <div class="p-4 rounded-lg bg-amber-50 border border-amber-200 text-amber-900 text-sm">
+    <div class="font-bold mb-1">⚠️ 检测到 file:// 协议，可能被 CORS 拦截</div>
+    <p class="text-xs leading-relaxed">如果"连通性测试"失败，说明浏览器拦了跨域。解决办法任选：</p>
+    <ol class="list-decimal list-inside mt-2 space-y-1 text-xs">
+      <li>把这个文件放到服务器 <code class="bg-white px-1 rounded">public/admin/test.html</code>，访问 <code class="bg-white px-1 rounded" x-text="host+'/admin/test.html'"></code></li>
+      <li>用 Chrome 禁用安全策略启动：<code class="bg-white px-1 rounded text-xs">chrome --disable-web-security --user-data-dir=C:/tmp/cors</code></li>
+    </ol>
+  </div>
+</div>
+
+<nav class="max-w-5xl mx-auto mt-6 px-4">
+  <div class="flex gap-1 bg-white rounded-lg p-1 shadow-sm border border-slate-200">
+    <template x-for="t in tabs" :key="t.key">
+      <button @click="tab=t.key" :class="tab===t.key?'bg-blue-600 text-white':'text-slate-600 hover:bg-slate-100'" class="flex-1 px-4 py-2 rounded text-sm font-medium transition" x-text="t.label"></button>
+    </template>
+  </div>
+</nav>
+
+<main class="max-w-5xl mx-auto p-4 space-y-4">
+
+<section x-show="tab==='me'">
+  <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-100">
+    <h2 class="font-bold text-lg mb-1">查看 Key 配额</h2>
+    <p class="text-xs text-slate-500 mb-4"><code>GET /api/v1/me</code></p>
+    <button @click="callMe" :disabled="busy" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm disabled:opacity-60"><span x-show="!busy">发起请求</span><span x-show="busy">请求中...</span></button>
+    <pre x-show="result.me" class="mt-4 p-4 bg-slate-900 text-slate-100 rounded-lg text-xs overflow-x-auto" x-text="pretty(result.me)"></pre>
+  </div>
+</section>
+
+<section x-show="tab==='search'">
+  <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-100">
+    <h2 class="font-bold text-lg mb-1">搜索资源</h2>
+    <p class="text-xs text-slate-500 mb-4"><code>GET /api/v1/search</code></p>
+    <div class="flex gap-2 mb-4">
+      <input x-model="searchQ" @keydown.enter="callSearch" placeholder="关键词（空=全部）" class="flex-1 px-3 py-2 rounded-lg border border-slate-200 text-sm focus:ring-2 focus:ring-blue-400 focus:border-transparent outline-none">
+      <input type="number" x-model.number="searchPageSize" min="1" max="100" class="w-20 px-3 py-2 rounded-lg border border-slate-200 text-sm" title="每页数量">
+      <button @click="callSearch" :disabled="busy" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm disabled:opacity-60">搜索</button>
+    </div>
+    <template x-if="result.search">
+      <div>
+        <div class="text-xs text-slate-500 mb-2" x-text="'共 '+(result.search.total||0)+' 条 · 本页 '+((result.search.items||[]).length)+' 条'"></div>
+        <div class="border border-slate-200 rounded-lg overflow-hidden">
+          <table class="w-full text-sm">
+            <thead class="bg-slate-50 text-xs text-slate-500"><tr><th class="p-2 text-left">ID</th><th class="p-2 text-left">文件名</th><th class="p-2">大小</th><th class="p-2">来源</th><th class="p-2 text-right">操作</th></tr></thead>
+            <tbody class="divide-y divide-slate-100">
+              <template x-for="r in (result.search.items||[])" :key="r.id">
+                <tr class="hover:bg-slate-50">
+                  <td class="p-2 text-slate-500" x-text="r.id"></td>
+                  <td class="p-2 font-medium max-w-xs truncate" :title="r.file_name" x-text="r.file_name"></td>
+                  <td class="p-2 text-center text-slate-500 text-xs" x-text="r.file_size"></td>
+                  <td class="p-2 text-center text-slate-500 text-xs" x-text="r.source"></td>
+                  <td class="p-2 text-right space-x-2">
+                    <button @click="detailId=r.id;tab='detail';callDetail()" class="text-blue-600 text-xs">详情</button>
+                    <button @click="linkId=r.id;tab='link';callLink()" class="text-indigo-600 text-xs">取直链</button>
+                  </td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </template>
+  </div>
+</section>
+
+<section x-show="tab==='detail'">
+  <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-100">
+    <h2 class="font-bold text-lg mb-1">资源详情</h2>
+    <p class="text-xs text-slate-500 mb-4"><code>GET /api/v1/resources/:id</code></p>
+    <div class="flex gap-2 mb-4">
+      <input type="number" x-model.number="detailId" placeholder="资源 ID" class="w-40 px-3 py-2 rounded-lg border border-slate-200 text-sm">
+      <button @click="callDetail" :disabled="busy" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm disabled:opacity-60">查询</button>
+    </div>
+    <pre x-show="result.detail" class="p-4 bg-slate-900 text-slate-100 rounded-lg text-xs overflow-x-auto" x-text="pretty(result.detail)"></pre>
+  </div>
+</section>
+
+<section x-show="tab==='link'">
+  <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-100">
+    <h2 class="font-bold text-lg mb-1">换取直链</h2>
+    <p class="text-xs text-slate-500 mb-4"><code>GET /api/v1/resources/:id/link</code></p>
+    <div class="flex gap-2 mb-4">
+      <input type="number" x-model.number="linkId" placeholder="资源 ID" class="w-40 px-3 py-2 rounded-lg border border-slate-200 text-sm">
+      <button @click="callLink" :disabled="busy" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm disabled:opacity-60"><span x-show="!busy">解析</span><span x-show="busy">解析中...</span></button>
+    </div>
+    <template x-if="result.link && result.link.url">
+      <div class="mb-3 space-y-3">
+        <div class="p-4 bg-slate-50 border border-slate-200 rounded-lg">
+          <div class="text-xs text-slate-500 mb-1">直链</div>
+          <div class="font-mono text-xs text-slate-700 break-all" x-text="result.link.url"></div>
+        </div>
+        <div class="flex gap-2">
+          <button @click="copyLink" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm">复制</button>
+          <a :href="result.link.url" target="_blank" rel="noopener" class="px-4 py-2 rounded-lg border border-slate-200 text-sm">新窗打开</a>
+        </div>
+      </div>
+    </template>
+    <pre x-show="result.link" class="p-4 bg-slate-900 text-slate-100 rounded-lg text-xs overflow-x-auto" x-text="pretty(result.link)"></pre>
+  </div>
+</section>
+
+<section x-show="tab==='batch'">
+  <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-100">
+    <h2 class="font-bold text-lg mb-1">批量解析前 N 条</h2>
+    <p class="text-xs text-slate-500 mb-4">先 search 再循环 link，每条间隔 500ms</p>
+    <div class="flex flex-wrap gap-2 mb-4">
+      <input type="number" x-model.number="batchN" min="1" max="30" class="w-20 px-3 py-2 rounded-lg border border-slate-200 text-sm" title="数量">
+      <input x-model="batchQ" placeholder="关键词（空=全部）" class="flex-1 min-w-[140px] px-3 py-2 rounded-lg border border-slate-200 text-sm">
+      <button @click="callBatch" :disabled="batchRunning" class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-sm disabled:opacity-60"><span x-show="!batchRunning">开始</span><span x-show="batchRunning" x-text="'解析中 '+batchDone+'/'+batchTotal"></span></button>
+      <button x-show="batchRunning" @click="batchCanceled=true" class="px-3 py-2 rounded-lg border border-red-200 text-red-600 text-sm">停止</button>
+    </div>
+    <div x-show="batchRunning || batchRows.length>0">
+      <div class="h-2 bg-slate-200 rounded-full overflow-hidden mb-3">
+        <div class="h-full bg-gradient-to-r from-blue-500 to-indigo-500 transition-all" :style="'width:'+(batchTotal?batchDone/batchTotal*100:0)+'%'"></div>
+      </div>
+      <div class="text-xs text-slate-600 mb-2">成功 <span class="text-green-600 font-medium" x-text="batchSuccess"></span> · 失败 <span class="text-red-500 font-medium" x-text="batchFailed"></span> · 共 <span x-text="batchTotal"></span></div>
+      <div class="border border-slate-200 rounded-lg max-h-96 overflow-auto">
+        <table class="w-full text-xs">
+          <thead class="bg-slate-50 text-slate-500 sticky top-0"><tr><th class="p-2 text-left">ID</th><th class="p-2 text-left">文件名</th><th class="p-2">耗时</th><th class="p-2 text-left">结果</th></tr></thead>
+          <tbody class="divide-y divide-slate-100">
+            <template x-for="r in batchRows" :key="r.id">
+              <tr>
+                <td class="p-2 text-slate-500" x-text="r.id"></td>
+                <td class="p-2 max-w-sm truncate" x-text="r.name"></td>
+                <td class="p-2 text-center text-slate-500" x-text="r.ms+'ms'"></td>
+                <td class="p-2">
+                  <span x-show="r.ok===true" class="text-green-600">✓</span>
+                  <span x-show="r.ok===false" :title="r.err" class="text-red-500">✗ <span class="ml-1 text-slate-500" x-text="(r.err||'').slice(0,60)"></span></span>
+                  <span x-show="r.ok===undefined" class="text-slate-300">...</span>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<div x-show="toast" x-transition class="fixed top-6 right-6 z-50 px-5 py-3 rounded-lg shadow-xl bg-slate-800 text-white text-sm" x-text="toast"></div>
+
+<script>
+function testApp(){
+  return {
+    apiKey:'lhk_uLv6kAaoPV8241jlyddWlsb12Qyqw0JwpfVSk4fK',
+    host:'https://ku.hstudy.xyz',
+    showKey:false, showCorsWarning:false, tab:'me', busy:false, toast:'',
+    connStatus:'', connOk:false,
+    tabs:[{key:'me',label:'配额'},{key:'search',label:'搜索'},{key:'detail',label:'详情'},{key:'link',label:'直链'},{key:'batch',label:'批量'}],
+    searchQ:'', searchPageSize:20, detailId:null, linkId:null,
+    batchQ:'', batchN:5, batchRunning:false, batchCanceled:false,
+    batchRows:[], batchDone:0, batchTotal:0, batchSuccess:0, batchFailed:0,
+    result:{me:null,search:null,detail:null,link:null},
+    init(){
+      this.showCorsWarning = location.protocol==='file:';
+      const s=localStorage.getItem('lrh_test_host'); if(s) this.host=s;
+    },
+    saveHost(){ localStorage.setItem('lrh_test_host', this.host); },
+    notify(m){ this.toast=m; setTimeout(()=>this.toast='',2500); },
+    pretty(o){ try{return JSON.stringify(o,null,2)}catch(e){return String(o)} },
+    async api(path, params){
+      const qs = params ? '?'+new URLSearchParams(params) : '';
+      const url = this.host.replace(/\/$/,'') + path + qs;
+      const r = await fetch(url, { headers:{'X-Api-Key':this.apiKey} });
+      let body; try{ body = await r.json(); }catch(e){ body={}; }
+      return { status:r.status, ok:r.ok, body };
+    },
+    async testConn(){
+      this.connStatus='请求中...'; this.connOk=false;
+      try{
+        const r = await this.api('/api/v1/me');
+        if(r.ok){ this.connOk=true; this.connStatus='✓ 连接成功 ('+(r.body.name||'-')+')'; }
+        else{ this.connStatus='✗ HTTP '+r.status+' '+(r.body.message||''); }
+      }catch(e){ this.connStatus='✗ '+e.message+'（可能是 CORS）'; }
+    },
+    async callMe(){
+      this.busy=true;
+      try{ const r=await this.api('/api/v1/me'); this.result.me=r.body; }
+      catch(e){ this.result.me={error:e.message}; this.notify('失败: '+e.message); }
+      finally{ this.busy=false; }
+    },
+    async callSearch(){
+      this.busy=true;
+      try{ const r=await this.api('/api/v1/search',{q:this.searchQ,page:1,pageSize:this.searchPageSize}); this.result.search=r.body; }
+      catch(e){ this.notify('失败: '+e.message); }
+      finally{ this.busy=false; }
+    },
+    async callDetail(){
+      if(!this.detailId){ this.notify('先填资源 ID'); return; }
+      this.busy=true;
+      try{ const r=await this.api('/api/v1/resources/'+this.detailId); this.result.detail=r.body; }
+      catch(e){ this.notify('失败: '+e.message); }
+      finally{ this.busy=false; }
+    },
+    async callLink(){
+      if(!this.linkId){ this.notify('先填资源 ID'); return; }
+      this.busy=true;
+      try{ const r=await this.api('/api/v1/resources/'+this.linkId+'/link'); this.result.link=r.body; }
+      catch(e){ this.result.link={error:e.message}; this.notify('失败: '+e.message); }
+      finally{ this.busy=false; }
+    },
+    async copyLink(){
+      const url=this.result.link&&this.result.link.url; if(!url) return;
+      try{
+        if(navigator.clipboard&&window.isSecureContext){ await navigator.clipboard.writeText(url); }
+        else{ const ta=document.createElement('textarea'); ta.value=url; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); }
+        this.notify('已复制');
+      }catch(e){ this.notify('复制失败'); }
+    },
+    async callBatch(){
+      this.batchRunning=true; this.batchCanceled=false;
+      this.batchRows=[]; this.batchDone=0; this.batchSuccess=0; this.batchFailed=0;
+      try{
+        const sr = await this.api('/api/v1/search',{q:this.batchQ,page:1,pageSize:this.batchN});
+        const items = (sr.body&&sr.body.items)||[];
+        this.batchTotal = items.length;
+        this.batchRows = items.map(it=>({id:it.id,name:it.file_name,ms:0,ok:undefined,err:''}));
+        for(let i=0;i<items.length;i++){
+          if(this.batchCanceled) break;
+          const row = this.batchRows[i];
+          const t0 = Date.now();
+          try{
+            const r = await this.api('/api/v1/resources/'+row.id+'/link');
+            row.ms = Date.now()-t0;
+            if(r.ok){ row.ok=true; this.batchSuccess++; }
+            else{ row.ok=false; row.err=(r.body.message||'HTTP '+r.status)+' '+(r.body.detail||''); this.batchFailed++; }
+          }catch(e){ row.ms=Date.now()-t0; row.ok=false; row.err=e.message; this.batchFailed++; }
+          this.batchDone++;
+          await new Promise(res=>setTimeout(res,500));
+        }
+      } finally { this.batchRunning=false; }
+    }
+  };
+}
+</script>
+</body>
+</html>
