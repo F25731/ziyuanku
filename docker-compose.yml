@@ -1,0 +1,88 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: lrh-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: lanzou_hub
+      MYSQL_USER: lanzou_hub
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-time-zone=+08:00
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+    networks: [internal]
+
+  redis:
+    image: redis:7-alpine
+    container_name: lrh-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks: [internal]
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: lanzou-resource-hub:latest
+    container_name: lrh-app
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      TZ: Asia/Shanghai
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: lanzou_hub
+      DB_USER: lanzou_hub
+      DB_PASSWORD: ${DB_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ""
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRES_IN: 7d
+      ADMIN_INIT_USERNAME: ${ADMIN_INIT_USERNAME:-admin}
+      ADMIN_INIT_PASSWORD: ${ADMIN_INIT_PASSWORD:-Admin@123456}
+      LINK_CACHE_TTL: ${LINK_CACHE_TTL:-1800}
+      API_RATE_LIMIT_PER_MIN: ${API_RATE_LIMIT_PER_MIN:-60}
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    volumes:
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://127.0.0.1:3000/healthz',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))\""]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks: [internal]
+
+volumes:
+  mysql_data:
+  redis_data:
+
+networks:
+  internal:
+    driver: bridge
