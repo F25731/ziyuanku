@@ -11,7 +11,7 @@ const {
   searchResources, listResources, deleteResource
 } = require('../services/resourceService');
 const {
-  createApiKey, listApiKeys, disableApiKey, enableApiKey, deleteApiKey
+  createApiKey, updateApiKey, listApiKeys, disableApiKey, enableApiKey, deleteApiKey
 } = require('../services/apiKeyService');
 
 const router = express.Router();
@@ -175,6 +175,12 @@ router.post('/api-keys', adminRequired, asyncHandler(async (req, res) => {
     ownerUserId: req.user.id
   });
   res.json({ code: 200, message: '创建成功', item });
+}));
+
+router.patch('/api-keys/:id', adminRequired, asyncHandler(async (req, res) => {
+  const item = await updateApiKey(Number(req.params.id), req.body || {});
+  if (!item) return res.status(404).json({ code: 404, message: 'Key 不存在' });
+  res.json({ code: 200, message: '更新成功', item });
 }));
 
 router.post('/api-keys/:id/disable', adminRequired, asyncHandler(async (req, res) => {

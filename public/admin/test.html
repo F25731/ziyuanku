@@ -89,7 +89,7 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
                 <tr class="hover:bg-slate-50">
                   <td class="p-2 text-slate-500" x-text="r.id"></td>
                   <td class="p-2 font-medium max-w-xs truncate" :title="r.file_name" x-text="r.file_name"></td>
-                  <td class="p-2 text-center text-slate-500 text-xs" x-text="r.file_size"></td>
+                  <td class="p-2 text-center text-slate-500 text-xs" x-text="fmtSize(r.file_size)"></td>
                   <td class="p-2 text-center text-slate-500 text-xs" x-text="r.source"></td>
                   <td class="p-2 text-right space-x-2">
                     <button @click="detailId=r.id;tab='detail';callDetail()" class="text-blue-600 text-xs">详情</button>
@@ -202,6 +202,17 @@ function testApp(){
     saveHost(){ localStorage.setItem('lrh_test_host', this.host); },
     notify(m){ this.toast=m; setTimeout(()=>this.toast='',2500); },
     pretty(o){ try{return JSON.stringify(o,null,2)}catch(e){return String(o)} },
+    fmtSize(raw){
+      if(raw==null) return '';
+      const s=String(raw).trim(); if(!s) return '';
+      const m=s.match(/^([\d.]+)\s*([a-zA-Z]+)/);
+      if(m){ let u=m[2].toUpperCase(); if(/^[KMGT]$/.test(u)) u+='B'; return m[1]+' '+u; }
+      const kb=Number(s); if(!isFinite(kb)||kb<0) return s;
+      const U=['KB','MB','GB','TB']; let v=kb,i=0;
+      while(v>=1024&&i<U.length-1){ v/=1024; i++; }
+      const d=v>=100?0:(v>=10?1:2);
+      return v.toFixed(d)+' '+U[i];
+    },
     async api(path, params){
       const qs = params ? '?'+new URLSearchParams(params) : '';
       const url = this.host.replace(/\/$/,'') + path + qs;

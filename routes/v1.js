@@ -4,6 +4,7 @@ const { apiKeyRequired } = require('../middleware/apiKeyAuth');
 const { searchResources, getResource } = require('../services/resourceService');
 const { resolve: resolveLink } = require('../services/linkResolver');
 const { getDailyUsage } = require('../services/apiKeyService');
+const { formatFileSize } = require('../utils/fileSize');
 
 const router = express.Router();
 
@@ -28,6 +29,7 @@ router.get('/search', asyncHandler(async (req, res) => {
       file_id: r.file_id,
       file_name: r.file_name,
       file_size: r.file_size,
+      file_size_human: formatFileSize(r.file_size),
       file_type: r.file_type,
       file_time: r.file_time,
       has_share_url: !!r.share_url
@@ -49,6 +51,7 @@ router.get('/resources/:id', asyncHandler(async (req, res) => {
       file_id: r.file_id,
       file_name: r.file_name,
       file_size: r.file_size,
+      file_size_human: formatFileSize(r.file_size),
       file_type: r.file_type,
       file_time: r.file_time,
       share_url: r.share_url || '',
@@ -74,6 +77,7 @@ router.get('/resources/:id/link', asyncHandler(async (req, res) => {
       message: 'ok',
       file_name: r.file_name,
       file_size: r.file_size,
+      file_size_human: formatFileSize(r.file_size),
       url,
       expire_at,
       cached,

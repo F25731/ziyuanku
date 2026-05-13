@@ -119,8 +119,41 @@ async function getDailyUsage(apiKeyId) {
   return Number(row.total || 0);
 }
 
+// 只允许改非敏感字段：key_prefix / key_hash 永远不动
+async function updateApiKey(id, payload) {
+  const map = {
+    name: 'name',
+    dailyLimit: 'daily_limit',
+    totalLimit: 'total_limit',
+    ratePerMin: 'rate_per_min',
+    remark: 'remark',
+    expireAt: 'expire_at',
+    status: 'status'
+  };
+  const fields = [];
+  const values = [];
+  for (const k of Object.keys(map)) {
+    if (payload[k] !== undefined) {
+      let v = payload[k];
+      if (['dailyLimit', 'totalLimit', 'ratePerMin', 'status'].includes(k)) v = Number(v) || 0;
+      if (k === 'expireAt' && (v === '' || v === null)) v = null;
+      fields.push(`${map[k]} = ?`);
+      values.push(v);
+    }
+  }
+  if (fields.length === 0) {
+    const [rows] = await pool.query('SELECT * FROM api_keys WHERE id = ? LIMIT 1', [id]);
+    return rows[0] || null;
+  }
+  values.push(id);
+  await pool.query(`UPDATE api_keys SET ${fields.join(', ')} WHERE id = ?`, values);
+  const [rows] = await pool.query('SELECT * FROM api_keys WHERE id = ? LIMIT 1', [id]);
+  return rows[0] || null;
+}
+
 module.exports = {
   createApiKey,
+  updateApiKey,
   listApiKeys,
   verifyPlainKey,
   disableApiKey,

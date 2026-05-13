@@ -10,6 +10,26 @@ const ICON = {
 
 function getToken() { return localStorage.getItem('lrh_token') || ''; }
 
+// 格式化蓝奏的文件大小：纯数字按 KB 处理；已带单位则规范化
+function formatFileSize(raw) {
+  if (raw == null) return '';
+  const s = String(raw).trim();
+  if (!s) return '';
+  const m = s.match(/^([\d.]+)\s*([a-zA-Z]+)/);
+  if (m) {
+    let unit = m[2].toUpperCase();
+    if (/^[KMGT]$/.test(unit)) unit += 'B';
+    return m[1] + ' ' + unit;
+  }
+  const kb = Number(s);
+  if (!isFinite(kb) || kb < 0) return s;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let v = kb, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  const digits = v >= 100 ? 0 : (v >= 10 ? 1 : 2);
+  return v.toFixed(digits) + ' ' + units[i];
+}
+
 async function api(path, options = {}) {
   const opts = {
     method: options.method || 'GET',
@@ -58,6 +78,7 @@ async function api(path, options = {}) {
 function dashboard() {
   return {
     tab: 'dashboard',
+    formatSize: formatFileSize,
     currentUser: { username: '-' },
     navs: [
       { key: 'dashboard', label: '仪表盘', desc: '资源库运行总览', icon: ICON.dashboard },
@@ -91,7 +112,9 @@ function dashboard() {
     busyTasks: [],
 
     sourceModal: { open: false, title: '', provider: 'ilanzou', loginType: 'account', account: '', passwordText: '', cookieText: '', rootFolderId: '0', remark: '' },
+    sourceEditModal: { open: false, id: null, title: '', account: '', passwordText: '', rootFolderId: '0', remark: '', status: 1 },
     keyModal: { open: false, name: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', result: '' },
+    keyEditModal: { open: false, id: null, name: '', key_prefix: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', expireAt: '' },
     linkModal: { open: false, fileName: '', url: '', expireText: '', cached: false, loading: false, error: '', detail: '' },
     errorModal: { open: false, title: '', message: '', detail: '' },
     batchResolve: { running: false, total: 0, done: 0, success: 0, failed: 0, canceled: false, summary: false, sources: 0 },
@@ -246,6 +269,33 @@ function dashboard() {
         this.loadSources();
       } catch (e) { this.showError('保存失败', e); }
     },
+    openSourceEditModal(s) {
+      this.sourceEditModal = {
+        open: true, id: s.id,
+        title: s.title || '',
+        account: s.account || '',
+        passwordText: '',
+        rootFolderId: s.root_folder_id || '0',
+        remark: s.remark || '',
+        status: s.status ? 1 : 0
+      };
+    },
+    async saveSourceEdit() {
+      const m = this.sourceEditModal;
+      const body = {
+        title: m.title,
+        rootFolderId: m.rootFolderId,
+        remark: m.remark,
+        status: m.status
+      };
+      if (m.passwordText && m.passwordText.trim()) body.passwordText = m.passwordText;
+      try {
+        await api('/sources/' + m.id, { method: 'PATCH', body });
+        this.sourceEditModal.open = false;
+        this.notify('已保存');
+        this.loadSources();
+      } catch (e) { this.showError('保存失败', e); }
+    },
     async syncSource(id, mode) {
       mode = mode || 'incremental';
       const src = this.sources.find((s) => s.id === id);
@@ -385,6 +435,40 @@ function dashboard() {
         this.keyModal.result = d.item.plain_key;
         this.notify('已签发');
       } catch (e) { this.showError('签发失败', e); }
+    },
+    openKeyEditModal(k) {
+      // 把 MySQL datetime 转成 input[type=datetime-local] 能用的 YYYY-MM-DDTHH:MM
+      let exp = '';
+      if (k.expire_at) {
+        exp = String(k.expire_at).replace(' ', 'T').slice(0, 16);
+      }
+      this.keyEditModal = {
+        open: true, id: k.id,
+        name: k.name || '',
+        key_prefix: k.key_prefix || '',
+        dailyLimit: Number(k.daily_limit || 0),
+        totalLimit: Number(k.total_limit || 0),
+        ratePerMin: Number(k.rate_per_min || 60),
+        remark: k.remark || '',
+        expireAt: exp
+      };
+    },
+    async saveKeyEdit() {
+      const m = this.keyEditModal;
+      const body = {
+        name: m.name,
+        dailyLimit: m.dailyLimit,
+        totalLimit: m.totalLimit,
+        ratePerMin: m.ratePerMin,
+        remark: m.remark,
+        expireAt: m.expireAt ? m.expireAt.replace('T', ' ') + ':00' : null
+      };
+      try {
+        await api('/api-keys/' + m.id, { method: 'PATCH', body });
+        this.keyEditModal.open = false;
+        this.notify('已保存');
+        this.loadApiKeys();
+      } catch (e) { this.showError('保存失败', e); }
     },
     async toggleKey(id, op) {
       await api('/api-keys/' + id + '/' + op, { method: 'POST' });
