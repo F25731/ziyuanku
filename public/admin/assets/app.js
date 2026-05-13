@@ -94,7 +94,7 @@ function dashboard() {
     keyModal: { open: false, name: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', result: '' },
     linkModal: { open: false, fileName: '', url: '', expireText: '', cached: false, loading: false, error: '', detail: '' },
     errorModal: { open: false, title: '', message: '', detail: '' },
-    batchResolve: { running: false, total: 0, done: 0, success: 0, failed: 0, canceled: false, summary: false },
+    batchResolve: { running: false, total: 0, done: 0, success: 0, failed: 0, canceled: false, summary: false, sources: 0 },
     toast: { msg: '', type: '' },
 
     docs: window.LRH_DOCS || { endpoints: [], examples: {}, errors: [], notes: [] },
@@ -294,39 +294,77 @@ function dashboard() {
     async batchResolveCurrentPage() {
       const items = this.resList.items || [];
       if (!items.length) { this.notify('本页没有资源', 'error'); return; }
-      this.batchResolve = { running: true, total: items.length, done: 0, success: 0, failed: 0, canceled: false, summary: false };
-      const taskId = this.startTask('批量解析本页 (' + items.length + ')');
-      try {
-        for (const r of items) {
-          if (this.batchResolve.canceled) break;
-          r._linkLoading = true;
-          r._linkOk = undefined;
-          r._linkError = '';
-          const t0 = Date.now();
-          try {
-            await api('/resources/' + r.id + '/link', { timeout: 60000 });
-            r._linkOk = true;
-            r._linkMs = Date.now() - t0;
-            this.batchResolve.success++;
-          } catch (e) {
-            r._linkOk = false;
-            r._linkError = e.message || '解析失败';
-            this.batchResolve.failed++;
-          } finally {
-            r._linkLoading = false;
-            this.batchResolve.done++;
-          }
-          // 友好的节流，避免蓝奏风控
-          await new Promise(res => setTimeout(res, 400));
+
+      // 按 source_id 分组：组间并行（多账号轮询），组内串行（单账号信号量天然限制）
+      const groups = {};
+      for (const r of items) {
+        const k = r.source_id || 0;
+        (groups[k] = groups[k] || []).push(r);
+      }
+      const groupCount = Object.keys(groups).length;
+      const tasks = Object.values(groups);
+
+      this.batchResolve = {
+        running: true,
+        total: items.length,
+        done: 0,
+        success: 0,
+        failed: 0,
+        canceled: false,
+        summary: false,
+        sources: groupCount
+      };
+      const taskId = this.startTask(`批量解析 ${items.length} 条 (${groupCount} 个来源并行)`);
+
+      const runOne = async (r) => {
+        if (this.batchResolve.canceled) return;
+        r._linkLoading = true;
+        r._linkOk = undefined;
+        r._linkError = '';
+        const t0 = Date.now();
+        try {
+          await api('/resources/' + r.id + '/link', { timeout: 60000 });
+          r._linkOk = true;
+          r._linkMs = Date.now() - t0;
+          this.batchResolve.success++;
+        } catch (e) {
+          r._linkOk = false;
+          r._linkError = e.message || '解析失败';
+          this.batchResolve.failed++;
+        } finally {
+          r._linkLoading = false;
+          this.batchResolve.done++;
         }
+      };
+
+      // 每组（账号）一个 worker 串行处理；组间并行；组内由后端 semaphore 再保险
+      const workers = tasks.map(async (group) => {
+        for (const r of group) {
+          if (this.batchResolve.canceled) break;
+          await runOne(r);
+        }
+      });
+
+      try {
+        await Promise.all(workers);
         const msg = this.batchResolve.canceled
           ? `已停止（成功 ${this.batchResolve.success}，失败 ${this.batchResolve.failed}）`
-          : `解析完成：成功 ${this.batchResolve.success}，失败 ${this.batchResolve.failed}`;
+          : `解析完成：成功 ${this.batchResolve.success}，失败 ${this.batchResolve.failed}（${groupCount} 个来源并行）`;
         this.notify(msg);
       } finally {
         this.batchResolve.running = false;
         this.batchResolve.summary = true;
         this.endTask(taskId);
+      }
+    },
+
+    async unlockSource(id) {
+      try {
+        await api('/sources/' + id + '/unlock-cooldown', { method: 'POST' });
+        this.notify('已解除冷却');
+        this.loadSources();
+      } catch (e) {
+        this.showError('解冻失败', e);
       }
     },
 

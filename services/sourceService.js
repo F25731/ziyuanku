@@ -1,5 +1,12 @@
 const { pool } = require('../config/db');
 const HttpError = require('../utils/httpError');
+const { getHealth, clearCooldown } = require('./rateLimiter');
+
+function accountKeyOf(source) {
+  if (!source) return null;
+  if (source.provider === 'ilanzou' && source.account) return 'ilanzou:' + source.account;
+  return null;
+}
 
 async function listSources() {
   const [rows] = await pool.query(
@@ -9,7 +16,13 @@ async function listSources() {
             status, last_check_at, last_sync_at, remark, created_at, updated_at
        FROM sources ORDER BY id DESC`
   );
-  return rows;
+  // 并行查每个账号的健康状态（Redis 操作很快）
+  const enriched = await Promise.all(rows.map(async (s) => {
+    const key = accountKeyOf(s);
+    const health = key ? await getHealth(key) : null;
+    return { ...s, health };
+  }));
+  return enriched;
 }
 
 async function getSource(id) {
@@ -77,4 +90,13 @@ async function deleteSource(id) {
   await pool.query('DELETE FROM sources WHERE id = ?', [id]);
 }
 
-module.exports = { listSources, getSource, saveSource, updateSource, deleteSource };
+async function unlockSource(id) {
+  const source = await getSource(id);
+  if (!source) throw new HttpError(404, '来源不存在');
+  const key = accountKeyOf(source);
+  if (!key) throw new HttpError(400, '该来源没有可解冻的账号 key');
+  await clearCooldown(key);
+  return { accountKey: key };
+}
+
+module.exports = { listSources, getSource, saveSource, updateSource, deleteSource, unlockSource };

@@ -2,7 +2,7 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const { LanZouYClient } = require('@netdrive-sdk/ilanzou');
 const { getRedis } = require('../config/redis');
-const { guarded } = require('./rateLimiter');
+const { guarded, guardedWithRetry } = require('./rateLimiter');
 
 const UA_PC = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const LANZOU_HOSTS = ['lanzou', 'lanzoux', 'lanzoui', 'lanzouw', 'lanzouj', 'lanzouf', 'lanzoup', 'lanzouq', 'lanzouv', 'lanzouy', 'woozooo'];
@@ -96,11 +96,11 @@ async function resolveByIlanzouAccount(resource) {
 
   let direct;
   try {
-    direct = await guarded(accountKey, 'downloadFile',
-      () => withTimeout(client.downloadFile(String(resource.file_id), true), 30000, 'downloadFile')
+    direct = await guardedWithRetry(accountKey, 'downloadFile',
+      () => withTimeout(client.downloadFile(String(resource.file_id), true), 30000, 'downloadFile'),
+      { maxRetries: 2, baseBackoffMs: 800 }
     );
   } catch (err) {
-    // 登录失效时让下次重建 client
     if (/token|未登录|login/i.test(err.message || '')) invalidateClient(resource.source_account);
     throw new Error('downloadFile 调用异常: ' + (err.message || err));
   }

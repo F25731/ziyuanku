@@ -89,21 +89,44 @@ function withTimeout(promise, ms, label) {
   ]);
 }
 
+// 带指数退避的调用：网络错/超时 重试；风控/冷却 不重试
+async function callWithRetry(accountId, op, fn, maxRetries = 2) {
+  let lastErr;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      await acquire(accountId, op);
+    } catch (err) {
+      // 冷却 / 超配额直接抛，不重试
+      throw err;
+    }
+    try {
+      const r = await fn();
+      if (looksRateLimited(r)) {
+        await cooldown(accountId, 600);
+        throw new Error('风控触发: ' + JSON.stringify(r));
+      }
+      return r;
+    } catch (err) {
+      lastErr = err;
+      if (err.code === 'COOLDOWN' || err.code === 'RATE_LIMITED') throw err;
+      if (/风控|封|频繁|限制/.test(err.message || '')) throw err;
+      if (attempt >= maxRetries) throw err;
+      const wait = 800 * Math.pow(3, attempt) + rand(400);
+      await new Promise((res) => setTimeout(res, wait));
+    }
+  }
+  throw lastErr;
+}
+
 async function safeShareUrl(client, accountId, fileId) {
   try {
-    await acquire(accountId, 'shareUrl');
-  } catch (err) {
-    if (err.code === 'COOLDOWN') throw err; // 冷却期直接停，上层捕获
-    return '';
-  }
-  try {
-    const res = await withTimeout(client.shareUrl(String(fileId || '')), 12000, 'shareUrl');
-    if (looksRateLimited(res)) {
-      await cooldown(accountId, 600);
-      return '';
-    }
+    const res = await callWithRetry(accountId, 'shareUrl',
+      () => withTimeout(client.shareUrl(String(fileId || '')), 12000, 'shareUrl'),
+      1 // 单文件失败不要重试太多次，快速跳过
+    );
     return String((res && res.shareUrl) || '').trim();
-  } catch (_) {
+  } catch (err) {
+    if (err.code === 'COOLDOWN') throw err;
     return '';
   }
 }
@@ -130,9 +153,9 @@ async function fetchAllInFolder(ctx, folderId) {
   const limit = 100;
   let offset = 1;
   while (true) {
-    await acquire(ctx.accountId, 'getFileList');
-    const res = await withTimeout(
-      ctx.client.getFileList({ folderId, limit, offset }), 15000, `getFileList(${folderId})`
+    const res = await callWithRetry(ctx.accountId, 'getFileList',
+      () => withTimeout(ctx.client.getFileList({ folderId, limit, offset }), 15000, `getFileList(${folderId})`),
+      2
     );
     if (!res || res.code !== 200) {
       if (looksRateLimited(res)) {

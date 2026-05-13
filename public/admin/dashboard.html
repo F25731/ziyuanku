@@ -179,7 +179,7 @@
         <div class="mb-4"><button @click="openSourceModal()" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium">+ 新增来源</button></div>
         <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
           <table class="w-full text-sm">
-            <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="px-4 py-3 text-left">标题</th><th class="px-4 py-3">类型</th><th class="px-4 py-3">账号</th><th class="px-4 py-3">最后同步</th><th class="px-4 py-3">状态</th><th class="px-4 py-3 text-right">操作</th></tr></thead>
+            <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="px-4 py-3 text-left">标题</th><th class="px-4 py-3">类型</th><th class="px-4 py-3">账号</th><th class="px-4 py-3">最后同步</th><th class="px-4 py-3">状态</th><th class="px-4 py-3">健康</th><th class="px-4 py-3 text-right">操作</th></tr></thead>
             <tbody class="divide-y divide-slate-100">
               <template x-for="s in sources" :key="s.id">
                 <tr class="hover:bg-slate-50">
@@ -188,6 +188,23 @@
                   <td class="px-4 py-3 text-center text-slate-500" x-text="s.account || '-'"></td>
                   <td class="px-4 py-3 text-center text-slate-500 text-xs" x-text="s.last_sync_at || '-'"></td>
                   <td class="px-4 py-3 text-center"><span :class="s.status ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-500'" class="px-2 py-0.5 rounded text-xs" x-text="s.status ? '启用' : '禁用'"></span></td>
+                  <td class="px-4 py-3 text-center">
+                    <template x-if="s.health && s.health.status === 'cooldown'">
+                      <span :title="'冷却中：' + (s.health.reason || '触发风控')" class="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-red-50 text-red-700 text-xs">
+                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                        <span x-text="'冷却 ' + Math.ceil((s.health.cooldown_ttl || 0) / 60) + 'min'"></span>
+                      </span>
+                    </template>
+                    <template x-if="s.health && s.health.status === 'warning'">
+                      <span :title="'近期失败 ' + s.health.recent_fails + ' 次'" class="px-2 py-0.5 rounded bg-amber-50 text-amber-700 text-xs">注意</span>
+                    </template>
+                    <template x-if="s.health && s.health.status === 'healthy'">
+                      <span class="px-2 py-0.5 rounded bg-green-50 text-green-700 text-xs">正常</span>
+                    </template>
+                    <template x-if="!s.health || s.health.status === 'unknown'">
+                      <span class="text-slate-400 text-xs">-</span>
+                    </template>
+                  </td>
                   <td class="px-4 py-3 text-right space-x-1 whitespace-nowrap">
                     <button @click="syncSource(s.id, 'incremental')" :disabled="s._syncing"
                       title="只拉取新增/变更的文件，跳过已有 share_url 的"
@@ -216,6 +233,9 @@
                       </svg>
                       <span>检测</span>
                     </button>
+                    <button x-show="s.health && s.health.status === 'cooldown'" @click="unlockSource(s.id)"
+                      title="立即解除该账号的冷却（仅在你确认蓝奏侧已恢复后再解）"
+                      class="px-2 py-1 rounded text-amber-600 hover:bg-amber-50 text-xs">解冻</button>
                     <button @click="deleteSource(s.id)" class="px-2 py-1 rounded text-red-500 hover:bg-red-50 text-xs">删除</button>
                   </td>
                 </tr>

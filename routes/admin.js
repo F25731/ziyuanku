@@ -4,7 +4,7 @@ const { pool } = require('../config/db');
 const { jwtRequired, adminRequired } = require('../middleware/jwtAuth');
 const { login, changePassword } = require('../services/userService');
 const {
-  listSources, getSource, saveSource, updateSource, deleteSource
+  listSources, getSource, saveSource, updateSource, deleteSource, unlockSource
 } = require('../services/sourceService');
 const { syncSource, checkSource, listSyncLogs, clearSyncLogs } = require('../services/lanzouSyncService');
 const {
@@ -139,6 +139,11 @@ router.post('/sources/:id/sync', adminRequired, asyncHandler(async (req, res) =>
 router.post('/sources/:id/check', adminRequired, asyncHandler(async (req, res) => {
   const result = await checkSource(Number(req.params.id));
   res.json({ code: 200, message: '检测完成', ...result });
+}));
+
+router.post('/sources/:id/unlock-cooldown', adminRequired, asyncHandler(async (req, res) => {
+  const result = await unlockSource(Number(req.params.id));
+  res.json({ code: 200, message: '已解冻', ...result });
 }));
 
 // ---------- 同步日志 ----------
