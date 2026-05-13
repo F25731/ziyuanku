@@ -46,15 +46,20 @@ async function api(path, options = {}) {
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   opts.signal = ac.signal;
 
+  // 触发全局进度条（通过自定义事件，不依赖 Alpine 实例）
+  window.dispatchEvent(new CustomEvent('api:start'));
+
   let r;
   try {
     r = await fetch('/api/admin' + path, opts);
   } catch (e) {
     clearTimeout(timer);
+    window.dispatchEvent(new CustomEvent('api:end'));
     if (e.name === 'AbortError') throw new Error(`请求超时 (${Math.round(timeoutMs/1000)}s)`);
     throw new Error('网络错误: ' + e.message);
   }
   clearTimeout(timer);
+  window.dispatchEvent(new CustomEvent('api:end'));
 
   if (r.status === 401) {
     localStorage.removeItem('lrh_token');
@@ -120,6 +125,16 @@ function dashboard() {
     batchResolve: { running: false, total: 0, done: 0, success: 0, failed: 0, canceled: false, summary: false, sources: 0 },
     toast: { msg: '', type: '' },
 
+    // 全局进度条：活跃请求计数器，>0 时显示顶部蓝色进度条
+    activeReq: 0,
+    // 每个 tab 自己的 loading 状态，true = 显示中间转圈
+    tabLoading: { resources: false, sources: false, apikeys: false, synclogs: false, calllogs: false, dashboard: false },
+    // 搜索防抖计时器
+    _searchDebounce: null,
+    searchEngine: '', // 'meili' / 'mysql'，搜完后显示
+    searchMs: 0,
+    indexStats: null,
+
     docs: window.LRH_DOCS || { endpoints: [], examples: {}, errors: [], notes: [] },
     docTab: 'curl',
     docHost: '',
@@ -130,6 +145,11 @@ function dashboard() {
       if (!getToken()) return location.href = '/admin/login.html';
       if (u) try { this.currentUser = JSON.parse(u); } catch (_) {}
       this.docHost = location.protocol + '//' + location.host;
+
+      // 监听全局 api:start / api:end，驱动顶部进度条
+      window.addEventListener('api:start', () => { this.activeReq++; });
+      window.addEventListener('api:end',   () => { this.activeReq = Math.max(0, this.activeReq - 1); });
+
       this.loadStats();
       this.$watch('tab', (v) => {
         if (v === 'resources') this.loadResources(1);
@@ -169,9 +189,10 @@ function dashboard() {
     },
 
     async loadStats() {
+      this.tabLoading.dashboard = true;
       try {
-        this.stats = await api('/stats');
-        const t = await api('/stats/call-trend');
+        const [s, t] = await Promise.all([api('/stats'), api('/stats/call-trend')]);
+        this.stats = s;
         const max = Math.max(1, ...t.items.map(i => Number(i.total)));
         this.trendDays = t.items.map(i => ({
           day: i.day,
@@ -179,13 +200,23 @@ function dashboard() {
           height: Math.round(Number(i.total) / max * 100)
         }));
       } catch (e) { this.notify(e.message, 'error'); }
+      finally { this.tabLoading.dashboard = false; }
+    },
+
+    onSearchInput() {
+      clearTimeout(this._searchDebounce);
+      this._searchDebounce = setTimeout(() => this.loadResources(1), 200);
     },
 
     async loadResources(page) {
       if (page < 1) return;
       this.resPage = page;
+      this.tabLoading.resources = true;
       try {
+        const t0 = performance.now();
         const d = await api('/resources?q=' + encodeURIComponent(this.resQuery) + '&page=' + page + '&pageSize=30');
+        this.searchMs = Math.round(performance.now() - t0);
+        this.searchEngine = d.engine || '';
         const items = (d.items || []).map((r) => ({
           ...r,
           _linkLoading: false,
@@ -195,6 +226,7 @@ function dashboard() {
         }));
         this.resList = { items, total: d.total || 0 };
       } catch (e) { this.notify(e.message, 'error'); }
+      finally { this.tabLoading.resources = false; }
     },
     async deleteResource(id) {
       if (!confirm('确认删除该资源？')) return;
@@ -255,8 +287,12 @@ function dashboard() {
     },
 
     async loadSources() {
-      const d = await api('/sources');
-      this.sources = (d.items || []).map((s) => ({ ...s, _syncing: false, _syncMode: '', _checking: false }));
+      this.tabLoading.sources = true;
+      try {
+        const d = await api('/sources');
+        this.sources = (d.items || []).map((s) => ({ ...s, _syncing: false, _syncMode: '', _checking: false }));
+      } catch (e) { this.notify(e.message, 'error'); }
+      finally { this.tabLoading.sources = false; }
     },
     openSourceModal() {
       this.sourceModal = { open: true, title: '', provider: 'ilanzou', loginType: 'account', account: '', passwordText: '', cookieText: '', rootFolderId: '0', remark: '' };
@@ -419,8 +455,12 @@ function dashboard() {
     },
 
     async loadApiKeys() {
-      const d = await api('/api-keys');
-      this.apiKeys = d.items || [];
+      this.tabLoading.apikeys = true;
+      try {
+        const d = await api('/api-keys');
+        this.apiKeys = d.items || [];
+      } catch (e) { this.notify(e.message, 'error'); }
+      finally { this.tabLoading.apikeys = false; }
     },
     openKeyModal() {
       this.keyModal = { open: true, name: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', result: '' };
@@ -483,8 +523,12 @@ function dashboard() {
     },
 
     async loadSyncLogs() {
-      const d = await api('/sync-logs');
-      this.syncLogs = d.items || [];
+      this.tabLoading.synclogs = true;
+      try {
+        const d = await api('/sync-logs');
+        this.syncLogs = d.items || [];
+      } catch (e) { this.notify(e.message, 'error'); }
+      finally { this.tabLoading.synclogs = false; }
     },
     async clearSyncLogs() {
       if (!confirm('确认清空同步日志？')) return;
@@ -493,8 +537,27 @@ function dashboard() {
       this.notify('已清空');
     },
     async loadCallLogs() {
-      const d = await api('/call-logs');
-      this.callLogs = d.items || [];
+      this.tabLoading.calllogs = true;
+      try {
+        const d = await api('/call-logs');
+        this.callLogs = d.items || [];
+      } catch (e) { this.notify(e.message, 'error'); }
+      finally { this.tabLoading.calllogs = false; }
+    },
+
+    async loadIndexStats() {
+      try { this.indexStats = await api('/search-index/stats'); }
+      catch (_) { this.indexStats = { enabled: false }; }
+    },
+    async rebuildIndex() {
+      if (!confirm('确认从 MySQL 全量重建 Meilisearch 索引？几十万条以内大约 10-30 秒。')) return;
+      const taskId = this.startTask('重建搜索索引');
+      try {
+        const d = await api('/search-index/rebuild', { method: 'POST', timeout: 600000 });
+        this.notify('重建完成，共 ' + (d.total || 0) + ' 条');
+        this.loadIndexStats();
+      } catch (e) { this.showError('重建失败', e); }
+      finally { this.endTask(taskId); }
     },
 
     docExampleText(lang) {

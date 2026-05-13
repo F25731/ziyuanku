@@ -210,4 +210,21 @@ router.get('/call-logs', asyncHandler(async (req, res) => {
   res.json({ code: 200, items: rows });
 }));
 
+// ---------- Meilisearch 索引 ----------
+const searchIndex = require('../services/searchIndex');
+
+router.get('/search-index/stats', asyncHandler(async (req, res) => {
+  const stats = await searchIndex.getStats();
+  res.json({ code: 200, ...stats });
+}));
+
+router.post('/search-index/rebuild', adminRequired, asyncHandler(async (req, res) => {
+  if (!searchIndex.isEnabled()) {
+    return res.status(400).json({ code: 400, message: 'Meilisearch 未配置（MEILI_HOST 未设置）' });
+  }
+  await searchIndex.ensureIndex();
+  const r = await searchIndex.rebuildFromDb();
+  res.json({ code: 200, message: '重建完成', ...r });
+}));
+
 module.exports = router;

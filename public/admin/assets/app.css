@@ -17,3 +17,12 @@ table th, table td { padding-top: 12px; padding-bottom: 12px; }
   main.ml-60 { margin-left: 0; padding-top: 70px; }
   aside.fixed { transform: translateX(-100%); }
 }
+
+/* Meilisearch 高亮词 */
+em {
+  font-style: normal;
+  background: linear-gradient(180deg, transparent 60%, #fde68a 60%);
+  color: #78350f;
+  padding: 0 1px;
+  border-radius: 2px;
+}

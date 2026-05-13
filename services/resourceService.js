@@ -1,6 +1,42 @@
 const { pool } = require('../config/db');
+const searchIndex = require('./searchIndex');
 
 async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = null }) {
+  // 优先走 Meilisearch
+  if (searchIndex.isEnabled()) {
+    try {
+      const r = await searchIndex.search({ q, page, pageSize, sourceId });
+      if (r) {
+        // 回表补 source_title（Meili 里已经有 source_title 就直接用）+ 格式对齐
+        return {
+          total: r.total,
+          page: r.page,
+          pageSize: r.pageSize,
+          items: r.items.map(h => ({
+            id: h.id,
+            source_id: h.source_id,
+            source_title: h.source_title,
+            source_provider: 'ilanzou',
+            file_id: h.file_id,
+            file_name: h.file_name,
+            file_size: h.file_size,
+            file_type: h.file_type,
+            file_time: h.file_time,
+            share_url: h.has_share_url ? 'yes' : '',
+            _highlight: h._formatted && h._formatted.file_name
+          })),
+          processing_ms: r.processing_ms,
+          engine: 'meili'
+        };
+      }
+    } catch (err) {
+      console.warn('[search] meili 查询失败，降级到 MySQL LIKE:', err.message);
+    }
+  }
+  return await searchByLike({ q, page, pageSize, sourceId });
+}
+
+async function searchByLike({ q = '', page = 1, pageSize = 20, sourceId = null }) {
   page = Math.max(1, Number(page) || 1);
   pageSize = Math.min(100, Math.max(1, Number(pageSize) || 20));
   const offset = (page - 1) * pageSize;
@@ -38,7 +74,8 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
     total: Number(countRow.total || 0),
     page,
     pageSize,
-    items: rows
+    items: rows,
+    engine: 'mysql'
   };
 }
 
@@ -114,6 +151,29 @@ async function upsertResources(sourceId, files) {
       [sourceId]
     );
     await conn.commit();
+
+    // 异步推送到 Meilisearch（不阻塞同步流程）
+    if (searchIndex.isEnabled()) {
+      setImmediate(async () => {
+        try {
+          const fileIdsList = files.map(f => String(f.file_id || '')).filter(Boolean);
+          if (!fileIdsList.length) return;
+          const placeholders = fileIdsList.map(() => '?').join(',');
+          const [rows] = await pool.query(
+            `SELECT r.id, r.source_id, r.file_id, r.file_name, r.file_size, r.file_type,
+                    r.file_time, r.share_url, r.is_deleted, r.created_at, s.title AS source_title
+               FROM resources r LEFT JOIN sources s ON s.id = r.source_id
+              WHERE r.source_id = ? AND r.file_id IN (${placeholders})`,
+            [sourceId, ...fileIdsList]
+          );
+          if (rows.length) await searchIndex.upsert(rows);
+          console.log(`[search] pushed ${rows.length} docs to meili (source ${sourceId})`);
+        } catch (e) {
+          console.warn('[search] meili 推送失败:', e.message);
+        }
+      });
+    }
+
     return { inserted: files.length };
   } catch (err) {
     await conn.rollback();
@@ -129,6 +189,9 @@ async function listResources({ page = 1, pageSize = 50, sourceId = null } = {}) 
 
 async function deleteResource(id) {
   await pool.query('DELETE FROM resources WHERE id = ?', [id]);
+  if (searchIndex.isEnabled()) {
+    searchIndex.deleteById([id]).catch(e => console.warn('[search] delete failed:', e.message));
+  }
 }
 
 module.exports = { searchResources, getResource, upsertResources, listResources, deleteResource };
