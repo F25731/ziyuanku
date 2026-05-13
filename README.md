@@ -1,4 +1,4 @@
-# Lanzou Resource Hub
+# 云逸蓝奏 · Lanzou Resource Hub
 
 Headless 蓝奏云资源库。只做资源聚合、搜索、直链生成三件事，对外暴露 REST API，供下游软件站 / 小说站 / 工具站调用。
 
