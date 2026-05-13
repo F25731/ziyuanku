@@ -4,7 +4,8 @@ const ICON = {
   sources: '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 3a2 2 0 00-2 2v12a2 2 0 002 2h14a2 2 0 002-2V5a2 2 0 00-2-2H5zm4 6l3 3-3 3m5-6l-3 3 3 3"/></svg>',
   apikeys: '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 11-4 0 2 2 0 014 0zm2 0a4 4 0 11-8 0 4 4 0 018 0zM3 21l6-6m2 2l3-3m-3 3l3 3"/></svg>',
   synclogs: '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.01M20 20v-5h-.01M5 9a7 7 0 0112 0M19 15a7 7 0 01-12 0"/></svg>',
-  calllogs: '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>'
+  calllogs: '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>',
+  docs: '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>'
 };
 
 function getToken() { return localStorage.getItem('lrh_token') || ''; }
@@ -64,7 +65,8 @@ function dashboard() {
       { key: 'sources',   label: '数据来源', desc: '蓝奏账号、分享链接来源配置', icon: ICON.sources },
       { key: 'apikeys',   label: 'API Key', desc: '对外开放的调用密钥，接入软件站时签发', icon: ICON.apikeys },
       { key: 'synclogs',  label: '同步日志', desc: '每次拉取蓝奏账号的记录', icon: ICON.synclogs },
-      { key: 'calllogs',  label: '调用日志', desc: '对外 API v1 的请求记录', icon: ICON.calllogs }
+      { key: 'calllogs',  label: '调用日志', desc: '对外 API v1 的请求记录', icon: ICON.calllogs },
+      { key: 'docs',      label: '使用文档', desc: '下游对接调用说明 · 一键复制', icon: ICON.docs }
     ],
     get currentNav() { return this.navs.find(n => n.key === this.tab); },
 
@@ -95,10 +97,16 @@ function dashboard() {
     batchResolve: { running: false, total: 0, done: 0, success: 0, failed: 0, canceled: false, summary: false },
     toast: { msg: '', type: '' },
 
+    docs: window.LRH_DOCS || { endpoints: [], examples: {}, errors: [], notes: [] },
+    docTab: 'curl',
+    docHost: '',
+    docKey: 'YOUR_API_KEY',
+
     init() {
       const u = localStorage.getItem('lrh_user');
       if (!getToken()) return location.href = '/admin/login.html';
       if (u) try { this.currentUser = JSON.parse(u); } catch (_) {}
+      this.docHost = location.protocol + '//' + location.host;
       this.loadStats();
       this.$watch('tab', (v) => {
         if (v === 'resources') this.loadResources(1);
@@ -365,6 +373,91 @@ function dashboard() {
     async loadCallLogs() {
       const d = await api('/call-logs');
       this.callLogs = d.items || [];
+    },
+
+    docExampleText(lang) {
+      const raw = (this.docs.examples && this.docs.examples[lang]) || '';
+      return raw
+        .replace(/YOUR_HOST/g, this.docHost.replace(/^https?:\/\//, ''))
+        .replace(/https:\/\/YOUR_HOST/g, this.docHost)
+        .replace(/YOUR_API_KEY/g, this.docKey || 'YOUR_API_KEY');
+    },
+    async copyText(text, label) {
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+        } else {
+          const ta = document.createElement('textarea');
+          ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+          document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+        }
+        this.notify((label || '内容') + '已复制');
+      } catch (e) {
+        this.notify('复制失败，请手动选择', 'error');
+      }
+    },
+    buildFullDocText() {
+      const d = this.docs;
+      const host = this.docHost;
+      const key = this.docKey || 'YOUR_API_KEY';
+      const lines = [];
+      lines.push('# 云逸蓝奏 资源库 API · 接入文档');
+      lines.push('');
+      lines.push('Host: ' + host);
+      lines.push('鉴权: 在每个请求头加 `X-Api-Key: <YOUR_API_KEY>`');
+      lines.push('');
+      lines.push('## 推荐调用顺序');
+      lines.push('1. /search 拿元数据列表（不消耗解析资源）');
+      lines.push('2. 用户点击具体某条结果时，再调 /resources/:id/link 换直链');
+      lines.push('3. 直链 30 分钟内有效，不要长期缓存到数据库');
+      lines.push('');
+      lines.push('## 接口列表');
+      d.endpoints.forEach((ep) => {
+        lines.push('### ' + ep.method + ' ' + ep.path);
+        lines.push(ep.title);
+        lines.push('');
+        if (ep.desc) { lines.push(ep.desc); lines.push(''); }
+        if (ep.params && ep.params.length) {
+          lines.push('参数：');
+          ep.params.forEach(p => lines.push('  - ' + p[0] + ' (' + p[1] + ') ' + p[2]));
+          lines.push('');
+        }
+        lines.push('返回示例：');
+        lines.push('```json');
+        lines.push(ep.response);
+        lines.push('```');
+        lines.push('');
+      });
+      lines.push('## cURL 示例');
+      lines.push('```bash');
+      lines.push(this.docExampleText('curl'));
+      lines.push('```');
+      lines.push('');
+      lines.push('## JavaScript 示例');
+      lines.push('```js');
+      lines.push(this.docExampleText('js'));
+      lines.push('```');
+      lines.push('');
+      lines.push('## Python 示例');
+      lines.push('```python');
+      lines.push(this.docExampleText('python'));
+      lines.push('```');
+      lines.push('');
+      lines.push('## PHP 示例');
+      lines.push('```php');
+      lines.push(this.docExampleText('php'));
+      lines.push('```');
+      lines.push('');
+      lines.push('## 错误码');
+      d.errors.forEach(e => lines.push('  ' + e[0] + ' — ' + e[1]));
+      lines.push('');
+      lines.push('## 注意事项');
+      d.notes.forEach((n, i) => lines.push((i + 1) + '. ' + n));
+      return lines.join('\n');
+    },
+    copyAllDocs() {
+      const txt = this.buildFullDocText();
+      this.copyText(txt, '完整接入文档');
     }
   };
 }

@@ -2,9 +2,36 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const { LanZouYClient } = require('@netdrive-sdk/ilanzou');
 const { getRedis } = require('../config/redis');
+const { guarded } = require('./rateLimiter');
 
 const UA_PC = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const LANZOU_HOSTS = ['lanzou', 'lanzoux', 'lanzoui', 'lanzouw', 'lanzouj', 'lanzouf', 'lanzoup', 'lanzouq', 'lanzouv', 'lanzouy', 'woozooo'];
+
+// 进程内 SDK client 缓存：同一账号 30 分钟内复用，不重新登录
+const CLIENT_TTL_MS = 30 * 60 * 1000;
+const clientCache = new Map(); // accountKey → { client, expireAt }
+
+async function getOrCreateClient(account, password) {
+  const key = 'ilanzou:' + account;
+  const now = Date.now();
+  const cached = clientCache.get(key);
+  if (cached && cached.expireAt > now) return { client: cached.client, accountKey: key };
+
+  const client = new LanZouYClient({ username: account, password });
+  client.config.apiUrl = 'https://apis.ilanzou.com';
+  client.client = client.client.extend({ prefixUrl: client.config.apiUrl });
+
+  const loginRes = await guarded(key, 'login', () => withTimeout(client.login(), 20000, '登录'));
+  if (!loginRes || loginRes.code !== 200) {
+    throw new Error('ilanzou 登录失败: ' + JSON.stringify(loginRes));
+  }
+  clientCache.set(key, { client, expireAt: now + CLIENT_TTL_MS });
+  return { client, accountKey: key };
+}
+
+function invalidateClient(account) {
+  clientCache.delete('ilanzou:' + account);
+}
 
 function isLanzouPublicUrl(url) {
   if (!url) return false;
@@ -60,27 +87,21 @@ async function resolveByIlanzouAccount(resource) {
   }
   console.log(`[resolve] account-mode fileId=${resource.file_id} account=${resource.source_account}`);
 
-  const client = new LanZouYClient({
-    username: resource.source_account,
-    password: resource.source_password
-  });
-  client.config.apiUrl = 'https://apis.ilanzou.com';
-  client.client = client.client.extend({ prefixUrl: client.config.apiUrl });
-
-  let loginRes;
+  let client, accountKey;
   try {
-    loginRes = await withTimeout(client.login(), 20000, '登录');
+    ({ client, accountKey } = await getOrCreateClient(resource.source_account, resource.source_password));
   } catch (err) {
     throw new Error('ilanzou 登录请求异常: ' + (err.message || err));
-  }
-  if (!loginRes || loginRes.code !== 200) {
-    throw new Error('ilanzou 登录失败: ' + JSON.stringify(loginRes));
   }
 
   let direct;
   try {
-    direct = await withTimeout(client.downloadFile(String(resource.file_id), true), 30000, 'downloadFile');
+    direct = await guarded(accountKey, 'downloadFile',
+      () => withTimeout(client.downloadFile(String(resource.file_id), true), 30000, 'downloadFile')
+    );
   } catch (err) {
+    // 登录失效时让下次重建 client
+    if (/token|未登录|login/i.test(err.message || '')) invalidateClient(resource.source_account);
     throw new Error('downloadFile 调用异常: ' + (err.message || err));
   }
   const url = asString(direct);
