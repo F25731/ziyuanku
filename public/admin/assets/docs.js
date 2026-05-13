@@ -7,12 +7,12 @@ window.LRH_DOCS = {
       method: 'GET',
       path: '/api/v1/search',
       title: '搜索资源（仅元数据，不消耗解析资源）',
-      desc: '按文件名模糊搜索，返回分页结果。返回字段不含直链，下游拿到 id 后再按需调 link 接口取直链。',
+      desc: '由 Meilisearch 支持，百万级库内一般 5-30ms 返回，支持拼写容错和前缀匹配（如 "pyth" 命中 "python"）。返回字段不含直链，下游拿到 id 后再按需调 link 接口换直链。',
       params: [
-        ['q', 'string', '关键词，模糊匹配 file_name'],
+        ['q', 'string', '关键词。空字符串或不传 = 返回全部，按 id 倒序'],
         ['page', 'int', '页码，默认 1'],
         ['pageSize', 'int', '每页大小，默认 20，上限 100'],
-        ['source_id', 'int', '可选，限定来源']
+        ['source_id', 'int', '可选，限定某个蓝奏账号来源']
       ],
       response: `{
   "code": 200,
@@ -27,7 +27,8 @@ window.LRH_DOCS = {
       "provider": "ilanzou",
       "file_id": "xxxxxxxx",
       "file_name": "Python入门到入土.zip",
-      "file_size": "12.3M",
+      "file_size": "4260",               // 蓝奏原始值（ilanzou 是 KB 数字；老蓝奏可能带单位）
+      "file_size_human": "4.16 MB",      // 已格式化，推荐直接展示这个
       "file_type": "zip",
       "file_time": "2026-04-01",
       "has_share_url": true
@@ -48,7 +49,8 @@ window.LRH_DOCS = {
     "id": 17,
     "source": "我的蓝奏号",
     "file_name": "Python入门到入土.zip",
-    "file_size": "12.3M",
+    "file_size": "4260",
+    "file_size_human": "4.16 MB",
     "share_url": "https://wwz.lanzouw.com/xxxxx",
     "has_password": false
   }
@@ -59,15 +61,16 @@ window.LRH_DOCS = {
       method: 'GET',
       path: '/api/v1/resources/:id/link',
       title: '换取直链（按需调用，会消耗配额）',
-      desc: '实时返回下载直链。直链有时效（30 分钟内有效），过期请重新调用本接口。同一资源 30 分钟内重复调用会命中服务端缓存，不会真实穿透到蓝奏。',
+      desc: '实时返回下载直链。直链有时效（约 30 分钟），过期请重新调用本接口。同一资源 30 分钟内重复调用会命中服务端缓存（Redis），不会穿透到蓝奏，响应里 cached=true。',
       params: [['id', 'int', '资源 id（path 参数）']],
       response: `{
   "code": 200,
   "file_name": "Python入门到入土.zip",
-  "file_size": "12.3M",
+  "file_size": "4260",
+  "file_size_human": "4.16 MB",
   "url": "https://developer-cdn.lanrar.com/file/...",
-  "expire_at": 1715600000000,
-  "cached": false,
+  "expire_at": 1715600000000,      // 直链预计失效毫秒时间戳
+  "cached": false,                 // true = 命中缓存，未穿透蓝奏
   "daily_limit": 5000,
   "used_today": 13,
   "remaining_today": 4987
@@ -154,7 +157,7 @@ def get_link(rid):
 # 用法
 results = search('python')
 for it in results['items']:
-    print(it['id'], it['file_name'], it['file_size'])
+    print(it['id'], it['file_name'], it['file_size_human'])
 
 picked = results['items'][0]
 link = get_link(picked['id'])
@@ -180,7 +183,7 @@ function lrh_get($url, $key) {
 // 1) 搜索
 $res = lrh_get($HOST . '/api/v1/search?q=' . urlencode('python'), $KEY);
 foreach ($res['items'] as $r) {
-    echo $r['id'] . ' ' . $r['file_name'] . ' ' . $r['file_size'] . PHP_EOL;
+    echo $r['id'] . ' ' . $r['file_name'] . ' ' . $r['file_size_human'] . PHP_EOL;
 }
 
 // 2) 取直链
@@ -196,6 +199,8 @@ echo '直链: ' . $link['url'] . PHP_EOL;`
   ],
   notes: [
     '推荐流程：先调 /search 拿元数据列表 → 用户在你的站点点击某条 → 再调 /resources/:id/link 换直链。这样既省配额，也降低被风控的概率。',
+    '文件大小优先展示 file_size_human（已带单位）；file_size 是蓝奏原始值，ilanzou 是纯 KB 数字（4260 表示 4260 KB），老版蓝奏可能带单位（如 "12.3 M"）。两个字段都返回，挑一个用即可。',
+    '搜索接口由 Meilisearch 驱动，支持拼写容错（pyton→python）和前缀匹配（只输入 "pyt" 就能出结果）。建议在下游做 200-300ms 输入防抖，实现"打字即搜"的体验。',
     '直链有时效（约 30 分钟），不要在数据库长期保存，每次用户点击下载时即时调用。',
     'Key 泄露请立即在后台「API Key」页停用并重新签发，旧 Key 立即失效。',
     '建议下游先实现 200ms~500ms 的随机延迟（多用户并发场景），防止本地 IP 触发蓝奏侧 IP 限流。'
