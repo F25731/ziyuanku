@@ -43,6 +43,13 @@ function asString(v) {
   return String(v);
 }
 
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label || '操作'}超时(${ms}ms)`)), ms))
+  ]);
+}
+
 // -------- 方式 A：ilanzou (新版) 账号模式 --------
 async function resolveByIlanzouAccount(resource) {
   if (!resource.source_account || !resource.source_password) {
@@ -62,7 +69,7 @@ async function resolveByIlanzouAccount(resource) {
 
   let loginRes;
   try {
-    loginRes = await client.login();
+    loginRes = await withTimeout(client.login(), 20000, '登录');
   } catch (err) {
     throw new Error('ilanzou 登录请求异常: ' + (err.message || err));
   }
@@ -70,10 +77,9 @@ async function resolveByIlanzouAccount(resource) {
     throw new Error('ilanzou 登录失败: ' + JSON.stringify(loginRes));
   }
 
-  // 优先：directly download with redirect=true
   let direct;
   try {
-    direct = await client.downloadFile(String(resource.file_id), true);
+    direct = await withTimeout(client.downloadFile(String(resource.file_id), true), 30000, 'downloadFile');
   } catch (err) {
     throw new Error('downloadFile 调用异常: ' + (err.message || err));
   }

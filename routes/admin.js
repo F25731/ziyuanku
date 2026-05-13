@@ -131,7 +131,8 @@ router.delete('/sources/:id', adminRequired, asyncHandler(async (req, res) => {
 }));
 
 router.post('/sources/:id/sync', adminRequired, asyncHandler(async (req, res) => {
-  const result = await syncSource(Number(req.params.id));
+  const mode = (req.body && req.body.mode === 'full') ? 'full' : 'incremental';
+  const result = await syncSource(Number(req.params.id), mode);
   res.json({ code: 200, message: '同步完成', ...result });
 }));
 

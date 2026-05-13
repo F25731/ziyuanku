@@ -19,7 +19,22 @@ async function api(path, options = {}) {
     ...options
   };
   if (options.body && typeof options.body !== 'string') opts.body = JSON.stringify(options.body);
-  const r = await fetch('/api/admin' + path, opts);
+
+  const timeoutMs = options.timeout || 90000;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  opts.signal = ac.signal;
+
+  let r;
+  try {
+    r = await fetch('/api/admin' + path, opts);
+  } catch (e) {
+    clearTimeout(timer);
+    if (e.name === 'AbortError') throw new Error(`请求超时 (${Math.round(timeoutMs/1000)}s)`);
+    throw new Error('网络错误: ' + e.message);
+  }
+  clearTimeout(timer);
+
   if (r.status === 401) {
     localStorage.removeItem('lrh_token');
     location.href = '/admin/login.html';
@@ -77,6 +92,7 @@ function dashboard() {
     keyModal: { open: false, name: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', result: '' },
     linkModal: { open: false, fileName: '', url: '', expireText: '', cached: false, loading: false, error: '', detail: '' },
     errorModal: { open: false, title: '', message: '', detail: '' },
+    batchResolve: { running: false, total: 0, done: 0, success: 0, failed: 0, canceled: false, summary: false },
     toast: { msg: '', type: '' },
 
     init() {
@@ -139,7 +155,14 @@ function dashboard() {
       this.resPage = page;
       try {
         const d = await api('/resources?q=' + encodeURIComponent(this.resQuery) + '&page=' + page + '&pageSize=30');
-        this.resList = { items: d.items || [], total: d.total || 0 };
+        const items = (d.items || []).map((r) => ({
+          ...r,
+          _linkLoading: false,
+          _linkOk: undefined,
+          _linkError: '',
+          _linkMs: 0
+        }));
+        this.resList = { items, total: d.total || 0 };
       } catch (e) { this.notify(e.message, 'error'); }
     },
     async deleteResource(id) {
@@ -151,15 +174,20 @@ function dashboard() {
 
     async getDirectLink(r) {
       r._linkLoading = true;
+      r._linkOk = undefined;
+      r._linkError = '';
       this.linkModal = { open: true, fileName: r.file_name, url: '', expireText: '', cached: false, loading: true, error: '', detail: '' };
       const taskId = this.startTask('解析直链: ' + r.file_name);
+      const t0 = Date.now();
       try {
-        const d = await api('/resources/' + r.id + '/link');
+        const d = await api('/resources/' + r.id + '/link', { timeout: 60000 });
         const expireMs = Number(d.expire_at || 0);
         const expireText = expireMs
           ? new Date(expireMs).toLocaleString('zh-CN', { hour12: false })
           : '未知';
         this.linkModal = { open: true, fileName: d.file_name || r.file_name, url: d.url, expireText, cached: !!d.cached, loading: false, error: '', detail: '' };
+        r._linkOk = true;
+        r._linkMs = Date.now() - t0;
       } catch (e) {
         this.linkModal = {
           open: true, fileName: r.file_name, url: '', expireText: '',
@@ -167,6 +195,8 @@ function dashboard() {
           error: e.message || '解析失败',
           detail: e.detail || ''
         };
+        r._linkOk = false;
+        r._linkError = e.message || '解析失败';
       } finally {
         r._linkLoading = false;
         this.endTask(taskId);
@@ -195,7 +225,7 @@ function dashboard() {
 
     async loadSources() {
       const d = await api('/sources');
-      this.sources = (d.items || []).map((s) => ({ ...s, _syncing: false, _checking: false }));
+      this.sources = (d.items || []).map((s) => ({ ...s, _syncing: false, _syncMode: '', _checking: false }));
     },
     openSourceModal() {
       this.sourceModal = { open: true, title: '', provider: 'ilanzou', loginType: 'account', account: '', passwordText: '', cookieText: '', rootFolderId: '0', remark: '' };
@@ -208,18 +238,27 @@ function dashboard() {
         this.loadSources();
       } catch (e) { this.showError('保存失败', e); }
     },
-    async syncSource(id) {
+    async syncSource(id, mode) {
+      mode = mode || 'incremental';
       const src = this.sources.find((s) => s.id === id);
-      if (src) src._syncing = true;
-      const taskId = this.startTask('同步来源: ' + (src ? src.title : '#' + id));
+      if (src) { src._syncing = true; src._syncMode = mode; }
+      const label = (mode === 'full' ? '全量同步: ' : '增量同步: ') + (src ? src.title : '#' + id);
+      const taskId = this.startTask(label);
       try {
-        const d = await api('/sources/' + id + '/sync', { method: 'POST' });
-        this.notify('同步完成，共 ' + d.total + ' 个文件');
+        const d = await api('/sources/' + id + '/sync', {
+          method: 'POST',
+          body: { mode },
+          timeout: 600000 // 同步可能要很久
+        });
+        const msg = (mode === 'full' ? '全量' : '增量') + '同步完成：'
+          + '共 ' + d.total + ' 个'
+          + (typeof d.reused === 'number' ? '（复用 ' + d.reused + '，新拉取 ' + d.new + '）' : '');
+        this.notify(msg);
         this.loadSources();
       } catch (e) {
-        this.showError('同步失败', e);
+        this.showError((mode === 'full' ? '全量' : '增量') + '同步失败', e);
       } finally {
-        if (src) src._syncing = false;
+        if (src) { src._syncing = false; src._syncMode = ''; }
         this.endTask(taskId);
       }
     },
@@ -228,7 +267,7 @@ function dashboard() {
       if (src) src._checking = true;
       const taskId = this.startTask('检测来源: ' + (src ? src.title : '#' + id));
       try {
-        const d = await api('/sources/' + id + '/check', { method: 'POST' });
+        const d = await api('/sources/' + id + '/check', { method: 'POST', timeout: 300000 });
         this.notify('检测通过，共 ' + d.total + ' 个文件');
       } catch (e) {
         this.showError('检测失败', e);
@@ -242,6 +281,45 @@ function dashboard() {
       await api('/sources/' + id, { method: 'DELETE' });
       this.notify('已删除');
       this.loadSources();
+    },
+
+    async batchResolveCurrentPage() {
+      const items = this.resList.items || [];
+      if (!items.length) { this.notify('本页没有资源', 'error'); return; }
+      this.batchResolve = { running: true, total: items.length, done: 0, success: 0, failed: 0, canceled: false, summary: false };
+      const taskId = this.startTask('批量解析本页 (' + items.length + ')');
+      try {
+        for (const r of items) {
+          if (this.batchResolve.canceled) break;
+          r._linkLoading = true;
+          r._linkOk = undefined;
+          r._linkError = '';
+          const t0 = Date.now();
+          try {
+            await api('/resources/' + r.id + '/link', { timeout: 60000 });
+            r._linkOk = true;
+            r._linkMs = Date.now() - t0;
+            this.batchResolve.success++;
+          } catch (e) {
+            r._linkOk = false;
+            r._linkError = e.message || '解析失败';
+            this.batchResolve.failed++;
+          } finally {
+            r._linkLoading = false;
+            this.batchResolve.done++;
+          }
+          // 友好的节流，避免蓝奏风控
+          await new Promise(res => setTimeout(res, 400));
+        }
+        const msg = this.batchResolve.canceled
+          ? `已停止（成功 ${this.batchResolve.success}，失败 ${this.batchResolve.failed}）`
+          : `解析完成：成功 ${this.batchResolve.success}，失败 ${this.batchResolve.failed}`;
+        this.notify(msg);
+      } finally {
+        this.batchResolve.running = false;
+        this.batchResolve.summary = true;
+        this.endTask(taskId);
+      }
     },
 
     async loadApiKeys() {

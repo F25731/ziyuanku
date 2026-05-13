@@ -27,7 +27,19 @@ async function finishSyncLog(logId, status, message, total = 0) {
   );
 }
 
-function runIlanzouScript(source) {
+async function loadExistingShareUrls(sourceId) {
+  const [rows] = await pool.query(
+    'SELECT file_id, share_url FROM resources WHERE source_id = ? AND is_deleted = 0 AND share_url IS NOT NULL AND share_url <> ""',
+    [sourceId]
+  );
+  const map = {};
+  for (const r of rows) {
+    if (r.file_id) map[r.file_id] = r.share_url;
+  }
+  return map;
+}
+
+function runIlanzouScript(source, options = {}) {
   return new Promise((resolve, reject) => {
     const scriptPath = path.join(__dirname, '..', 'scripts', 'ilanzou_sync_sdk.js');
     const child = spawn('node', [scriptPath], {
@@ -48,7 +60,7 @@ function runIlanzouScript(source) {
         const jsonText = clean.slice(clean.indexOf('{'));
         const result = JSON.parse(jsonText);
         if (!result.ok) return reject(new Error(result.message || '同步失败'));
-        resolve(result.files || []);
+        resolve(result);
       } catch (err) {
         reject(new Error(`同步脚本输出无法解析: ${stdout}`));
       }
@@ -59,26 +71,34 @@ function runIlanzouScript(source) {
       loginType: source.login_type,
       account: source.account,
       password: source.password_text,
-      cookie: source.cookie_text
+      cookie: source.cookie_text,
+      mode: options.mode || 'full',
+      existing: options.existing || {}
     }));
     child.stdin.end();
   });
 }
 
-async function syncSource(sourceId) {
+async function syncSource(sourceId, mode = 'incremental') {
   const source = await getSource(sourceId);
   if (!source) throw new HttpError(404, '来源不存在');
   if (source.provider !== 'ilanzou' || source.login_type !== 'account') {
-    throw new HttpError(400, '目前仅支持 ilanzou 账号模式同步，其它类型请手动添加 share_url');
+    throw new HttpError(400, '目前仅支持 ilanzou 账号模式同步');
   }
 
-  const logId = await createSyncLog(sourceId, 'running', '开始同步');
+  const existing = mode === 'incremental' ? await loadExistingShareUrls(sourceId) : {};
+  const logId = await createSyncLog(sourceId, 'running', `开始${mode === 'full' ? '全量' : '增量'}同步`);
+
   try {
-    const raw = await runIlanzouScript(source);
-    const files = raw.map((f) => ({ ...f, sync_hash: toSyncHash(f) }));
-    const result = await upsertResources(sourceId, files);
-    await finishSyncLog(logId, 'success', `同步成功，共 ${files.length} 个文件`, files.length);
-    return { total: files.length, ...result };
+    const result = await runIlanzouScript(source, { mode, existing });
+    const files = (result.files || []).map((f) => ({ ...f, sync_hash: toSyncHash(f) }));
+    const dbResult = await upsertResources(sourceId, files);
+
+    const reusedCount = Number(result.reused || 0);
+    const newCount = Number(result.new || files.length);
+    const msg = `${mode === 'full' ? '全量' : '增量'}同步成功：共 ${files.length} 个文件（复用 ${reusedCount}，新拉取 ${newCount}）`;
+    await finishSyncLog(logId, 'success', msg, files.length);
+    return { total: files.length, reused: reusedCount, new: newCount, mode, ...dbResult };
   } catch (err) {
     await finishSyncLog(logId, 'failed', err.message || String(err));
     throw err;
@@ -90,9 +110,10 @@ async function checkSource(sourceId) {
   if (!source) throw new HttpError(404, '来源不存在');
   const logId = await createSyncLog(sourceId, 'running', '开始检测');
   try {
-    const files = await runIlanzouScript(source);
+    const result = await runIlanzouScript(source, { mode: 'check-only' });
+    const files = result.files || [];
     await pool.query('UPDATE sources SET last_check_at = NOW() WHERE id = ?', [sourceId]);
-    await finishSyncLog(logId, 'success', `检测成功，共 ${files.length} 个文件`, files.length);
+    await finishSyncLog(logId, 'success', `检测成功，共 ${files.length} 个文件（未写库）`, files.length);
     return { total: files.length };
   } catch (err) {
     await finishSyncLog(logId, 'failed', err.message || String(err));

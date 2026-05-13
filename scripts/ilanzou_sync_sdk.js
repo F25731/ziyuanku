@@ -13,9 +13,16 @@ function fileToDict(item, parentFolderId, shareUrl = '') {
   };
 }
 
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label}超时(${ms}ms)`)), ms))
+  ]);
+}
+
 async function safeShareUrl(client, fileId) {
   try {
-    const res = await client.shareUrl(String(fileId || ''));
+    const res = await withTimeout(client.shareUrl(String(fileId || '')), 12000, 'shareUrl');
     return String((res && res.shareUrl) || '').trim();
   } catch (_) {
     return '';
@@ -45,7 +52,7 @@ async function fetchAllInFolder(client, folderId) {
   const limit = 100;
   let offset = 1;
   while (true) {
-    const res = await client.getFileList({ folderId, limit, offset });
+    const res = await withTimeout(client.getFileList({ folderId, limit, offset }), 15000, `getFileList(${folderId})`);
     if (!res || res.code !== 200) {
       throw new Error((res && (res.msg || res.message)) || `ilanzou 列表获取失败, folderId=${folderId}`);
     }
@@ -60,19 +67,25 @@ async function fetchAllInFolder(client, folderId) {
   return all;
 }
 
-async function walk(client, folderId, files, visited) {
+async function walk(ctx, folderId, files, visited) {
   const key = String(folderId ?? 0);
   if (visited.has(key)) return;
   visited.add(key);
-  const items = await fetchAllInFolder(client, Number(folderId || 0));
+  const items = await fetchAllInFolder(ctx.client, Number(folderId || 0));
   for (const item of items) {
     if (isFolderItem(item)) {
-      await walk(client, Number(item.folderId), files, visited);
+      await walk(ctx, Number(item.folderId), files, visited);
       continue;
     }
     if (isFileItem(item)) {
       const fileId = String(item.fileId || item.id || '');
-      const shareUrl = fileId ? await safeShareUrl(client, fileId) : '';
+      // 如果是增量模式 + 已知资源 + 已有 share_url，跳过 shareUrl 调用
+      let shareUrl = '';
+      if (ctx.mode === 'incremental' && ctx.existing && ctx.existing[fileId]) {
+        shareUrl = ctx.existing[fileId];
+      } else if (ctx.mode !== 'check-only' && fileId) {
+        shareUrl = await safeShareUrl(ctx.client, fileId);
+      }
       files.push(fileToDict(item, folderId, shareUrl));
     }
   }
@@ -83,6 +96,8 @@ async function main() {
   const account = String(input.account || '').trim();
   const password = String(input.password || '');
   const rootFolderId = Number(input.rootFolderId || 0);
+  const mode = String(input.mode || 'full'); // full | incremental | check-only
+  const existing = input.existing && typeof input.existing === 'object' ? input.existing : {};
 
   if (!account || !password) throw new Error('账号或密码为空');
 
@@ -90,14 +105,24 @@ async function main() {
   client.config.apiUrl = 'https://apis.ilanzou.com';
   client.client = client.client.extend({ prefixUrl: client.config.apiUrl });
 
-  const loginRes = await client.login();
+  const loginRes = await withTimeout(client.login(), 20000, '登录');
   if (!loginRes || loginRes.code !== 200) {
     throw new Error((loginRes && (loginRes.msg || loginRes.message)) || 'ilanzou 登录失败');
   }
 
   const files = [];
-  await walk(client, rootFolderId, files, new Set());
-  process.stdout.write(JSON.stringify({ ok: true, total: files.length, files }));
+  await walk({ client, mode, existing }, rootFolderId, files, new Set());
+
+  const reused = files.filter((f) => existing[f.file_id]).length;
+  const newOnes = files.length - reused;
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    total: files.length,
+    reused,
+    new: newOnes,
+    mode,
+    files
+  }));
 }
 
 main().catch((err) => {
