@@ -1,0 +1,19 @@
+[x-cloak] { display: none !important; }
+
+html, body { height: 100%; }
+body { background: #f8fafc; }
+
+/* 自定义滚动条 */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+/* table 基础 */
+table th, table td { padding-top: 12px; padding-bottom: 12px; }
+
+/* 小屏自适应 */
+@media (max-width: 768px) {
+  main.ml-60 { margin-left: 0; padding-top: 70px; }
+  aside.fixed { transform: translateX(-100%); }
+}

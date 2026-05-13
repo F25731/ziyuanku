@@ -1,0 +1,31 @@
+{
+  "name": "lanzou-resource-hub",
+  "version": "1.0.0",
+  "description": "Lanzou/iLanzou resource hub — headless API for downstream sites",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "node app.js",
+    "migrate": "node scripts/run_migrations.js",
+    "seed-admin": "node scripts/seed_admin.js",
+    "check": "node --check app.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@netdrive-sdk/ilanzou": "^1.0.3-alpha.4",
+    "axios": "^1.7.9",
+    "bcryptjs": "^2.4.3",
+    "cheerio": "^1.0.0",
+    "compression": "^1.7.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "helmet": "^8.0.0",
+    "ioredis": "^5.4.1",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0",
+    "mysql2": "^3.12.0",
+    "uuid": "^11.0.3"
+  }
+}

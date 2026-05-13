@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>控制台 · Lanzou Resource Hub</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <link rel="stylesheet" href="/admin/assets/app.css">
+</head>
+<body class="bg-slate-50 text-slate-800 antialiased" x-data="dashboard()" x-init="init()" x-cloak>
+
+  <!-- 侧边栏 -->
+  <aside class="fixed inset-y-0 left-0 w-60 bg-slate-900 text-slate-200 flex flex-col z-30">
+    <div class="px-6 py-6 border-b border-slate-800 flex items-center gap-3">
+      <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center">
+        <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"></path></svg>
+      </div>
+      <div>
+        <div class="font-bold text-white">Resource Hub</div>
+        <div class="text-xs text-slate-500">管理控制台</div>
+      </div>
+    </div>
+    <nav class="flex-1 p-4 space-y-1">
+      <template x-for="nav in navs" :key="nav.key">
+        <button @click="tab = nav.key" :class="tab === nav.key ? 'bg-blue-600 text-white shadow-lg shadow-blue-500/30' : 'text-slate-300 hover:bg-slate-800'"
+          class="w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm font-medium transition-all">
+          <span x-html="nav.icon"></span>
+          <span x-text="nav.label"></span>
+        </button>
+      </template>
+    </nav>
+    <div class="p-4 border-t border-slate-800 text-xs text-slate-500">
+      <div class="flex items-center justify-between">
+        <span>当前账号</span>
+        <span class="text-slate-300 font-medium" x-text="currentUser.username"></span>
+      </div>
+      <button @click="logout" class="mt-3 w-full py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs">退出登录</button>
+    </div>
+  </aside>
+
+  <!-- 顶部栏 + 主内容 -->
+  <main class="ml-60 min-h-screen">
+    <header class="sticky top-0 z-20 bg-white/80 backdrop-blur-lg border-b border-slate-200 px-8 py-4 flex items-center justify-between">
+      <div>
+        <h1 class="text-xl font-bold text-slate-800" x-text="currentNav?.label"></h1>
+        <p class="text-xs text-slate-500 mt-0.5" x-text="currentNav?.desc"></p>
+      </div>
+      <div class="flex items-center gap-2 text-xs text-slate-500">
+        <span class="inline-block w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
+        服务运行中
+      </div>
+    </header>
+
+    <div class="p-8">
+
+      <!-- 仪表盘 -->
+      <section x-show="tab === 'dashboard'" x-transition>
+        <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-6">
+          <template x-for="c in statCards" :key="c.key">
+            <div class="bg-white rounded-xl p-5 shadow-sm border border-slate-100">
+              <div class="text-xs text-slate-500 mb-1" x-text="c.label"></div>
+              <div class="text-2xl font-bold text-slate-800" x-text="stats[c.key] ?? '-'"></div>
+            </div>
+          </template>
+        </div>
+        <div class="bg-white rounded-xl shadow-sm border border-slate-100 p-6">
+          <h3 class="font-semibold text-slate-700 mb-4">最近 14 天调用趋势</h3>
+          <div class="h-48 flex items-end gap-1">
+            <template x-for="d in trendDays" :key="d.day">
+              <div class="flex-1 flex flex-col items-center gap-1">
+                <div class="w-full bg-gradient-to-t from-blue-500 to-indigo-400 rounded-t"
+                     :style="'height:' + d.height + '%; min-height: 2px'"></div>
+                <div class="text-[10px] text-slate-400" x-text="d.short"></div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </section>
+
+      <!-- 资源管理 -->
+      <section x-show="tab === 'resources'" x-transition>
+        <div class="bg-white rounded-xl shadow-sm border border-slate-100">
+          <div class="p-5 border-b border-slate-100 flex items-center gap-3">
+            <input x-model="resQuery" @keydown.enter="loadResources(1)" placeholder="搜索文件名..."
+              class="flex-1 px-4 py-2 rounded-lg border border-slate-200 focus:ring-2 focus:ring-blue-400 focus:border-transparent outline-none text-sm">
+            <button @click="loadResources(1)" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium">搜索</button>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead class="bg-slate-50 text-slate-500 text-xs uppercase">
+                <tr><th class="px-4 py-3 text-left">ID</th><th class="px-4 py-3 text-left">文件名</th><th class="px-4 py-3">大小</th><th class="px-4 py-3">类型</th><th class="px-4 py-3">来源</th><th class="px-4 py-3">分享链接</th><th class="px-4 py-3"></th></tr>
+              </thead>
+              <tbody class="divide-y divide-slate-100">
+                <template x-for="r in resList.items" :key="r.id">
+                  <tr class="hover:bg-slate-50">
+                    <td class="px-4 py-3 text-slate-500" x-text="r.id"></td>
+                    <td class="px-4 py-3 font-medium text-slate-700 max-w-lg truncate" x-text="r.file_name"></td>
+                    <td class="px-4 py-3 text-center text-slate-500" x-text="r.file_size"></td>
+                    <td class="px-4 py-3 text-center"><span class="px-2 py-0.5 rounded bg-slate-100 text-xs" x-text="r.file_type || '-'"></span></td>
+                    <td class="px-4 py-3 text-center text-slate-500" x-text="r.source_title || ('#' + r.source_id)"></td>
+                    <td class="px-4 py-3 text-center">
+                      <span x-show="r.share_url" class="inline-block w-2 h-2 rounded-full bg-green-500"></span>
+                      <span x-show="!r.share_url" class="inline-block w-2 h-2 rounded-full bg-slate-300"></span>
+                    </td>
+                    <td class="px-4 py-3 text-right"><button @click="deleteResource(r.id)" class="text-red-500 hover:text-red-600 text-xs">删除</button></td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+          <div class="p-4 flex items-center justify-between text-sm text-slate-500">
+            <span>共 <b class="text-slate-700" x-text="resList.total || 0"></b> 条</span>
+            <div class="flex gap-2">
+              <button @click="loadResources(resPage - 1)" :disabled="resPage <= 1" class="px-3 py-1 rounded border border-slate-200 disabled:opacity-40">上一页</button>
+              <span class="px-3 py-1" x-text="'第 ' + resPage + ' 页'"></span>
+              <button @click="loadResources(resPage + 1)" class="px-3 py-1 rounded border border-slate-200">下一页</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 来源 / 蓝奏账号 -->
+      <section x-show="tab === 'sources'" x-transition>
+        <div class="mb-4"><button @click="openSourceModal()" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium">+ 新增来源</button></div>
+        <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+          <table class="w-full text-sm">
+            <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="px-4 py-3 text-left">标题</th><th class="px-4 py-3">类型</th><th class="px-4 py-3">账号</th><th class="px-4 py-3">最后同步</th><th class="px-4 py-3">状态</th><th class="px-4 py-3 text-right">操作</th></tr></thead>
+            <tbody class="divide-y divide-slate-100">
+              <template x-for="s in sources" :key="s.id">
+                <tr class="hover:bg-slate-50">
+                  <td class="px-4 py-3 font-medium text-slate-700" x-text="s.title"></td>
+                  <td class="px-4 py-3 text-center"><span class="px-2 py-0.5 rounded bg-blue-50 text-blue-600 text-xs" x-text="s.provider + ' · ' + s.login_type"></span></td>
+                  <td class="px-4 py-3 text-center text-slate-500" x-text="s.account || '-'"></td>
+                  <td class="px-4 py-3 text-center text-slate-500 text-xs" x-text="s.last_sync_at || '-'"></td>
+                  <td class="px-4 py-3 text-center"><span :class="s.status ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-500'" class="px-2 py-0.5 rounded text-xs" x-text="s.status ? '启用' : '禁用'"></span></td>
+                  <td class="px-4 py-3 text-right space-x-2">
+                    <button @click="syncSource(s.id)" class="text-blue-600 hover:underline text-xs">同步</button>
+                    <button @click="checkSource(s.id)" class="text-slate-500 hover:underline text-xs">检测</button>
+                    <button @click="deleteSource(s.id)" class="text-red-500 hover:underline text-xs">删除</button>
+                  </td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- API Key 管理 -->
+      <section x-show="tab === 'apikeys'" x-transition>
+        <div class="mb-4"><button @click="openKeyModal()" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium">+ 签发 API Key</button></div>
+        <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+          <table class="w-full text-sm">
+            <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="px-4 py-3 text-left">名称</th><th class="px-4 py-3">Prefix</th><th class="px-4 py-3">配额</th><th class="px-4 py-3">限流</th><th class="px-4 py-3">累计</th><th class="px-4 py-3">状态</th><th class="px-4 py-3 text-right">操作</th></tr></thead>
+            <tbody class="divide-y divide-slate-100">
+              <template x-for="k in apiKeys" :key="k.id">
+                <tr class="hover:bg-slate-50">
+                  <td class="px-4 py-3 font-medium text-slate-700" x-text="k.name"></td>
+                  <td class="px-4 py-3 text-center"><code class="px-2 py-0.5 bg-slate-100 rounded text-xs" x-text="k.key_prefix + '...'"></code></td>
+                  <td class="px-4 py-3 text-center text-slate-500 text-xs"><span x-text="(k.daily_limit ? '日 ' + k.daily_limit : '日不限') + ' / ' + (k.total_limit ? '总 ' + k.total_limit : '总不限')"></span></td>
+                  <td class="px-4 py-3 text-center text-slate-500 text-xs" x-text="k.rate_per_min + '/分钟'"></td>
+                  <td class="px-4 py-3 text-center text-slate-500" x-text="k.used_total"></td>
+                  <td class="px-4 py-3 text-center"><span :class="k.status ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-500'" class="px-2 py-0.5 rounded text-xs" x-text="k.status ? '启用' : '停用'"></span></td>
+                  <td class="px-4 py-3 text-right space-x-2">
+                    <button x-show="k.status" @click="toggleKey(k.id, 'disable')" class="text-amber-600 hover:underline text-xs">停用</button>
+                    <button x-show="!k.status" @click="toggleKey(k.id, 'enable')" class="text-green-600 hover:underline text-xs">启用</button>
+                    <button @click="deleteKey(k.id)" class="text-red-500 hover:underline text-xs">删除</button>
+                  </td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 同步日志 -->
+      <section x-show="tab === 'synclogs'" x-transition>
+        <div class="mb-4 flex justify-between items-center">
+          <button @click="loadSyncLogs" class="px-3 py-1.5 rounded border border-slate-200 text-sm">刷新</button>
+          <button @click="clearSyncLogs" class="px-3 py-1.5 rounded border border-red-200 text-red-600 text-sm">清空</button>
+        </div>
+        <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+          <table class="w-full text-sm">
+            <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="px-4 py-3 text-left">时间</th><th class="px-4 py-3">来源</th><th class="px-4 py-3">状态</th><th class="px-4 py-3">数量</th><th class="px-4 py-3 text-left">消息</th></tr></thead>
+            <tbody class="divide-y divide-slate-100">
+              <template x-for="l in syncLogs" :key="l.id">
+                <tr>
+                  <td class="px-4 py-3 text-xs text-slate-500" x-text="l.created_at"></td>
+                  <td class="px-4 py-3 text-center text-slate-500" x-text="'#' + l.source_id"></td>
+                  <td class="px-4 py-3 text-center"><span :class="{'text-green-600':l.status==='success','text-red-600':l.status==='failed','text-blue-600':l.status==='running'}" x-text="l.status"></span></td>
+                  <td class="px-4 py-3 text-center" x-text="l.total"></td>
+                  <td class="px-4 py-3 text-slate-600 text-xs" x-text="l.message"></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 调用日志 -->
+      <section x-show="tab === 'calllogs'" x-transition>
+        <div class="mb-4"><button @click="loadCallLogs" class="px-3 py-1.5 rounded border border-slate-200 text-sm">刷新</button></div>
+        <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+          <table class="w-full text-sm">
+            <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="px-4 py-3 text-left">时间</th><th class="px-4 py-3">Key</th><th class="px-4 py-3 text-left">路径</th><th class="px-4 py-3">IP</th><th class="px-4 py-3">状态</th><th class="px-4 py-3">耗时</th></tr></thead>
+            <tbody class="divide-y divide-slate-100">
+              <template x-for="l in callLogs" :key="l.id">
+                <tr>
+                  <td class="px-4 py-3 text-xs text-slate-500" x-text="l.created_at"></td>
+                  <td class="px-4 py-3 text-center text-slate-600 text-xs" x-text="l.key_name || '-'"></td>
+                  <td class="px-4 py-3 text-slate-700 text-xs font-mono" x-text="l.path"></td>
+                  <td class="px-4 py-3 text-center text-slate-500 text-xs" x-text="l.ip"></td>
+                  <td class="px-4 py-3 text-center"><span :class="l.status_code>=400?'text-red-600':'text-green-600'" x-text="l.status_code"></span></td>
+                  <td class="px-4 py-3 text-center text-slate-500 text-xs" x-text="l.ms + 'ms'"></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+    </div>
+  </main>
+
+  <!-- Source 新增弹窗 -->
+  <div x-show="sourceModal.open" x-transition class="fixed inset-0 bg-black/50 flex items-center justify-center z-40 p-4" @click.self="sourceModal.open = false">
+    <div class="bg-white rounded-xl w-full max-w-lg p-6">
+      <h3 class="font-bold text-lg mb-4">新增来源</h3>
+      <div class="space-y-3 text-sm">
+        <label class="block"><span class="text-slate-600">标题 *</span><input x-model="sourceModal.title" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200"></label>
+        <label class="block"><span class="text-slate-600">Provider</span>
+          <select x-model="sourceModal.provider" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200">
+            <option value="ilanzou">ilanzou (新版蓝奏)</option>
+          </select>
+        </label>
+        <label class="block"><span class="text-slate-600">登录方式</span>
+          <select x-model="sourceModal.loginType" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200">
+            <option value="account">账号密码</option>
+            <option value="cookie">Cookie</option>
+          </select>
+        </label>
+        <template x-if="sourceModal.loginType === 'account'">
+          <div class="space-y-3">
+            <label class="block"><span class="text-slate-600">账号 *</span><input x-model="sourceModal.account" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200"></label>
+            <label class="block"><span class="text-slate-600">密码 *</span><input x-model="sourceModal.passwordText" type="password" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200"></label>
+          </div>
+        </template>
+        <template x-if="sourceModal.loginType === 'cookie'">
+          <label class="block"><span class="text-slate-600">Cookie *</span><textarea x-model="sourceModal.cookieText" rows="3" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 font-mono text-xs"></textarea></label>
+        </template>
+        <label class="block"><span class="text-slate-600">根目录 ID</span><input x-model="sourceModal.rootFolderId" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200" placeholder="0"></label>
+        <label class="block"><span class="text-slate-600">备注</span><input x-model="sourceModal.remark" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200"></label>
+      </div>
+      <div class="mt-5 flex justify-end gap-2">
+        <button @click="sourceModal.open = false" class="px-4 py-2 rounded-lg border border-slate-200 text-sm">取消</button>
+        <button @click="saveSource" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- API Key 签发弹窗 -->
+  <div x-show="keyModal.open" x-transition class="fixed inset-0 bg-black/50 flex items-center justify-center z-40 p-4" @click.self="keyModal.open = false">
+    <div class="bg-white rounded-xl w-full max-w-lg p-6">
+      <h3 class="font-bold text-lg mb-4">签发新的 API Key</h3>
+      <div class="space-y-3 text-sm">
+        <label class="block"><span class="text-slate-600">名称 *</span><input x-model="keyModal.name" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200" placeholder="如: 小说站-生产"></label>
+        <div class="grid grid-cols-3 gap-3">
+          <label class="block"><span class="text-slate-600">日配额</span><input type="number" x-model.number="keyModal.dailyLimit" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200" placeholder="0 = 不限"></label>
+          <label class="block"><span class="text-slate-600">总配额</span><input type="number" x-model.number="keyModal.totalLimit" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200" placeholder="0 = 不限"></label>
+          <label class="block"><span class="text-slate-600">限流/分</span><input type="number" x-model.number="keyModal.ratePerMin" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200" placeholder="60"></label>
+        </div>
+        <label class="block"><span class="text-slate-600">备注</span><input x-model="keyModal.remark" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200"></label>
+        <div x-show="keyModal.result" class="p-4 bg-amber-50 border border-amber-200 rounded-lg">
+          <div class="text-xs text-amber-700 mb-2">请立即复制并妥善保存，关闭弹窗后不再显示：</div>
+          <div class="font-mono text-xs text-slate-800 break-all bg-white p-2 rounded border border-amber-100" x-text="keyModal.result"></div>
+        </div>
+      </div>
+      <div class="mt-5 flex justify-end gap-2">
+        <button @click="closeKeyModal" class="px-4 py-2 rounded-lg border border-slate-200 text-sm">关闭</button>
+        <button x-show="!keyModal.result" @click="saveKey" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm">签发</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 轻提示 -->
+  <div x-show="toast.msg" x-transition class="fixed top-6 right-6 z-50 px-5 py-3 rounded-lg shadow-xl text-white"
+       :class="toast.type === 'error' ? 'bg-red-500' : 'bg-slate-800'" x-text="toast.msg"></div>
+
+  <script src="/admin/assets/app.js"></script>
+</body>
+</html>

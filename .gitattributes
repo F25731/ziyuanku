@@ -1,0 +1,21 @@
+# 默认自动识别文本文件并规范化行尾
+* text=auto eol=lf
+
+# 强制 LF（跨平台必须，服务器上跑会出问题）
+*.sh     text eol=lf
+*.js     text eol=lf
+*.json   text eol=lf
+*.sql    text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.md     text eol=lf
+*.html   text eol=lf
+*.css    text eol=lf
+Dockerfile text eol=lf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.ico binary
+*.gz  binary
+*.tar binary
