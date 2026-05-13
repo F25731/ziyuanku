@@ -64,6 +64,7 @@ function dashboard() {
 
     sourceModal: { open: false, title: '', provider: 'ilanzou', loginType: 'account', account: '', passwordText: '', cookieText: '', rootFolderId: '0', remark: '' },
     keyModal: { open: false, name: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', result: '' },
+    linkModal: { open: false, fileName: '', url: '', expireText: '', cached: false },
     toast: { msg: '', type: '' },
 
     init() {
@@ -118,6 +119,42 @@ function dashboard() {
       await api('/resources/' + id, { method: 'DELETE' });
       this.notify('已删除');
       this.loadResources(this.resPage);
+    },
+
+    async getDirectLink(r) {
+      r._linkLoading = true;
+      try {
+        const d = await api('/resources/' + r.id + '/link');
+        const expireMs = Number(d.expire_at || 0);
+        const expireText = expireMs
+          ? new Date(expireMs).toLocaleString('zh-CN', { hour12: false })
+          : '未知';
+        this.linkModal = { open: true, fileName: d.file_name || r.file_name, url: d.url, expireText, cached: !!d.cached };
+      } catch (e) {
+        this.notify('解析失败: ' + e.message, 'error');
+      } finally {
+        r._linkLoading = false;
+      }
+    },
+    async copyDirectLink() {
+      const url = this.linkModal.url;
+      if (!url) return;
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(url);
+        } else {
+          const ta = document.createElement('textarea');
+          ta.value = url;
+          ta.style.position = 'fixed'; ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          document.body.removeChild(ta);
+        }
+        this.notify('已复制到剪贴板');
+      } catch (e) {
+        this.notify('复制失败，请手动选择文本', 'error');
+      }
     },
 
     async loadSources() {

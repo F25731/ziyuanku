@@ -82,6 +82,19 @@ router.delete('/resources/:id', adminRequired, asyncHandler(async (req, res) => 
   res.json({ code: 200, message: '已删除' });
 }));
 
+router.get('/resources/:id/link', asyncHandler(async (req, res) => {
+  const { getResource } = require('../services/resourceService');
+  const { resolve: resolveLink } = require('../services/linkResolver');
+  const r = await getResource(Number(req.params.id));
+  if (!r || r.is_deleted) return res.status(404).json({ code: 404, message: '资源不存在' });
+  try {
+    const { url, expire_at, cached } = await resolveLink(r);
+    res.json({ code: 200, message: 'ok', file_name: r.file_name, url, expire_at, cached });
+  } catch (err) {
+    res.status(502).json({ code: 502, message: '解析直链失败', detail: err.message });
+  }
+}));
+
 // ---------- 来源（蓝奏账号）管理 ----------
 router.get('/sources', asyncHandler(async (req, res) => {
   const items = await listSources();
