@@ -26,7 +26,16 @@ async function api(path, options = {}) {
     return;
   }
   const d = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(d.message || ('HTTP ' + r.status));
+  if (!r.ok) {
+    const err = new Error(d.message || ('HTTP ' + r.status));
+    err.detail = d.detail || '';
+    if (d.context) {
+      err.detail = (err.detail ? err.detail + '\n\n' : '')
+        + 'context: ' + JSON.stringify(d.context, null, 2);
+    }
+    err.status = r.status;
+    throw err;
+  }
   return d;
 }
 
@@ -62,9 +71,12 @@ function dashboard() {
     syncLogs: [],
     callLogs: [],
 
+    busyTasks: [],
+
     sourceModal: { open: false, title: '', provider: 'ilanzou', loginType: 'account', account: '', passwordText: '', cookieText: '', rootFolderId: '0', remark: '' },
     keyModal: { open: false, name: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', result: '' },
-    linkModal: { open: false, fileName: '', url: '', expireText: '', cached: false },
+    linkModal: { open: false, fileName: '', url: '', expireText: '', cached: false, loading: false, error: '', detail: '' },
+    errorModal: { open: false, title: '', message: '', detail: '' },
     toast: { msg: '', type: '' },
 
     init() {
@@ -84,7 +96,23 @@ function dashboard() {
 
     notify(msg, type = 'info') {
       this.toast = { msg, type };
-      setTimeout(() => { this.toast = { msg: '', type: '' }; }, 2500);
+      setTimeout(() => { this.toast = { msg: '', type: '' }; }, 2800);
+    },
+    showError(title, err) {
+      this.errorModal = {
+        open: true,
+        title: title || '出错了',
+        message: (err && err.message) || String(err) || '未知错误',
+        detail: (err && err.detail) || ''
+      };
+    },
+    startTask(label) {
+      const id = Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+      this.busyTasks.push({ id, label, startAt: Date.now() });
+      return id;
+    },
+    endTask(id) {
+      this.busyTasks = this.busyTasks.filter((t) => t.id !== id);
     },
 
     logout() {
@@ -123,17 +151,25 @@ function dashboard() {
 
     async getDirectLink(r) {
       r._linkLoading = true;
+      this.linkModal = { open: true, fileName: r.file_name, url: '', expireText: '', cached: false, loading: true, error: '', detail: '' };
+      const taskId = this.startTask('解析直链: ' + r.file_name);
       try {
         const d = await api('/resources/' + r.id + '/link');
         const expireMs = Number(d.expire_at || 0);
         const expireText = expireMs
           ? new Date(expireMs).toLocaleString('zh-CN', { hour12: false })
           : '未知';
-        this.linkModal = { open: true, fileName: d.file_name || r.file_name, url: d.url, expireText, cached: !!d.cached };
+        this.linkModal = { open: true, fileName: d.file_name || r.file_name, url: d.url, expireText, cached: !!d.cached, loading: false, error: '', detail: '' };
       } catch (e) {
-        this.notify('解析失败: ' + e.message, 'error');
+        this.linkModal = {
+          open: true, fileName: r.file_name, url: '', expireText: '',
+          cached: false, loading: false,
+          error: e.message || '解析失败',
+          detail: e.detail || ''
+        };
       } finally {
         r._linkLoading = false;
+        this.endTask(taskId);
       }
     },
     async copyDirectLink() {
@@ -159,7 +195,7 @@ function dashboard() {
 
     async loadSources() {
       const d = await api('/sources');
-      this.sources = d.items || [];
+      this.sources = (d.items || []).map((s) => ({ ...s, _syncing: false, _checking: false }));
     },
     openSourceModal() {
       this.sourceModal = { open: true, title: '', provider: 'ilanzou', loginType: 'account', account: '', passwordText: '', cookieText: '', rootFolderId: '0', remark: '' };
@@ -170,21 +206,36 @@ function dashboard() {
         this.sourceModal.open = false;
         this.notify('已保存');
         this.loadSources();
-      } catch (e) { this.notify(e.message, 'error'); }
+      } catch (e) { this.showError('保存失败', e); }
     },
     async syncSource(id) {
-      this.notify('同步中，可能需要几十秒...');
+      const src = this.sources.find((s) => s.id === id);
+      if (src) src._syncing = true;
+      const taskId = this.startTask('同步来源: ' + (src ? src.title : '#' + id));
       try {
         const d = await api('/sources/' + id + '/sync', { method: 'POST' });
         this.notify('同步完成，共 ' + d.total + ' 个文件');
         this.loadSources();
-      } catch (e) { this.notify('同步失败: ' + e.message, 'error'); }
+      } catch (e) {
+        this.showError('同步失败', e);
+      } finally {
+        if (src) src._syncing = false;
+        this.endTask(taskId);
+      }
     },
     async checkSource(id) {
+      const src = this.sources.find((s) => s.id === id);
+      if (src) src._checking = true;
+      const taskId = this.startTask('检测来源: ' + (src ? src.title : '#' + id));
       try {
         const d = await api('/sources/' + id + '/check', { method: 'POST' });
         this.notify('检测通过，共 ' + d.total + ' 个文件');
-      } catch (e) { this.notify('检测失败: ' + e.message, 'error'); }
+      } catch (e) {
+        this.showError('检测失败', e);
+      } finally {
+        if (src) src._checking = false;
+        this.endTask(taskId);
+      }
     },
     async deleteSource(id) {
       if (!confirm('确认删除该来源？关联的资源和日志会一并清除')) return;
@@ -209,7 +260,7 @@ function dashboard() {
         const d = await api('/api-keys', { method: 'POST', body: this.keyModal });
         this.keyModal.result = d.item.plain_key;
         this.notify('已签发');
-      } catch (e) { this.notify(e.message, 'error'); }
+      } catch (e) { this.showError('签发失败', e); }
     },
     async toggleKey(id, op) {
       await api('/api-keys/' + id + '/' + op, { method: 'POST' });

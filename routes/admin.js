@@ -91,7 +91,21 @@ router.get('/resources/:id/link', asyncHandler(async (req, res) => {
     const { url, expire_at, cached } = await resolveLink(r);
     res.json({ code: 200, message: 'ok', file_name: r.file_name, url, expire_at, cached });
   } catch (err) {
-    res.status(502).json({ code: 502, message: '解析直链失败', detail: err.message });
+    const ctx = {
+      resource_id: r.id,
+      source_provider: r.source_provider,
+      source_login_type: r.source_login_type,
+      file_id: r.file_id,
+      has_share_url: !!r.share_url,
+      has_share_pwd: !!r.share_pwd,
+      has_account: !!r.source_account
+    };
+    res.status(502).json({
+      code: 502,
+      message: '解析直链失败',
+      detail: (err && err.message) || String(err),
+      context: ctx
+    });
   }
 }));
 
