@@ -17,10 +17,15 @@ async function ensureMigrationsTable() {
 }
 
 function splitStatements(sql) {
-  return sql
-    .split(/;\s*\n/)
+  // 先逐行剥掉行注释（-- 开头）和空行，再按分号拆分
+  const cleaned = sql
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*--/.test(line))
+    .join('\n');
+  return cleaned
+    .split(/;\s*(?:\n|$)/)
     .map((s) => s.trim())
-    .filter((s) => s.length > 0 && !/^--/.test(s));
+    .filter((s) => s.length > 0);
 }
 
 async function runMigrations() {
