@@ -25,18 +25,24 @@ async function compareKey(plain, hash) {
   return bcrypt.compare(String(plain), hash);
 }
 
-async function createApiKey({ name, dailyLimit = 0, totalLimit = 0, ratePerMin = 60, remark = '', expireAt = null, ownerUserId = null }) {
+async function createApiKey({ name, dailyLimit = 0, totalLimit = 0, ratePerMin = 60, remark = '', expireDays = 30, ownerUserId = null }) {
   if (!name) throw new HttpError(400, '名称必填');
   const plain = generatePlainKey();
   const prefix = prefixOf(plain);
   const keyHash = await hashKey(plain);
 
+  // expireDays: 0 = 不限；正数 = 现在起 N 天后到期
+  const days = Number(expireDays);
+  const expireSql = (Number.isFinite(days) && days > 0) ? `DATE_ADD(NOW(), INTERVAL ${Math.floor(days)} DAY)` : 'NULL';
+
   const [result] = await pool.query(
     `INSERT INTO api_keys (name, key_prefix, key_hash, owner_user_id, daily_limit, total_limit, rate_per_min, remark, expire_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [name, prefix, keyHash, ownerUserId, Number(dailyLimit) || 0, Number(totalLimit) || 0, Number(ratePerMin) || 60, remark || null, expireAt || null]
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ${expireSql})`,
+    [name, prefix, keyHash, ownerUserId, Number(dailyLimit) || 0, Number(totalLimit) || 0, Number(ratePerMin) || 60, remark || null]
   );
   const id = result.insertId;
+  // 把刚插入的 expire_at 取回（让前端能立即显示）
+  const [[row]] = await pool.query('SELECT expire_at FROM api_keys WHERE id = ?', [id]);
   return {
     id,
     name,
@@ -45,10 +51,33 @@ async function createApiKey({ name, dailyLimit = 0, totalLimit = 0, ratePerMin =
     daily_limit: Number(dailyLimit) || 0,
     total_limit: Number(totalLimit) || 0,
     rate_per_min: Number(ratePerMin) || 60,
-    expire_at: expireAt,
+    expire_at: row ? row.expire_at : null,
     remark,
     warning: '请妥善保存：完整 key 只会显示这一次'
   };
+}
+
+// 延长有效期：days = 0 不动；>0 在原到期时间上加 N 天（已过期则从今天起加）
+async function extendExpire(id, days) {
+  const n = Math.floor(Number(days) || 0);
+  if (n <= 0) throw new HttpError(400, '天数必须 > 0');
+  const [[row]] = await pool.query('SELECT expire_at FROM api_keys WHERE id = ? LIMIT 1', [id]);
+  if (!row) throw new HttpError(404, 'Key 不存在');
+  const now = Date.now();
+  let baseSql;
+  if (!row.expire_at) {
+    // 原本永不过期，仍然永不过期
+    return { id, expire_at: null, message: '原 Key 永不过期，无需延长' };
+  }
+  const expMs = new Date(row.expire_at).getTime();
+  if (expMs < now) {
+    baseSql = `DATE_ADD(NOW(), INTERVAL ${n} DAY)`;
+  } else {
+    baseSql = `DATE_ADD(expire_at, INTERVAL ${n} DAY)`;
+  }
+  await pool.query(`UPDATE api_keys SET expire_at = ${baseSql} WHERE id = ?`, [id]);
+  const [[updated]] = await pool.query('SELECT expire_at FROM api_keys WHERE id = ?', [id]);
+  return { id, expire_at: updated.expire_at, added_days: n };
 }
 
 async function listApiKeys() {
@@ -119,7 +148,8 @@ async function getDailyUsage(apiKeyId) {
   return Number(row.total || 0);
 }
 
-// 只允许改非敏感字段：key_prefix / key_hash 永远不动
+// 只允许改非敏感字段：key_prefix / key_hash / expire_at 永远不动
+// expire_at 通过 extendExpire 单独修改
 async function updateApiKey(id, payload) {
   const map = {
     name: 'name',
@@ -127,7 +157,6 @@ async function updateApiKey(id, payload) {
     totalLimit: 'total_limit',
     ratePerMin: 'rate_per_min',
     remark: 'remark',
-    expireAt: 'expire_at',
     status: 'status'
   };
   const fields = [];
@@ -136,7 +165,6 @@ async function updateApiKey(id, payload) {
     if (payload[k] !== undefined) {
       let v = payload[k];
       if (['dailyLimit', 'totalLimit', 'ratePerMin', 'status'].includes(k)) v = Number(v) || 0;
-      if (k === 'expireAt' && (v === '' || v === null)) v = null;
       fields.push(`${map[k]} = ?`);
       values.push(v);
     }
@@ -154,6 +182,7 @@ async function updateApiKey(id, payload) {
 module.exports = {
   createApiKey,
   updateApiKey,
+  extendExpire,
   listApiKeys,
   verifyPlainKey,
   disableApiKey,

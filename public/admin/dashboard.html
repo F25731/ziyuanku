@@ -16,8 +16,22 @@
     <div class="h-full bg-gradient-to-r from-blue-500 via-indigo-500 to-purple-500 animate-pulse" style="width:100%"></div>
   </div>
 
+  <!-- 移动端汉堡菜单按钮 -->
+  <button @click="sidebarOpen = !sidebarOpen"
+    class="md:hidden fixed top-3 left-3 z-40 w-10 h-10 rounded-lg bg-slate-900 text-white flex items-center justify-center shadow-lg">
+    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+        :d="sidebarOpen ? 'M6 18L18 6M6 6l12 12' : 'M4 6h16M4 12h16M4 18h16'"/>
+    </svg>
+  </button>
+
+  <!-- 移动端遮罩层 -->
+  <div x-show="sidebarOpen" @click="sidebarOpen=false" x-transition.opacity
+    class="md:hidden fixed inset-0 bg-black/40 z-30"></div>
+
   <!-- 侧边栏 -->
-  <aside class="fixed inset-y-0 left-0 w-60 bg-slate-900 text-slate-200 flex flex-col z-30">
+  <aside :class="sidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'"
+    class="fixed inset-y-0 left-0 w-60 bg-slate-900 text-slate-200 flex flex-col z-40 transition-transform duration-200">
     <div class="px-6 py-6 border-b border-slate-800 flex items-center gap-3">
       <img src="/admin/assets/logo.svg" alt="云逸蓝奏" class="w-10 h-10 rounded-xl">
       <div>
@@ -25,9 +39,9 @@
         <div class="text-xs text-slate-500">管理控制台</div>
       </div>
     </div>
-    <nav class="flex-1 p-4 space-y-1">
+    <nav class="flex-1 p-4 space-y-1 overflow-y-auto">
       <template x-for="nav in navs" :key="nav.key">
-        <button @click="tab = nav.key" :class="tab === nav.key ? 'bg-blue-600 text-white shadow-lg shadow-blue-500/30' : 'text-slate-300 hover:bg-slate-800'"
+        <button @click="tab = nav.key; sidebarOpen = false" :class="tab === nav.key ? 'bg-blue-600 text-white shadow-lg shadow-blue-500/30' : 'text-slate-300 hover:bg-slate-800'"
           class="w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm font-medium transition-all">
           <span x-html="nav.icon"></span>
           <span x-text="nav.label"></span>
@@ -44,19 +58,19 @@
   </aside>
 
   <!-- 顶部栏 + 主内容 -->
-  <main class="ml-60 min-h-screen">
-    <header class="sticky top-0 z-20 bg-white/80 backdrop-blur-lg border-b border-slate-200 px-8 py-4 flex items-center justify-between">
+  <main class="md:ml-60 min-h-screen">
+    <header class="sticky top-0 z-20 bg-white/80 backdrop-blur-lg border-b border-slate-200 px-4 md:px-8 py-4 pl-16 md:pl-8 flex items-center justify-between">
       <div>
-        <h1 class="text-xl font-bold text-slate-800" x-text="currentNav?.label"></h1>
-        <p class="text-xs text-slate-500 mt-0.5" x-text="currentNav?.desc"></p>
+        <h1 class="text-lg md:text-xl font-bold text-slate-800" x-text="currentNav?.label"></h1>
+        <p class="text-xs text-slate-500 mt-0.5 hidden sm:block" x-text="currentNav?.desc"></p>
       </div>
       <div class="flex items-center gap-2 text-xs text-slate-500">
         <span class="inline-block w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
-        服务运行中
+        <span class="hidden sm:inline">服务运行中</span>
       </div>
     </header>
 
-    <div class="p-8">
+    <div class="p-4 md:p-8">
 
       <!-- 仪表盘 -->
       <section x-show="tab === 'dashboard'" x-transition>
@@ -176,7 +190,7 @@
             </div>
           </div>
           <div class="overflow-x-auto">
-            <table class="w-full text-sm">
+            <table class="w-full text-sm min-w-[640px]">
               <thead class="bg-slate-50 text-slate-500 text-xs uppercase">
                 <tr><th class="px-4 py-3 text-left">ID</th><th class="px-4 py-3 text-left">文件名</th><th class="px-4 py-3">大小</th><th class="px-4 py-3">类型</th><th class="px-4 py-3">来源</th><th class="px-4 py-3">分享</th><th class="px-4 py-3">直链</th><th class="px-4 py-3 text-right">操作</th></tr>
               </thead>
@@ -248,7 +262,8 @@
           <div x-show="tabLoading.sources" class="absolute inset-0 z-10 bg-white/70 backdrop-blur-sm flex items-center justify-center">
             <svg class="animate-spin w-7 h-7 text-blue-500" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg>
           </div>
-          <table class="w-full text-sm">
+          <div class="overflow-x-auto">
+          <table class="w-full text-sm min-w-[640px]">
             <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="px-4 py-3 text-left">标题</th><th class="px-4 py-3">类型</th><th class="px-4 py-3">账号</th><th class="px-4 py-3">最后同步</th><th class="px-4 py-3">状态</th><th class="px-4 py-3">健康</th><th class="px-4 py-3 text-right">操作</th></tr></thead>
             <tbody class="divide-y divide-slate-100">
               <template x-for="s in sources" :key="s.id">
@@ -313,6 +328,7 @@
               </template>
             </tbody>
           </table>
+          </div>
         </div>
       </section>
 
@@ -323,8 +339,9 @@
           <div x-show="tabLoading.apikeys" class="absolute inset-0 z-10 bg-white/70 backdrop-blur-sm flex items-center justify-center">
             <svg class="animate-spin w-7 h-7 text-blue-500" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg>
           </div>
-          <table class="w-full text-sm">
-            <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="px-4 py-3 text-left">名称</th><th class="px-4 py-3">Prefix</th><th class="px-4 py-3">配额</th><th class="px-4 py-3">限流</th><th class="px-4 py-3">累计</th><th class="px-4 py-3">状态</th><th class="px-4 py-3 text-right">操作</th></tr></thead>
+          <div class="overflow-x-auto">
+          <table class="w-full text-sm min-w-[640px]">
+            <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="px-4 py-3 text-left">名称</th><th class="px-4 py-3">Prefix</th><th class="px-4 py-3">配额</th><th class="px-4 py-3">限流</th><th class="px-4 py-3">累计</th><th class="px-4 py-3">到期</th><th class="px-4 py-3">状态</th><th class="px-4 py-3 text-right">操作</th></tr></thead>
             <tbody class="divide-y divide-slate-100">
               <template x-for="k in apiKeys" :key="k.id">
                 <tr class="hover:bg-slate-50">
@@ -333,6 +350,16 @@
                   <td class="px-4 py-3 text-center text-slate-500 text-xs"><span x-text="(k.daily_limit ? '日 ' + k.daily_limit : '日不限') + ' / ' + (k.total_limit ? '总 ' + k.total_limit : '总不限')"></span></td>
                   <td class="px-4 py-3 text-center text-slate-500 text-xs" x-text="k.rate_per_min + '/分钟'"></td>
                   <td class="px-4 py-3 text-center text-slate-500" x-text="k.used_total"></td>
+                  <td class="px-4 py-3 text-center text-xs">
+                    <template x-if="!k.expire_at">
+                      <span class="text-slate-500">永不</span>
+                    </template>
+                    <template x-if="k.expire_at">
+                      <span :class="daysLeft(k.expire_at) < 0 ? 'text-red-600' : (daysLeft(k.expire_at) < 7 ? 'text-amber-600' : 'text-slate-600')"
+                        :title="k.expire_at"
+                        x-text="daysLeft(k.expire_at) < 0 ? ('已过期 ' + (-daysLeft(k.expire_at)) + ' 天') : ('剩 ' + daysLeft(k.expire_at) + ' 天')"></span>
+                    </template>
+                  </td>
                   <td class="px-4 py-3 text-center"><span :class="k.status ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-500'" class="px-2 py-0.5 rounded text-xs" x-text="k.status ? '启用' : '停用'"></span></td>
                   <td class="px-4 py-3 text-right space-x-2">
                     <button x-show="k.status" @click="toggleKey(k.id, 'disable')" class="text-amber-600 hover:underline text-xs">停用</button>
@@ -344,6 +371,7 @@
               </template>
             </tbody>
           </table>
+          </div>
         </div>
       </section>
 
@@ -357,7 +385,8 @@
           <div x-show="tabLoading.synclogs" class="absolute inset-0 z-10 bg-white/70 backdrop-blur-sm flex items-center justify-center">
             <svg class="animate-spin w-7 h-7 text-blue-500" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg>
           </div>
-          <table class="w-full text-sm">
+          <div class="overflow-x-auto">
+          <table class="w-full text-sm min-w-[640px]">
             <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="px-4 py-3 text-left">时间</th><th class="px-4 py-3">来源</th><th class="px-4 py-3">状态</th><th class="px-4 py-3">数量</th><th class="px-4 py-3 text-left">消息</th></tr></thead>
             <tbody class="divide-y divide-slate-100">
               <template x-for="l in syncLogs" :key="l.id">
@@ -371,6 +400,7 @@
               </template>
             </tbody>
           </table>
+          </div>
         </div>
       </section>
 
@@ -381,7 +411,8 @@
           <div x-show="tabLoading.calllogs" class="absolute inset-0 z-10 bg-white/70 backdrop-blur-sm flex items-center justify-center">
             <svg class="animate-spin w-7 h-7 text-blue-500" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg>
           </div>
-          <table class="w-full text-sm">
+          <div class="overflow-x-auto">
+          <table class="w-full text-sm min-w-[640px]">
             <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="px-4 py-3 text-left">时间</th><th class="px-4 py-3">Key</th><th class="px-4 py-3 text-left">路径</th><th class="px-4 py-3">IP</th><th class="px-4 py-3">状态</th><th class="px-4 py-3">耗时</th></tr></thead>
             <tbody class="divide-y divide-slate-100">
               <template x-for="l in callLogs" :key="l.id">
@@ -396,6 +427,7 @@
               </template>
             </tbody>
           </table>
+          </div>
         </div>
       </section>
 
@@ -538,7 +570,7 @@
 
   <!-- Source 新增弹窗 -->
   <div x-show="sourceModal.open" x-transition class="fixed inset-0 bg-black/50 flex items-center justify-center z-40 p-4" @click.self="sourceModal.open = false">
-    <div class="bg-white rounded-xl w-full max-w-lg p-6">
+    <div class="bg-white rounded-xl w-full max-w-lg p-6 max-h-[90vh] overflow-y-auto">
       <h3 class="font-bold text-lg mb-4">新增来源</h3>
       <div class="space-y-3 text-sm">
         <label class="block"><span class="text-slate-600">标题 *</span><input x-model="sourceModal.title" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200"></label>
@@ -574,7 +606,7 @@
 
   <!-- Source 编辑弹窗（不能改账号，其它字段可改）-->
   <div x-show="sourceEditModal.open" x-transition class="fixed inset-0 bg-black/50 flex items-center justify-center z-40 p-4" @click.self="sourceEditModal.open = false">
-    <div class="bg-white rounded-xl w-full max-w-lg p-6">
+    <div class="bg-white rounded-xl w-full max-w-lg p-6 max-h-[90vh] overflow-y-auto">
       <h3 class="font-bold text-lg mb-1">编辑来源</h3>
       <p class="text-xs text-slate-500 mb-4">账号不可修改，想换账号请删除后重新添加</p>
       <div class="space-y-3 text-sm">
@@ -605,15 +637,17 @@
 
   <!-- API Key 签发弹窗 -->
   <div x-show="keyModal.open" x-transition class="fixed inset-0 bg-black/50 flex items-center justify-center z-40 p-4" @click.self="keyModal.open = false">
-    <div class="bg-white rounded-xl w-full max-w-lg p-6">
+    <div class="bg-white rounded-xl w-full max-w-lg p-6 max-h-[90vh] overflow-y-auto">
       <h3 class="font-bold text-lg mb-4">签发新的 API Key</h3>
       <div class="space-y-3 text-sm">
         <label class="block"><span class="text-slate-600">名称 *</span><input x-model="keyModal.name" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200" placeholder="如: 小说站-生产"></label>
-        <div class="grid grid-cols-3 gap-3">
-          <label class="block"><span class="text-slate-600">日配额</span><input type="number" x-model.number="keyModal.dailyLimit" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200" placeholder="0 = 不限"></label>
-          <label class="block"><span class="text-slate-600">总配额</span><input type="number" x-model.number="keyModal.totalLimit" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200" placeholder="0 = 不限"></label>
-          <label class="block"><span class="text-slate-600">限流/分</span><input type="number" x-model.number="keyModal.ratePerMin" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200" placeholder="60"></label>
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <label class="block"><span class="text-slate-600">日配额</span><input type="number" x-model.number="keyModal.dailyLimit" min="0" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200" placeholder="0=不限"></label>
+          <label class="block"><span class="text-slate-600">总配额</span><input type="number" x-model.number="keyModal.totalLimit" min="0" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200" placeholder="0=不限"></label>
+          <label class="block"><span class="text-slate-600">限流/分</span><input type="number" x-model.number="keyModal.ratePerMin" min="1" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200" placeholder="60"></label>
+          <label class="block"><span class="text-slate-600">有效天数</span><input type="number" x-model.number="keyModal.expireDays" min="0" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200" placeholder="30"></label>
         </div>
+        <p class="text-xs text-slate-400">默认 30 天有效；填 0 = 永不过期</p>
         <label class="block"><span class="text-slate-600">备注</span><input x-model="keyModal.remark" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200"></label>
         <div x-show="keyModal.result" class="p-4 bg-amber-50 border border-amber-200 rounded-lg">
           <div class="text-xs text-amber-700 mb-2">请立即复制并妥善保存，关闭弹窗后不再显示：</div>
@@ -629,7 +663,7 @@
 
   <!-- API Key 编辑弹窗（不能改 Key 本体）-->
   <div x-show="keyEditModal.open" x-transition class="fixed inset-0 bg-black/50 flex items-center justify-center z-40 p-4" @click.self="keyEditModal.open = false">
-    <div class="bg-white rounded-xl w-full max-w-lg p-6">
+    <div class="bg-white rounded-xl w-full max-w-lg p-6 max-h-[90vh] overflow-y-auto">
       <h3 class="font-bold text-lg mb-1">编辑 API Key</h3>
       <p class="text-xs text-slate-500 mb-4">Key 本体不可修改，如需更换请删除后重新签发</p>
       <div class="space-y-3 text-sm">
@@ -644,10 +678,19 @@
           <label class="block"><span class="text-slate-600">限流/分</span><input type="number" x-model.number="keyEditModal.ratePerMin" min="1" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200" placeholder="60"></label>
         </div>
         <label class="block"><span class="text-slate-600">备注</span><input x-model="keyEditModal.remark" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200"></label>
-        <label class="block">
-          <span class="text-slate-600">到期时间 <span class="text-slate-400 text-xs">（留空=永不）</span></span>
-          <input x-model="keyEditModal.expireAt" type="datetime-local" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200">
-        </label>
+
+        <div class="p-3 rounded-lg bg-slate-50 border border-slate-200">
+          <div class="text-xs text-slate-500 mb-1">当前到期时间</div>
+          <div class="text-sm font-medium text-slate-700 mb-2" x-text="keyEditModal.expireText || '永不过期'"></div>
+          <div class="flex gap-2 items-center">
+            <input type="number" x-model.number="keyEditModal.addDays" min="1" placeholder="30"
+              class="w-24 px-3 py-2 rounded-lg border border-slate-200 text-sm">
+            <span class="text-xs text-slate-500">天</span>
+            <button @click="doExtend" class="px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium">立即延长</button>
+            <span x-show="keyEditModal.extendMsg" class="text-xs text-green-600" x-text="keyEditModal.extendMsg"></span>
+          </div>
+          <p class="text-xs text-slate-400 mt-2">已过期会从今天开始算 N 天；未过期则在原到期时间上加 N 天</p>
+        </div>
       </div>
       <div class="mt-5 flex justify-end gap-2">
         <button @click="keyEditModal.open = false" class="px-4 py-2 rounded-lg border border-slate-200 text-sm">取消</button>
@@ -708,7 +751,7 @@
 
   <!-- 错误弹窗（通用） -->
   <div x-show="errorModal.open" x-transition class="fixed inset-0 bg-black/50 flex items-center justify-center z-40 p-4" @click.self="errorModal.open = false">
-    <div class="bg-white rounded-xl w-full max-w-xl p-6">
+    <div class="bg-white rounded-xl w-full max-w-xl p-6 max-h-[90vh] overflow-y-auto">
       <div class="flex items-center gap-3 mb-4">
         <div class="w-10 h-10 rounded-full bg-red-100 flex items-center justify-center">
           <svg class="w-5 h-5 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>

@@ -15,10 +15,10 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
 </head>
 <body class="bg-slate-50 min-h-screen" x-data="testApp()" x-init="init()" x-cloak>
 
-<header class="bg-mesh text-white p-6">
+<header class="bg-mesh text-white p-4 md:p-6">
   <div class="max-w-5xl mx-auto">
-    <h1 class="text-2xl font-bold">云逸蓝奏 · API 测试面板</h1>
-    <p class="text-slate-300 text-sm mt-1">本地测试工具 · Key 已写死</p>
+    <h1 class="text-xl md:text-2xl font-bold">云逸蓝奏 · API 测试面板</h1>
+    <p class="text-slate-300 text-xs md:text-sm mt-1">本地测试工具 · Key 已写死</p>
     <div class="mt-5 grid md:grid-cols-2 gap-3 text-sm">
       <label class="block">
         <span class="text-slate-300 text-xs">HOST</span>
@@ -50,18 +50,18 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
   </div>
 </div>
 
-<nav class="max-w-5xl mx-auto mt-6 px-4">
-  <div class="flex gap-1 bg-white rounded-lg p-1 shadow-sm border border-slate-200">
+<nav class="max-w-5xl mx-auto mt-4 md:mt-6 px-4">
+  <div class="flex flex-wrap gap-1 bg-white rounded-lg p-1 shadow-sm border border-slate-200 overflow-x-auto">
     <template x-for="t in tabs" :key="t.key">
-      <button @click="tab=t.key" :class="tab===t.key?'bg-blue-600 text-white':'text-slate-600 hover:bg-slate-100'" class="flex-1 px-4 py-2 rounded text-sm font-medium transition" x-text="t.label"></button>
+      <button @click="tab=t.key" :class="tab===t.key?'bg-blue-600 text-white':'text-slate-600 hover:bg-slate-100'" class="flex-1 min-w-[64px] px-3 md:px-4 py-2 rounded text-xs md:text-sm font-medium transition whitespace-nowrap" x-text="t.label"></button>
     </template>
   </div>
 </nav>
 
-<main class="max-w-5xl mx-auto p-4 space-y-4">
+<main class="max-w-5xl mx-auto p-3 md:p-4 space-y-4">
 
 <section x-show="tab==='me'">
-  <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-100">
+  <div class="bg-white rounded-xl p-4 md:p-6 shadow-sm border border-slate-100">
     <h2 class="font-bold text-lg mb-1">查看 Key 配额</h2>
     <p class="text-xs text-slate-500 mb-4"><code>GET /api/v1/me</code></p>
     <button @click="callMe" :disabled="busy" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm disabled:opacity-60"><span x-show="!busy">发起请求</span><span x-show="busy">请求中...</span></button>
@@ -70,7 +70,7 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
 </section>
 
 <section x-show="tab==='search'">
-  <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-100">
+  <div class="bg-white rounded-xl p-4 md:p-6 shadow-sm border border-slate-100">
     <h2 class="font-bold text-lg mb-1">搜索资源</h2>
     <p class="text-xs text-slate-500 mb-4"><code>GET /api/v1/search</code></p>
     <div class="flex gap-2 mb-4">
@@ -82,7 +82,8 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
       <div>
         <div class="text-xs text-slate-500 mb-2" x-text="'共 '+(result.search.total||0)+' 条 · 本页 '+((result.search.items||[]).length)+' 条'"></div>
         <div class="border border-slate-200 rounded-lg overflow-hidden">
-          <table class="w-full text-sm">
+          <div class="overflow-x-auto">
+          <table class="w-full min-w-[500px] text-sm">
             <thead class="bg-slate-50 text-xs text-slate-500"><tr><th class="p-2 text-left">ID</th><th class="p-2 text-left">文件名</th><th class="p-2">大小</th><th class="p-2">来源</th><th class="p-2 text-right">操作</th></tr></thead>
             <tbody class="divide-y divide-slate-100">
               <template x-for="r in (result.search.items||[])" :key="r.id">
@@ -99,6 +100,7 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
               </template>
             </tbody>
           </table>
+          </div>
         </div>
       </div>
     </template>
@@ -106,7 +108,7 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
 </section>
 
 <section x-show="tab==='detail'">
-  <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-100">
+  <div class="bg-white rounded-xl p-4 md:p-6 shadow-sm border border-slate-100">
     <h2 class="font-bold text-lg mb-1">资源详情</h2>
     <p class="text-xs text-slate-500 mb-4"><code>GET /api/v1/resources/:id</code></p>
     <div class="flex gap-2 mb-4">
@@ -118,7 +120,7 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
 </section>
 
 <section x-show="tab==='link'">
-  <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-100">
+  <div class="bg-white rounded-xl p-4 md:p-6 shadow-sm border border-slate-100">
     <h2 class="font-bold text-lg mb-1">换取直链</h2>
     <p class="text-xs text-slate-500 mb-4"><code>GET /api/v1/resources/:id/link</code></p>
     <div class="flex gap-2 mb-4">
@@ -142,7 +144,7 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
 </section>
 
 <section x-show="tab==='batch'">
-  <div class="bg-white rounded-xl p-6 shadow-sm border border-slate-100">
+  <div class="bg-white rounded-xl p-4 md:p-6 shadow-sm border border-slate-100">
     <h2 class="font-bold text-lg mb-1">批量解析前 N 条</h2>
     <p class="text-xs text-slate-500 mb-4">先 search 再循环 link，每条间隔 500ms</p>
     <div class="flex flex-wrap gap-2 mb-4">
@@ -157,7 +159,8 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
       </div>
       <div class="text-xs text-slate-600 mb-2">成功 <span class="text-green-600 font-medium" x-text="batchSuccess"></span> · 失败 <span class="text-red-500 font-medium" x-text="batchFailed"></span> · 共 <span x-text="batchTotal"></span></div>
       <div class="border border-slate-200 rounded-lg max-h-96 overflow-auto">
-        <table class="w-full text-xs">
+        <div class="overflow-x-auto">
+        <table class="w-full min-w-[500px] text-xs">
           <thead class="bg-slate-50 text-slate-500 sticky top-0"><tr><th class="p-2 text-left">ID</th><th class="p-2 text-left">文件名</th><th class="p-2">耗时</th><th class="p-2 text-left">结果</th></tr></thead>
           <tbody class="divide-y divide-slate-100">
             <template x-for="r in batchRows" :key="r.id">
@@ -174,6 +177,7 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
             </template>
           </tbody>
         </table>
+        </div>
       </div>
     </div>
   </div>

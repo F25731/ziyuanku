@@ -83,6 +83,7 @@ async function api(path, options = {}) {
 function dashboard() {
   return {
     tab: 'dashboard',
+    sidebarOpen: false,
     formatSize: formatFileSize,
     currentUser: { username: '-' },
     navs: [
@@ -118,8 +119,8 @@ function dashboard() {
 
     sourceModal: { open: false, title: '', provider: 'ilanzou', loginType: 'account', account: '', passwordText: '', cookieText: '', rootFolderId: '0', remark: '' },
     sourceEditModal: { open: false, id: null, title: '', account: '', passwordText: '', rootFolderId: '0', remark: '', status: 1 },
-    keyModal: { open: false, name: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', result: '' },
-    keyEditModal: { open: false, id: null, name: '', key_prefix: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', expireAt: '' },
+    keyModal: { open: false, name: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', expireDays: 30, result: '' },
+    keyEditModal: { open: false, id: null, name: '', key_prefix: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', expireText: '', addDays: 30, extendMsg: '' },
     linkModal: { open: false, fileName: '', url: '', expireText: '', cached: false, loading: false, error: '', detail: '' },
     errorModal: { open: false, title: '', message: '', detail: '' },
     batchResolve: { running: false, total: 0, done: 0, success: 0, failed: 0, canceled: false, summary: false, sources: 0 },
@@ -463,7 +464,7 @@ function dashboard() {
       finally { this.tabLoading.apikeys = false; }
     },
     openKeyModal() {
-      this.keyModal = { open: true, name: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', result: '' };
+      this.keyModal = { open: true, name: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', expireDays: 30, result: '' };
     },
     closeKeyModal() {
       this.keyModal.open = false;
@@ -477,10 +478,11 @@ function dashboard() {
       } catch (e) { this.showError('签发失败', e); }
     },
     openKeyEditModal(k) {
-      // 把 MySQL datetime 转成 input[type=datetime-local] 能用的 YYYY-MM-DDTHH:MM
-      let exp = '';
+      let expireText = '';
       if (k.expire_at) {
-        exp = String(k.expire_at).replace(' ', 'T').slice(0, 16);
+        const left = this.daysLeft(k.expire_at);
+        expireText = String(k.expire_at).slice(0, 16).replace('T', ' ')
+          + (left < 0 ? ` · 已过期 ${-left} 天` : ` · 还有 ${left} 天`);
       }
       this.keyEditModal = {
         open: true, id: k.id,
@@ -490,7 +492,9 @@ function dashboard() {
         totalLimit: Number(k.total_limit || 0),
         ratePerMin: Number(k.rate_per_min || 60),
         remark: k.remark || '',
-        expireAt: exp
+        expireText,
+        addDays: 30,
+        extendMsg: ''
       };
     },
     async saveKeyEdit() {
@@ -500,8 +504,7 @@ function dashboard() {
         dailyLimit: m.dailyLimit,
         totalLimit: m.totalLimit,
         ratePerMin: m.ratePerMin,
-        remark: m.remark,
-        expireAt: m.expireAt ? m.expireAt.replace('T', ' ') + ':00' : null
+        remark: m.remark
       };
       try {
         await api('/api-keys/' + m.id, { method: 'PATCH', body });
@@ -509,6 +512,28 @@ function dashboard() {
         this.notify('已保存');
         this.loadApiKeys();
       } catch (e) { this.showError('保存失败', e); }
+    },
+    async doExtend() {
+      const m = this.keyEditModal;
+      const days = Number(m.addDays) || 0;
+      if (days <= 0) { this.notify('天数必须 > 0', 'error'); return; }
+      try {
+        const r = await api('/api-keys/' + m.id + '/extend', { method: 'POST', body: { days } });
+        if (r.expire_at) {
+          const newLeft = this.daysLeft(r.expire_at);
+          m.expireText = String(r.expire_at).slice(0, 16).replace('T', ' ') + ` · 还有 ${newLeft} 天`;
+          m.extendMsg = `已加 ${days} 天`;
+          setTimeout(() => { m.extendMsg = ''; }, 3000);
+        } else {
+          this.notify(r.message || '已处理');
+        }
+        this.loadApiKeys();
+      } catch (e) { this.showError('延长失败', e); }
+    },
+    daysLeft(expireAt) {
+      if (!expireAt) return Infinity;
+      const ms = new Date(String(expireAt).replace(' ', 'T')).getTime() - Date.now();
+      return Math.ceil(ms / 86400000);
     },
     async toggleKey(id, op) {
       await api('/api-keys/' + id + '/' + op, { method: 'POST' });
