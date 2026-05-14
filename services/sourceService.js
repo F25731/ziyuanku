@@ -10,7 +10,7 @@ function accountKeyOf(source) {
 
 async function listSources() {
   const [rows] = await pool.query(
-    `SELECT id, title, provider, login_type, root_folder_id, account,
+    `SELECT id, title, provider, login_type, root_folder_id, max_index_depth, account,
             CASE WHEN password_text IS NULL OR password_text = '' THEN 0 ELSE 1 END AS has_password,
             CASE WHEN cookie_text IS NULL OR cookie_text = '' THEN 0 ELSE 1 END AS has_cookie,
             status, last_check_at, last_sync_at, remark, created_at, updated_at
@@ -35,6 +35,7 @@ async function saveSource(payload) {
   const provider = String(payload.provider || 'ilanzou').trim();
   const loginType = String(payload.loginType || '').trim();
   const rootFolderId = String(payload.rootFolderId || '0').trim();
+  const maxIndexDepth = Math.max(1, Math.min(100, Number(payload.maxIndexDepth) || 20));
   const account = payload.account ? String(payload.account).trim() : null;
   const passwordText = payload.passwordText ? String(payload.passwordText) : null;
   const cookieText = payload.cookieText ? String(payload.cookieText) : null;
@@ -52,9 +53,9 @@ async function saveSource(payload) {
   }
 
   const [result] = await pool.query(
-    `INSERT INTO sources (title, provider, login_type, root_folder_id, account, password_text, cookie_text, remark, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`,
-    [title, provider, loginType, rootFolderId, account, passwordText, cookieText, remark]
+    `INSERT INTO sources (title, provider, login_type, root_folder_id, max_index_depth, account, password_text, cookie_text, remark, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+    [title, provider, loginType, rootFolderId, maxIndexDepth, account, passwordText, cookieText, remark]
   );
   return getSource(result.insertId);
 }
@@ -62,10 +63,10 @@ async function saveSource(payload) {
 async function updateSource(id, payload) {
   const fields = [];
   const values = [];
-  const allowed = ['title', 'root_folder_id', 'account', 'password_text', 'cookie_text', 'remark', 'status'];
   const map = {
     title: 'title',
     rootFolderId: 'root_folder_id',
+    maxIndexDepth: 'max_index_depth',
     account: 'account',
     passwordText: 'password_text',
     cookieText: 'cookie_text',
@@ -74,8 +75,10 @@ async function updateSource(id, payload) {
   };
   for (const k of Object.keys(map)) {
     if (payload[k] !== undefined) {
+      let v = payload[k];
+      if (k === 'maxIndexDepth') v = Math.max(1, Math.min(100, Number(v) || 20));
       fields.push(`${map[k]} = ?`);
-      values.push(payload[k]);
+      values.push(v);
     }
   }
   if (fields.length === 0) return getSource(id);
@@ -85,6 +88,9 @@ async function updateSource(id, payload) {
 }
 
 async function deleteSource(id) {
+  // 级联清理 sync_runs / sync_progress / sync_run_events / resources / sync_logs
+  const { deleteRunsBySource } = require('./lanzouSyncService');
+  await deleteRunsBySource(id);
   await pool.query('DELETE FROM resources WHERE source_id = ?', [id]);
   await pool.query('DELETE FROM sync_logs WHERE source_id = ?', [id]);
   await pool.query('DELETE FROM sources WHERE id = ?', [id]);

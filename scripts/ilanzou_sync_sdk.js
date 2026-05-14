@@ -1,13 +1,23 @@
 #!/usr/bin/env node
+// 蓝奏官方 web 接口同步脚本（参照 OpenList drivers/ilanzou）
+// 协议：stdin 接 JSON 输入；stdout 输出 NDJSON 事件流
+//   {event:'file',  data:{...}}                          每个文件一条
+//   {event:'page',  folder_id, next_offset, total_page, done}   每翻一页一条（含目录扫完）
+//   {event:'message', level, event, message, payload}    粒度日志（启动/恢复/失败重试…）
+//   {event:'end',   ok, reason, total_files, total_calls, remaining_folders}
+
 const Redis = require('ioredis');
 const ilanzouApi = require('../services/ilanzouApi');
 
-// ===== 限速：和 services/rateLimiter.js 保持同一套策略 =====
-// shareUrl 已废弃（百万级会触发风控），同步只保留 getFileList
-// 阶段3：getFileList 30→15/分钟，间隔 600→1500ms，抖动 400→1500ms
-const LIMITS = { login: 2, getFileList: 15, default: 15 };
-const MIN_INTERVAL_MS = Number(process.env.LZ_MIN_INTERVAL_MS || 1500);
-const JITTER_MS = Number(process.env.LZ_JITTER_MS || 1500);
+// 阶段4：默认不主动限速、不预防 sleep；只对真实风控信号被动 cooldown
+// 用户想保守跑可通过 ENV 拉慢
+const LIMITS = {
+  login: 5,
+  getFileList: Number(process.env.LZ_LIST_RPM || 600),
+  default: 300
+};
+const MIN_INTERVAL_MS = Number(process.env.LZ_MIN_INTERVAL_MS || 0);
+const JITTER_MS = Number(process.env.LZ_JITTER_MS || 0);
 
 let redis = null;
 function getRedis() {
@@ -25,6 +35,11 @@ function getRedis() {
 
 function rand(max) { return Math.floor(Math.random() * (max + 1)); }
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+function emit(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
+function logMsg(level, event, message, payload) {
+  emit({ event: 'message', level: level || 'info', event_name: event, message: message || '', payload: payload || null });
+}
 
 async function acquire(accountId, op = 'default') {
   if (!accountId) return;
@@ -50,14 +65,17 @@ async function acquire(accountId, op = 'default') {
       throw err;
     }
 
-    const lk = `ratelimit:last:${accountId}`;
-    const last = Number(await r.get(lk) || 0);
-    const wait = Math.max(0, MIN_INTERVAL_MS + rand(JITTER_MS) - (Date.now() - last));
-    if (wait > 0) await sleep(wait);
-    await r.set(lk, String(Date.now()), 'EX', 60);
+    if (MIN_INTERVAL_MS > 0 || JITTER_MS > 0) {
+      const lk = `ratelimit:last:${accountId}`;
+      const last = Number(await r.get(lk) || 0);
+      const wait = Math.max(0, MIN_INTERVAL_MS + rand(JITTER_MS) - (Date.now() - last));
+      if (wait > 0) await sleep(wait);
+      await r.set(lk, String(Date.now()), 'EX', 60);
+    }
   } catch (err) {
     if (err.code === 'COOLDOWN' || err.code === 'RATE_LIMITED') throw err;
-    await sleep(MIN_INTERVAL_MS + rand(JITTER_MS));
+    // Redis 失败不阻塞同步：fallback 到本地小延迟
+    if (MIN_INTERVAL_MS > 0) await sleep(MIN_INTERVAL_MS + rand(JITTER_MS));
   }
 }
 
@@ -90,15 +108,21 @@ async function callWithRetry(accountId, op, fn, maxRetries = 2) {
       if (/风控|封|频繁|限制/.test(err.message || '')) throw err;
       if (attempt >= maxRetries) throw err;
       const wait = 1500 * Math.pow(3, attempt) + rand(800);
+      logMsg('warn', 'retry', `${op} 失败，第 ${attempt + 1}/${maxRetries} 次重试 (${wait}ms 后)`, { error: err.message });
       await sleep(wait);
     }
   }
   throw lastErr;
 }
 
-// ===== NDJSON 事件输出 =====
-function emit(obj) {
-  process.stdout.write(JSON.stringify(obj) + '\n');
+// 字段约定（参照 OpenList）：fileType==2 文件夹，其他都是文件
+function isFolderItem(item) {
+  return Number(item?.fileType ?? -1) === 2 && (item?.folderId != null);
+}
+function isFileItem(item) {
+  if (!item) return false;
+  if (Number(item.fileType ?? -1) === 2) return false;
+  return item.fileId != null || item.id != null;
 }
 
 function fileToDict(item, parentFolderId) {
@@ -107,17 +131,10 @@ function fileToDict(item, parentFolderId) {
     file_id: String(item.fileId || item.id || ''),
     file_name: String(item.fileName || item.name || ''),
     file_size: String(item.fileSize || item.size || ''),
-    file_type: String(item.fileType || item.type || ''),
+    file_type: String(item.fileType ?? item.type ?? ''),
     file_time: String(item.updTime || item.addTime || item.updateTime || item.createTime || item.time || ''),
     share_url: ''
   };
-}
-
-function isFolderItem(item) {
-  return Number(item?.fileType || item?.type || 0) === 2 && item?.folderId;
-}
-function isFileItem(item) {
-  return Number(item?.fileType || item?.type || 0) === 1 && (item?.fileId || item?.id);
 }
 
 async function readInput() {
@@ -136,8 +153,9 @@ async function main() {
   const password = String(input.password || '');
   const rootFolderId = String(input.rootFolderId || '0');
   const mode = String(input.mode || 'incremental');
-  const dailyBudget = Math.max(0, Number(input.dailyCallBudget || 0));
+  const maxIndexDepth = Math.max(1, Number(input.maxIndexDepth) || 20);
   const resume = (input.resume && typeof input.resume === 'object') ? input.resume : {};
+  const depthMap = (input.depthMap && typeof input.depthMap === 'object') ? { ...input.depthMap } : { [rootFolderId]: 0 };
   const initialPending = Array.isArray(input.pendingFolders) && input.pendingFolders.length
     ? input.pendingFolders.map(String)
     : [rootFolderId];
@@ -146,41 +164,36 @@ async function main() {
 
   const accountId = 'ilanzou:' + account;
 
-  // 预热登录（getUuid + login + user/account/map），失败立刻抛
+  // 预热登录
   await acquire(accountId, 'login');
   try {
     await withTimeout(ilanzouApi.getClient(account, password), 25000, '登录');
+    logMsg('info', 'login_ok', '账号已登录，开始扫描');
   } catch (err) {
     if (looksRateLimited({ msg: err && err.message })) await cooldown(accountId, 600);
     throw err;
   }
 
-  // ===== BFS 主循环 =====
   const queue = [...initialPending];
   const enqueued = new Set(queue);
-  let callsLeft = dailyBudget;
+  // 没有显式 depthMap 项的目录（resume 来的）按"根目录深度"对待，避免被误截断
+  for (const f of queue) if (depthMap[f] == null) depthMap[f] = 0;
+
   let totalFiles = 0;
+  let totalCalls = 0;
   let stopReason = 'completed';
 
   outer:
   while (queue.length > 0) {
     const folderId = queue.shift();
     const state = resume[folderId] || { next_offset: 1, total_page: 0, done: 0 };
-    if (state.done) continue; // 已完成的目录跳过
+    if (state.done) continue;
+    const depth = Number(depthMap[folderId] ?? 0);
     let offset = Math.max(1, Number(state.next_offset) || 1);
     let totalPage = Math.max(0, Number(state.total_page) || 0);
-    const limit = 60; // OpenList 同款
+    const limit = 60;
 
     while (true) {
-      if (callsLeft <= 0) {
-        // 当前页还没拉，next_offset 维持 offset（下次从这一页继续），done=0
-        emit({ event: 'progress', folder_id: folderId, next_offset: offset, total_page: totalPage, done: 0 });
-        // 把当前目录退回队首，剩余目录原样保留
-        queue.unshift(folderId);
-        stopReason = 'daily_quota_reached';
-        break outer;
-      }
-
       let resp;
       try {
         resp = await callWithRetry(accountId, 'getFileList',
@@ -191,39 +204,49 @@ async function main() {
           2
         );
       } catch (err) {
-        emit({ event: 'progress', folder_id: folderId, next_offset: offset, total_page: totalPage, done: 0 });
+        // 风控/冷却 → 把当前目录退回队首，干净停掉
+        emit({ event: 'page', folder_id: folderId, next_offset: offset, total_page: totalPage, done: 0 });
         queue.unshift(folderId);
         if (err.code === 'COOLDOWN') {
+          logMsg('warn', 'cooldown', `账号已冷却: ${err.message}`);
           stopReason = 'cooldown';
           break outer;
         }
         if (err.code === 'RATE_LIMITED') {
+          logMsg('warn', 'rate_limited', `配额超限: ${err.message}`);
           stopReason = 'rate_limited';
           break outer;
         }
         if (looksRateLimited({ msg: err && err.message })) {
           await cooldown(accountId, 600);
+          logMsg('warn', 'cooldown', `命中风控关键词，已冷却 600s: ${err.message}`);
           stopReason = 'cooldown';
           break outer;
         }
-        // 其他错误：直接抛，由上层 failRun
         throw err;
       }
-      callsLeft--;
+      totalCalls++;
 
       const list = Array.isArray(resp && resp.list) ? resp.list : [];
       totalPage = Number((resp && resp.totalPage) || totalPage);
 
+      let pageFileCount = 0, pageFolderCount = 0;
       for (const item of list) {
         if (isFolderItem(item)) {
-          const sub = String(item.folderId);
-          if (!enqueued.has(sub)) {
-            enqueued.add(sub);
-            queue.push(sub);
+          pageFolderCount++;
+          // 深度截断：当前目录 depth + 1 > maxIndexDepth 就不入队
+          if (depth + 1 <= maxIndexDepth) {
+            const sub = String(item.folderId);
+            if (!enqueued.has(sub)) {
+              enqueued.add(sub);
+              depthMap[sub] = depth + 1;
+              queue.push(sub);
+            }
           }
           continue;
         }
         if (isFileItem(item)) {
+          pageFileCount++;
           totalFiles++;
           emit({ event: 'file', data: fileToDict(item, folderId) });
         }
@@ -232,7 +255,17 @@ async function main() {
       const isLastPage = list.length === 0 || (totalPage > 0 && offset >= totalPage);
       const nextOffset = isLastPage ? offset : (offset + 1);
       const done = isLastPage ? 1 : 0;
-      emit({ event: 'progress', folder_id: folderId, next_offset: nextOffset, total_page: totalPage, done });
+      emit({
+        event: 'page',
+        folder_id: folderId,
+        page: offset,
+        total_page: totalPage,
+        next_offset: nextOffset,
+        done,
+        depth,
+        page_files: pageFileCount,
+        page_folders: pageFolderCount
+      });
 
       if (isLastPage) break;
       offset++;
@@ -244,7 +277,7 @@ async function main() {
     ok: true,
     reason: stopReason,
     total_files: totalFiles,
-    total_calls: dailyBudget - callsLeft,
+    total_calls: totalCalls,
     remaining_folders: queue
   });
 

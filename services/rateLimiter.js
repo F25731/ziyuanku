@@ -1,16 +1,20 @@
 const { getRedis } = require('../config/redis');
 
-// 每个账号每分钟配额（按操作分类）
-// 阶段3：百万级扫描需要慢且像人——单点限制再放紧一档
+// 阶段4 改造：参照 OpenList——它对蓝奏 list/redirect 完全没有限速。
+// 蓝奏对官方 web 客户端签名链路的容忍度其实很高，OpenList 实测可一直拉。
+// 我们的策略：**默认不主动限速、不预防性 sleep；只对真正的风控信号被动 cooldown**。
+//   - DEFAULT_LIMITS 给一个非常宽松的兜底（防止失控刷接口）
+//   - MIN_INTERVAL_MS / JITTER_MS 默认 0；用户想保守可通过 ENV 拉慢
+//   - cooldown 仅在 looksRateLimited 命中真实风控关键词或 5 分钟 5 次失败时触发
 const DEFAULT_LIMITS = {
-  login: 2,
-  getFileList: 15,    // 原 30，对齐 OpenList 风格的随手翻目录
-  downloadFile: 20,
-  default: 15
+  login: 5,
+  getFileList: 600,    // 对齐 OpenList 实测水平（每秒 5~10 次 list）
+  downloadFile: 300,
+  default: 300
 };
 
-const MIN_INTERVAL_MS = Number(process.env.LZ_MIN_INTERVAL_MS || 1500); // 原 600
-const JITTER_MS = Number(process.env.LZ_JITTER_MS || 1500);             // 原 400
+const MIN_INTERVAL_MS = Number(process.env.LZ_MIN_INTERVAL_MS || 0);
+const JITTER_MS = Number(process.env.LZ_JITTER_MS || 0);
 
 // 同账号信号量（同时最多 N 个 SDK 请求在飞）
 const ACCOUNT_CONCURRENCY = 1;

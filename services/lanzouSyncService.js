@@ -2,20 +2,103 @@ const { spawn } = require('child_process');
 const path = require('path');
 const readline = require('readline');
 const crypto = require('crypto');
+const EventEmitter = require('events');
 const { pool } = require('../config/db');
 const { getSource } = require('./sourceService');
 const { upsertResources } = require('./resourceService');
+const ilanzouApi = require('./ilanzouApi');
 const HttpError = require('../utils/httpError');
 
-// 阶段3 H：每日 list 调用预算（蓝奏官方 web 客户端典型一天的活跃量上限附近）
-const DAILY_LIST_QUOTA = Math.max(100, Number(process.env.SYNC_DAILY_LIST_QUOTA || 5000));
+// 阶段4：抛弃每日预算闸门，对齐 OpenList 风格——一次跑到底，
+// 真触发风控才退避。保留断点续扫（崩溃/网络抖动总会有）。
 const UPSERT_BATCH = Math.max(50, Number(process.env.SYNC_UPSERT_BATCH || 500));
+const DEFAULT_MAX_DEPTH = Math.max(1, Number(process.env.SYNC_MAX_INDEX_DEPTH || 20));
+const EVENT_BACKLOG = 1000;
 
 function toSyncHash(item) {
   return crypto.createHash('md5')
     .update([item.file_id || '', item.file_name || '', item.share_url || ''].join('|'))
     .digest('hex');
 }
+
+// ===== 全局事件总线：runId -> { emitter, ring(最近 N 条事件)} =====
+const runBuses = new Map();
+
+function getRunBus(runId) {
+  let bus = runBuses.get(runId);
+  if (!bus) {
+    const emitter = new EventEmitter();
+    emitter.setMaxListeners(50);
+    bus = { emitter, ring: [], closed: false };
+    runBuses.set(runId, bus);
+  }
+  return bus;
+}
+
+function publishRunEvent(runId, evt) {
+  if (!runId) return;
+  const bus = getRunBus(runId);
+  bus.ring.push(evt);
+  if (bus.ring.length > EVENT_BACKLOG) bus.ring.splice(0, bus.ring.length - EVENT_BACKLOG);
+  bus.emitter.emit('event', evt);
+}
+
+function closeRunBus(runId, finalEvt) {
+  const bus = runBuses.get(runId);
+  if (!bus) return;
+  if (finalEvt) {
+    bus.ring.push(finalEvt);
+    bus.emitter.emit('event', finalEvt);
+  }
+  bus.closed = true;
+  bus.emitter.emit('close');
+  setTimeout(() => runBuses.delete(runId), 60_000); // 1 分钟后回收
+}
+
+function subscribeRun(runId, sinceEventId = 0) {
+  const bus = getRunBus(runId);
+  return {
+    backlog: bus.ring.filter((e) => Number(e.event_id || 0) > Number(sinceEventId || 0)),
+    emitter: bus.emitter,
+    closed: bus.closed
+  };
+}
+
+// ===== sync_run_events: 持久化事件，方便回看 =====
+async function recordEvent(runId, level, event, message, payload) {
+  if (!runId) return null;
+  try {
+    const [r] = await pool.query(
+      'INSERT INTO sync_run_events (run_id, level, event, message, payload) VALUES (?, ?, ?, ?, ?)',
+      [runId, level || 'info', String(event).slice(0, 40), String(message || '').slice(0, 1000),
+       payload ? JSON.stringify(payload).slice(0, 8000) : null]
+    );
+    const evt = {
+      event_id: r.insertId,
+      run_id: runId,
+      level: level || 'info',
+      event,
+      message: message || '',
+      payload: payload || null,
+      created_at: new Date().toISOString()
+    };
+    publishRunEvent(runId, evt);
+    return evt;
+  } catch (err) {
+    console.error('[lanzouSyncService] recordEvent failed', err.message);
+    return null;
+  }
+}
+
+async function listRunEvents(runId, sinceId = 0, limit = 500) {
+  const [rows] = await pool.query(
+    'SELECT id AS event_id, run_id, level, event, message, payload, created_at FROM sync_run_events WHERE run_id=? AND id>? ORDER BY id ASC LIMIT ?',
+    [runId, Number(sinceId) || 0, Math.min(Number(limit) || 500, 2000)]
+  );
+  return rows.map((r) => ({ ...r, payload: r.payload ? safeJson(r.payload) : null }));
+}
+
+function safeJson(s) { try { return JSON.parse(s); } catch (_) { return null; } }
 
 async function createSyncLog(sourceId, status, message) {
   const [r] = await pool.query(
@@ -42,17 +125,21 @@ async function findOpenRun(sourceId) {
   return rows[0] || null;
 }
 
-async function createRun(sourceId, mode, rootFolderId) {
+async function createRun(sourceId, mode, rootFolderId, maxDepth) {
   const [r] = await pool.query(
-    'INSERT INTO sync_runs (source_id, mode, status, root_folder_id, started_at, last_resume_at) VALUES (?, ?, ?, ?, NOW(), NOW())',
-    [sourceId, mode, 'running', String(rootFolderId || '0')]
+    'INSERT INTO sync_runs (source_id, mode, status, root_folder_id, max_index_depth, started_at, last_resume_at) VALUES (?, ?, ?, ?, ?, NOW(), NOW())',
+    [sourceId, mode, 'running', String(rootFolderId || '0'), Number(maxDepth) || DEFAULT_MAX_DEPTH]
   );
-  // 初始进度：根目录 next_offset=1
   await pool.query(
     'INSERT INTO sync_progress (run_id, folder_id, next_offset, total_page, done) VALUES (?, ?, 1, 0, 0)',
     [r.insertId, String(rootFolderId || '0')]
   );
   return r.insertId;
+}
+
+async function getRun(runId) {
+  const [rows] = await pool.query('SELECT * FROM sync_runs WHERE id=?', [runId]);
+  return rows[0] || null;
 }
 
 async function markRunResumed(runId) {
@@ -122,20 +209,20 @@ async function bumpRunCounters(runId, addCalls, addFiles) {
   );
 }
 
-// 今天还剩多少 list 调用预算
-async function todaysRemainingQuota(sourceId) {
-  const [[row]] = await pool.query(
-    `SELECT COALESCE(SUM(total_calls),0) AS used
-       FROM sync_runs
-      WHERE source_id=? AND last_resume_at >= CURDATE()`,
-    [sourceId]
-  );
-  const used = Number(row && row.used) || 0;
-  return Math.max(0, DAILY_LIST_QUOTA - used);
+// ===== 删除源时级联清理 =====
+async function deleteRunsBySource(sourceId) {
+  // 先读所有 run_id，再级联清进度/事件
+  const [runs] = await pool.query('SELECT id FROM sync_runs WHERE source_id=?', [sourceId]);
+  const ids = runs.map((r) => r.id);
+  if (ids.length) {
+    await pool.query('DELETE FROM sync_progress WHERE run_id IN (?)', [ids]);
+    await pool.query('DELETE FROM sync_run_events WHERE run_id IN (?)', [ids]);
+  }
+  await pool.query('DELETE FROM sync_runs WHERE source_id=?', [sourceId]);
 }
 
-// 流式跑子进程：边收 NDJSON 事件，边写 DB
-function streamRunIlanzouScript({ source, mode, syncRunId, dailyCallBudget, resume, pendingFolders, onFile, onProgress, onMessage }) {
+// ===== 流式跑子进程：边收 NDJSON 事件，边广播，边写库 =====
+function streamRunIlanzouScript({ source, mode, syncRunId, maxIndexDepth, resume, pendingFolders, depthMap, onFile, onPage, onMessage }) {
   return new Promise((resolve, reject) => {
     const scriptPath = path.join(__dirname, '..', 'scripts', 'ilanzou_sync_sdk.js');
     const child = spawn('node', [scriptPath], {
@@ -157,10 +244,10 @@ function streamRunIlanzouScript({ source, mode, syncRunId, dailyCallBudget, resu
       try {
         if (evt.event === 'file') {
           await onFile(evt.data);
-        } else if (evt.event === 'progress') {
-          await onProgress(evt);
+        } else if (evt.event === 'page') {
+          await onPage(evt);
         } else if (evt.event === 'message') {
-          if (typeof onMessage === 'function') onMessage(evt.text || '');
+          if (typeof onMessage === 'function') await onMessage(evt);
         } else if (evt.event === 'end') {
           endEvent = evt;
         }
@@ -187,12 +274,12 @@ function streamRunIlanzouScript({ source, mode, syncRunId, dailyCallBudget, resu
       loginType: source.login_type,
       account: source.account,
       password: source.password_text,
-      cookie: source.cookie_text,
       mode,
       syncRunId,
-      dailyCallBudget,
+      maxIndexDepth,
       resume,
-      pendingFolders
+      pendingFolders,
+      depthMap
     }));
     child.stdin.end();
   });
@@ -205,34 +292,32 @@ async function syncSource(sourceId, mode = 'incremental') {
     throw new HttpError(400, '目前仅支持 ilanzou 账号模式同步');
   }
 
-  // full = 重置：把现有 paused/running run 的进度全清掉，重新建一个 run
   if (mode === 'full') {
     await pool.query("UPDATE sync_runs SET status='failed', finished_at=NOW(), last_message='被全量重置覆盖' WHERE source_id=? AND status IN ('running','paused')", [sourceId]);
   }
 
   let run = mode === 'full' ? null : await findOpenRun(sourceId);
+  const maxDepth = Number(source.max_index_depth) > 0 ? Number(source.max_index_depth) : DEFAULT_MAX_DEPTH;
   if (!run) {
-    const id = await createRun(sourceId, mode, source.root_folder_id || '0');
-    run = (await pool.query('SELECT * FROM sync_runs WHERE id=?', [id]))[0][0];
+    const id = await createRun(sourceId, mode, source.root_folder_id || '0', maxDepth);
+    run = await getRun(id);
   } else {
     await markRunResumed(run.id);
   }
 
-  const remaining = await todaysRemainingQuota(sourceId);
-  if (remaining <= 0) {
-    const msg = `今日 list 调用预算已用完（上限 ${DAILY_LIST_QUOTA}），run #${run.id} 已暂停，明天再继续`;
-    await pauseRun(run.id, msg);
-    return { run_id: run.id, status: 'paused', remaining_quota: 0, message: msg };
-  }
-
   const { resume, pending } = await loadResumeState(run.id);
   const logId = await createSyncLog(sourceId, 'running',
-    `run#${run.id} ${mode} 启动，今日剩余预算=${remaining}，待扫目录=${pending.length}`);
+    `run#${run.id} ${mode} 启动，待扫目录=${pending.length}`);
+
+  await recordEvent(run.id, 'info', 'run_started',
+    `run#${run.id} ${mode} 启动 (max_depth=${maxDepth})`,
+    { mode, max_depth: maxDepth, pending_folders: pending.length });
 
   // 流式入库分批缓冲
   let batch = [];
   let totalFiles = 0;
   let totalCalls = 0;
+  let lastSummaryAt = Date.now();
 
   const flush = async () => {
     if (!batch.length) return;
@@ -247,16 +332,32 @@ async function syncSource(sourceId, mode = 'incremental') {
       source,
       mode,
       syncRunId: run.id,
-      dailyCallBudget: remaining,
+      maxIndexDepth: maxDepth,
       resume,
       pendingFolders: pending.length ? pending : [String(source.root_folder_id || '0')],
+      depthMap: { [String(source.root_folder_id || '0')]: 0 },
       onFile: async (file) => {
         batch.push(file);
         if (batch.length >= UPSERT_BATCH) await flush();
       },
-      onProgress: async (p) => {
+      onPage: async (p) => {
         totalCalls++;
-        if (run.id) await upsertProgress(run.id, p.folder_id, p.next_offset, p.total_page, p.done);
+        await upsertProgress(run.id, p.folder_id, p.next_offset, p.total_page, p.done);
+        // 不每页都写事件库（百万级会爆），改成定速 summary
+        if (Date.now() - lastSummaryAt >= 2000) {
+          lastSummaryAt = Date.now();
+          await recordEvent(run.id, 'info', 'progress',
+            `已拉 ${totalCalls} 页 / ${totalFiles + batch.length} 文件入库 / 当前 folder=${p.folder_id} 第 ${p.next_offset - 1}/${p.total_page} 页`,
+            { calls: totalCalls, files: totalFiles + batch.length, folder_id: p.folder_id });
+        }
+        if (p.done) {
+          await recordEvent(run.id, 'info', 'folder_done',
+            `folder=${p.folder_id} 已扫完 (共 ${p.total_page} 页)`,
+            { folder_id: p.folder_id, total_page: p.total_page });
+        }
+      },
+      onMessage: async (m) => {
+        await recordEvent(run.id, m.level || 'info', m.event || 'message', m.message || '', m.payload || null);
       }
     });
 
@@ -264,55 +365,50 @@ async function syncSource(sourceId, mode = 'incremental') {
     await bumpRunCounters(run.id, totalCalls, totalFiles);
 
     if (endEvt.reason === 'completed') {
-      const msg = `run#${run.id} 已完成：累计文件 ${endEvt.total_files || totalFiles}，本次新增 ${totalFiles}，本次 list 调用 ${totalCalls}`;
+      const msg = `run#${run.id} 已完成: 累计文件 ${totalFiles}, list 调用 ${totalCalls}`;
       await completeRun(run.id, msg);
       await finishSyncLog(logId, 'success', msg, totalFiles);
+      const finalEvt = await recordEvent(run.id, 'done', 'completed', msg, { total_files: totalFiles, total_calls: totalCalls });
+      closeRunBus(run.id, finalEvt);
       return { run_id: run.id, status: 'completed', total: totalFiles, calls: totalCalls };
     }
-    // daily_quota_reached / cooldown / etc.
-    const msg = `run#${run.id} 暂停（${endEvt.reason}）：本次新增 ${totalFiles}，list 调用 ${totalCalls}，剩余目录 ${(endEvt.remaining_folders || []).length}`;
+    const msg = `run#${run.id} 暂停 (${endEvt.reason}): 本次新增 ${totalFiles}, list 调用 ${totalCalls}, 剩余目录 ${(endEvt.remaining_folders || []).length}`;
     await pauseRun(run.id, msg);
     await finishSyncLog(logId, 'success', msg, totalFiles);
+    const finalEvt = await recordEvent(run.id, 'warn', 'paused', msg,
+      { reason: endEvt.reason, total_files: totalFiles, total_calls: totalCalls, remaining: (endEvt.remaining_folders || []).length });
+    closeRunBus(run.id, finalEvt);
     return { run_id: run.id, status: 'paused', reason: endEvt.reason, total: totalFiles, calls: totalCalls };
   } catch (err) {
     try { await flush(); } catch (_) {}
     await bumpRunCounters(run.id, totalCalls, totalFiles);
-    // 风控/冷却 → paused 而非 failed，方便明天重启
     const msg = err && err.message || String(err);
     if (/冷却|风控|频繁|限制|429/i.test(msg)) {
-      await pauseRun(run.id, '触发风控/冷却：' + msg);
+      await pauseRun(run.id, '触发风控/冷却: ' + msg);
       await finishSyncLog(logId, 'failed', msg, totalFiles);
+      const finalEvt = await recordEvent(run.id, 'warn', 'rate_limited', msg, null);
+      closeRunBus(run.id, finalEvt);
     } else {
       await failRun(run.id, msg);
       await finishSyncLog(logId, 'failed', msg, totalFiles);
+      const finalEvt = await recordEvent(run.id, 'error', 'failed', msg, null);
+      closeRunBus(run.id, finalEvt);
     }
     throw err;
   }
 }
 
-async function checkSource(sourceId) {
+// 测试连接：login + 拿 userId，半秒级，不拉 list、不入库
+async function testConnection(sourceId) {
   const source = await getSource(sourceId);
   if (!source) throw new HttpError(404, '来源不存在');
-  const logId = await createSyncLog(sourceId, 'running', '开始检测（仅根目录第一页）');
-  try {
-    let count = 0;
-    await streamRunIlanzouScript({
-      source,
-      mode: 'check-only',
-      syncRunId: 0,
-      dailyCallBudget: 1, // 只允许 1 次 list 调用
-      resume: {},
-      pendingFolders: [String(source.root_folder_id || '0')],
-      onFile: async () => { count++; },
-      onProgress: async () => {}
-    });
-    await pool.query('UPDATE sources SET last_check_at=NOW() WHERE id=?', [sourceId]);
-    await finishSyncLog(logId, 'success', `检测成功（首页 ${count} 个文件，未写库）`, count);
-    return { total: count };
-  } catch (err) {
-    await finishSyncLog(logId, 'failed', err.message || String(err));
-    throw err;
+  if (source.provider !== 'ilanzou' || source.login_type !== 'account') {
+    throw new HttpError(400, '目前仅支持 ilanzou 账号模式');
   }
+  ilanzouApi.invalidateClient(source.account);
+  const ctx = await ilanzouApi.getClient(source.account, source.password_text);
+  await pool.query('UPDATE sources SET last_check_at=NOW() WHERE id=?', [sourceId]);
+  return { account: source.account, user_id: ctx.userId, message: '账号登录成功' };
 }
 
 async function listSyncLogs(limit = 100) {
@@ -339,4 +435,7 @@ async function listSyncRuns(sourceId, limit = 30) {
   return rows;
 }
 
-module.exports = { syncSource, checkSource, listSyncLogs, clearSyncLogs, listSyncRuns, DAILY_LIST_QUOTA };
+module.exports = {
+  syncSource, testConnection, listSyncLogs, clearSyncLogs, listSyncRuns,
+  listRunEvents, getRun, subscribeRun, deleteRunsBySource
+};

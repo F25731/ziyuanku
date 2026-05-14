@@ -117,8 +117,13 @@ function dashboard() {
 
     busyTasks: [],
 
-    sourceModal: { open: false, title: '', provider: 'ilanzou', loginType: 'account', account: '', passwordText: '', cookieText: '', rootFolderId: '0', remark: '' },
-    sourceEditModal: { open: false, id: null, title: '', account: '', passwordText: '', rootFolderId: '0', remark: '', status: 1 },
+    sourceModal: { open: false, title: '', provider: 'ilanzou', loginType: 'account', account: '', passwordText: '', cookieText: '', rootFolderId: '0', maxIndexDepth: 20, remark: '' },
+    sourceEditModal: { open: false, id: null, title: '', account: '', passwordText: '', rootFolderId: '0', maxIndexDepth: 20, remark: '', status: 1 },
+    syncPanel: {
+      open: false, runId: null, sourceId: null, title: '',
+      status: '-', totalFiles: 0, totalCalls: 0, tail: '',
+      lines: [], autoScroll: true, _es: null
+    },
     keyModal: { open: false, name: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', expireDays: 30, result: '' },
     keyEditModal: { open: false, id: null, name: '', key_prefix: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', expireText: '', addDays: 30, extendMsg: '' },
     linkModal: { open: false, fileName: '', url: '', expireText: '', cached: false, loading: false, error: '', detail: '' },
@@ -296,7 +301,7 @@ function dashboard() {
       finally { this.tabLoading.sources = false; }
     },
     openSourceModal() {
-      this.sourceModal = { open: true, title: '', provider: 'ilanzou', loginType: 'account', account: '', passwordText: '', cookieText: '', rootFolderId: '0', remark: '' };
+      this.sourceModal = { open: true, title: '', provider: 'ilanzou', loginType: 'account', account: '', passwordText: '', cookieText: '', rootFolderId: '0', maxIndexDepth: 20, remark: '' };
     },
     async saveSource() {
       try {
@@ -313,6 +318,7 @@ function dashboard() {
         account: s.account || '',
         passwordText: '',
         rootFolderId: s.root_folder_id || '0',
+        maxIndexDepth: Number(s.max_index_depth) || 20,
         remark: s.remark || '',
         status: s.status ? 1 : 0
       };
@@ -322,6 +328,7 @@ function dashboard() {
       const body = {
         title: m.title,
         rootFolderId: m.rootFolderId,
+        maxIndexDepth: m.maxIndexDepth,
         remark: m.remark,
         status: m.status
       };
@@ -337,39 +344,123 @@ function dashboard() {
       mode = mode || 'incremental';
       const src = this.sources.find((s) => s.id === id);
       if (src) { src._syncing = true; src._syncMode = mode; }
-      const label = (mode === 'full' ? '全量同步: ' : '增量同步: ') + (src ? src.title : '#' + id);
-      const taskId = this.startTask(label);
       try {
-        const d = await api('/sources/' + id + '/sync', {
-          method: 'POST',
-          body: { mode },
-          timeout: 600000 // 同步可能要很久
-        });
-        const msg = (mode === 'full' ? '全量' : '增量') + '同步完成：'
-          + '共 ' + d.total + ' 个'
-          + (typeof d.reused === 'number' ? '（复用 ' + d.reused + '，新拉取 ' + d.new + '）' : '');
-        this.notify(msg);
-        this.loadSources();
+        const d = await api('/sources/' + id + '/sync', { method: 'POST', body: { mode } });
+        if (!d.run_id) {
+          this.notify('同步已触发，但未返回 run_id', 'error');
+          if (src) { src._syncing = false; src._syncMode = ''; }
+          return;
+        }
+        this.openSyncPanel(d.run_id, src ? src.title : '#' + id, mode);
       } catch (e) {
-        this.showError((mode === 'full' ? '全量' : '增量') + '同步失败', e);
-      } finally {
+        this.showError((mode === 'full' ? '全量' : '增量') + '同步触发失败', e);
         if (src) { src._syncing = false; src._syncMode = ''; }
-        this.endTask(taskId);
       }
     },
-    async checkSource(id) {
+    async testSource(id) {
       const src = this.sources.find((s) => s.id === id);
       if (src) src._checking = true;
-      const taskId = this.startTask('检测来源: ' + (src ? src.title : '#' + id));
+      const taskId = this.startTask('测试连接: ' + (src ? src.title : '#' + id));
       try {
-        const d = await api('/sources/' + id + '/check', { method: 'POST', timeout: 300000 });
-        this.notify('检测通过，共 ' + d.total + ' 个文件');
+        const d = await api('/sources/' + id + '/test', { method: 'POST', timeout: 30000 });
+        this.notify('连接成功（user_id=' + (d.user_id || '?') + '）');
       } catch (e) {
-        this.showError('检测失败', e);
+        this.showError('连接失败', e);
       } finally {
         if (src) src._checking = false;
         this.endTask(taskId);
       }
+    },
+    // 兼容旧调用
+    async checkSource(id) { return this.testSource(id); },
+
+    // ===== 同步实时面板 =====
+    openSyncPanel(runId, title, mode) {
+      this.closeSyncPanel(); // 关掉旧的
+      this.syncPanel = {
+        open: true,
+        runId: runId,
+        sourceId: null,
+        title: (mode === 'full' ? '全量同步' : '增量同步') + ' · ' + title,
+        status: 'running',
+        totalFiles: 0,
+        totalCalls: 0,
+        tail: '正在连接事件流...',
+        lines: [],
+        autoScroll: true,
+        _es: null
+      };
+      const token = localStorage.getItem('token') || '';
+      const url = '/admin/sync-runs/' + runId + '/stream?token=' + encodeURIComponent(token);
+      const es = new EventSource(url);
+      this.syncPanel._es = es;
+      es.onopen = () => { this.syncPanel.tail = '已连接，等待事件...'; };
+      es.onerror = () => {
+        this.syncPanel.tail = '连接中断（浏览器会自动重连）';
+      };
+      const handler = (e) => this.appendSyncEvent(e);
+      ['run_started','progress','folder_done','rate_limited','cooldown','retry','login_ok','paused','completed','failed','message','error'].forEach((name) => {
+        es.addEventListener(name, handler);
+      });
+    },
+    appendSyncEvent(e) {
+      let data;
+      try { data = JSON.parse(e.data); } catch (_) { return; }
+      const ts = new Date(data.created_at || Date.now()).toLocaleTimeString('zh-CN', { hour12: false });
+      const icon = ({
+        run_started: '🚀', login_ok: '🔑', progress: '📊', folder_done: '📁',
+        rate_limited: '⛔', cooldown: '🧊', retry: '🔁',
+        completed: '🎉', paused: '⏸', failed: '💥', error: '⚠️', message: '·'
+      })[data.event] || '·';
+      const text = '[' + ts + '] ' + icon + ' ' + (data.message || data.event);
+      this.syncPanel.lines.push({
+        text,
+        level: data.level || 'info',
+        event: data.event
+      });
+      if (this.syncPanel.lines.length > 2000) this.syncPanel.lines.splice(0, this.syncPanel.lines.length - 2000);
+      if (data.payload && typeof data.payload === 'object') {
+        if (typeof data.payload.files === 'number') this.syncPanel.totalFiles = data.payload.files;
+        if (typeof data.payload.calls === 'number') this.syncPanel.totalCalls = data.payload.calls;
+        if (typeof data.payload.total_files === 'number') this.syncPanel.totalFiles = data.payload.total_files;
+        if (typeof data.payload.total_calls === 'number') this.syncPanel.totalCalls = data.payload.total_calls;
+      }
+      if (data.event === 'completed') { this.syncPanel.status = 'completed'; this.syncPanel.tail = '✅ 已完成'; this.afterSyncEnd(); }
+      else if (data.event === 'paused') { this.syncPanel.status = 'paused'; this.syncPanel.tail = '⏸ 已暂停'; this.afterSyncEnd(); }
+      else if (data.event === 'failed') { this.syncPanel.status = 'failed'; this.syncPanel.tail = '💥 失败'; this.afterSyncEnd(); }
+      else if (data.event === 'rate_limited') { this.syncPanel.status = 'paused'; this.syncPanel.tail = '⛔ 触发限流，已暂停'; this.afterSyncEnd(); }
+      this.$nextTick(() => {
+        if (this.syncPanel.autoScroll && this.$refs.syncLogBox) {
+          this.$refs.syncLogBox.scrollTop = this.$refs.syncLogBox.scrollHeight;
+        }
+      });
+    },
+    afterSyncEnd() {
+      this.sources.forEach((s) => { s._syncing = false; s._syncMode = ''; });
+      this.loadSources();
+    },
+    closeSyncPanel() {
+      if (this.syncPanel && this.syncPanel._es) {
+        try { this.syncPanel._es.close(); } catch (_) {}
+      }
+      this.syncPanel = { open: false, runId: null, sourceId: null, title: '', status: '-', totalFiles: 0, totalCalls: 0, tail: '', lines: [], autoScroll: true, _es: null };
+    },
+    clearSyncPanel() { this.syncPanel.lines = []; },
+    async copySyncPanel() {
+      const text = this.syncPanel.lines.map((l) => l.text).join('\n');
+      try { await navigator.clipboard.writeText(text); this.notify('已复制 ' + this.syncPanel.lines.length + ' 行'); }
+      catch (_) { this.notify('复制失败', 'error'); }
+    },
+    lineClass(line) {
+      if (!line) return '';
+      if (line.event === 'completed') return 'text-emerald-400';
+      if (line.event === 'paused' || line.event === 'rate_limited' || line.event === 'cooldown') return 'text-amber-400';
+      if (line.event === 'failed' || line.event === 'error') return 'text-rose-400';
+      if (line.level === 'warn') return 'text-amber-300';
+      if (line.level === 'error') return 'text-rose-400';
+      if (line.event === 'folder_done') return 'text-cyan-400';
+      if (line.event === 'progress') return 'text-slate-300';
+      return 'text-slate-200';
     },
     async deleteSource(id) {
       if (!confirm('确认删除该来源？关联的资源和日志会一并清除')) return;
