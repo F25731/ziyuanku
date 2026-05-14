@@ -94,10 +94,6 @@ async function getResource(id) {
 
 async function upsertResources(sourceId, files) {
   if (!Array.isArray(files) || files.length === 0) {
-    await pool.query(
-      'UPDATE resources SET is_deleted = 1 WHERE source_id = ? AND is_deleted = 0',
-      [sourceId]
-    );
     return { inserted: 0, marked_deleted: 0 };
   }
 
@@ -137,27 +133,21 @@ async function upsertResources(sourceId, files) {
       [values]
     );
 
-    const fileIds = files.map((f) => String(f.file_id || '')).filter(Boolean);
-    if (fileIds.length > 0) {
-      await conn.query(
-        `UPDATE resources SET is_deleted = 1
-          WHERE source_id = ? AND is_deleted = 0 AND file_id NOT IN (?)`,
-        [sourceId, fileIds]
-      );
-    }
-
+    // 注意：以前这里有一段 "UPDATE ... WHERE file_id NOT IN (?)" 的逻辑——
+    // 在流式批量 upsert 模式下，每批 200 条都会把表里**其余所有数据标 is_deleted=1**，
+    // 上一批写入下一批就被标删，灾难。整个 sync_run 结束后由 reconcileDeletedAfterRun 统一处理。
     await conn.query(
       'UPDATE sources SET last_sync_at = NOW(), last_check_at = NOW() WHERE id = ?',
       [sourceId]
     );
     await conn.commit();
 
-    // 异步推送到 Meilisearch（不阻塞同步流程）
+    // Meili 同步推送（**等待**完成再返回）：避免 setImmediate 在 1G 容器里
+    // 堆积大量 fire-and-forget 任务把 heap 顶爆。代价是每批多 ~50ms-200ms 网络耗时。
     if (searchIndex.isEnabled()) {
-      setImmediate(async () => {
-        try {
-          const fileIdsList = files.map(f => String(f.file_id || '')).filter(Boolean);
-          if (!fileIdsList.length) return;
+      try {
+        const fileIdsList = files.map((f) => String(f.file_id || '')).filter(Boolean);
+        if (fileIdsList.length) {
           const placeholders = fileIdsList.map(() => '?').join(',');
           const [rows] = await pool.query(
             `SELECT r.id, r.source_id, r.file_id, r.file_name, r.file_size, r.file_type,
@@ -167,11 +157,10 @@ async function upsertResources(sourceId, files) {
             [sourceId, ...fileIdsList]
           );
           if (rows.length) await searchIndex.upsert(rows);
-          console.log(`[search] pushed ${rows.length} docs to meili (source ${sourceId})`);
-        } catch (e) {
-          console.warn('[search] meili 推送失败:', e.message);
         }
-      });
+      } catch (e) {
+        console.warn('[search] meili 推送失败:', e.message);
+      }
     }
 
     return { inserted: files.length };
@@ -181,6 +170,21 @@ async function upsertResources(sourceId, files) {
   } finally {
     conn.release();
   }
+}
+
+// 在一个 sync_run 完整跑完后调用：把"本次 run 没碰过"的旧资源标 is_deleted=1
+// 用 last_sync_at（一次 run 内 upsertResources 都会更新源 last_sync_at）作分界点。
+// 比基于 sync_hash 或 file_id NOT IN 都更便宜：单条 UPDATE，靠时间戳索引
+async function reconcileDeletedAfterRun(sourceId, runStartedAt) {
+  if (!runStartedAt) return { marked: 0 };
+  const [r] = await pool.query(
+    `UPDATE resources
+        SET is_deleted = 1
+      WHERE source_id = ? AND is_deleted = 0
+        AND (updated_at IS NULL OR updated_at < ?)`,
+    [sourceId, runStartedAt]
+  );
+  return { marked: r.affectedRows || 0 };
 }
 
 async function listResources({ page = 1, pageSize = 50, sourceId = null } = {}) {
@@ -194,4 +198,4 @@ async function deleteResource(id) {
   }
 }
 
-module.exports = { searchResources, getResource, upsertResources, listResources, deleteResource };
+module.exports = { searchResources, getResource, upsertResources, reconcileDeletedAfterRun, listResources, deleteResource };

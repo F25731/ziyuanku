@@ -13,8 +13,16 @@ services:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
       - --default-time-zone=+08:00
+      - --innodb-buffer-pool-size=128M
+      - --innodb-log-file-size=48M
+      - --max-connections=80
+      - --performance-schema=OFF
     volumes:
       - mysql_data:/var/lib/mysql
+    deploy:
+      resources:
+        limits:
+          memory: 384M
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
       interval: 10s
@@ -27,9 +35,13 @@ services:
     image: redis:7-alpine
     container_name: lrh-redis
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
     volumes:
       - redis_data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 96M
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -47,6 +59,10 @@ services:
       MEILI_NO_ANALYTICS: "true"
     volumes:
       - meili_data:/meili_data
+    deploy:
+      resources:
+        limits:
+          memory: 256M
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:7700/health"]
       interval: 15s
@@ -71,6 +87,9 @@ services:
         condition: service_healthy
     environment:
       NODE_ENV: production
+      # 1.9G 总内存的轻量服务器：mysql 占 ~300M、meili ~150M、redis ~30M，
+      # app 给 Node 上限 768M 留 200M 给系统/子进程，刚好不溢出
+      NODE_OPTIONS: --max-old-space-size=768
       PORT: 3000
       TZ: Asia/Shanghai
       DB_HOST: mysql
@@ -89,6 +108,13 @@ services:
       ADMIN_INIT_PASSWORD: ${ADMIN_INIT_PASSWORD:-Admin@123456}
       LINK_CACHE_TTL: ${LINK_CACHE_TTL:-1800}
       API_RATE_LIMIT_PER_MIN: ${API_RATE_LIMIT_PER_MIN:-60}
+      # 同步参数（可在 .env 覆盖）
+      SYNC_UPSERT_BATCH: ${SYNC_UPSERT_BATCH:-200}
+      SYNC_MAX_INDEX_DEPTH: ${SYNC_MAX_INDEX_DEPTH:-20}
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
     ports:
       - "${APP_PORT:-3000}:3000"
     volumes:

@@ -401,12 +401,19 @@ function dashboard() {
         _es: null
       };
       const token = localStorage.getItem('lrh_token') || '';
-      const url = '/admin/sync-runs/' + runId + '/stream?token=' + encodeURIComponent(token);
+      const url = '/api/admin/sync-runs/' + runId + '/stream?token=' + encodeURIComponent(token);
       const es = new EventSource(url);
       this.syncPanels[sourceId]._es = es;
       es.onopen = () => { if (this.syncPanels[sourceId]) this.syncPanels[sourceId].tail = '已连接，等待事件...'; };
-      es.onerror = () => {
-        if (this.syncPanels[sourceId]) this.syncPanels[sourceId].tail = '连接中断（浏览器会自动重连）';
+      es.onerror = (err) => {
+        const panel = this.syncPanels[sourceId];
+        if (!panel) return;
+        // EventSource readyState: 0=CONNECTING, 1=OPEN, 2=CLOSED
+        if (es.readyState === 2) {
+          panel.tail = '连接已关闭（运行可能已结束，可关闭面板）';
+        } else {
+          panel.tail = '连接中断（浏览器自动重连中…）';
+        }
       };
       const handler = (e) => this.appendSyncEvent(sourceId, e);
       ['run_started','progress','folder_done','rate_limited','cooldown','retry','login_ok','paused','completed','failed','message','error'].forEach((name) => {

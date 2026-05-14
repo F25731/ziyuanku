@@ -5,15 +5,17 @@ const crypto = require('crypto');
 const EventEmitter = require('events');
 const { pool } = require('../config/db');
 const { getSource } = require('./sourceService');
-const { upsertResources } = require('./resourceService');
+const { upsertResources, reconcileDeletedAfterRun } = require('./resourceService');
 const ilanzouApi = require('./ilanzouApi');
 const HttpError = require('../utils/httpError');
 
 // 阶段4：抛弃每日预算闸门，对齐 OpenList 风格——一次跑到底，
 // 真触发风控才退避。保留断点续扫（崩溃/网络抖动总会有）。
-const UPSERT_BATCH = Math.max(50, Number(process.env.SYNC_UPSERT_BATCH || 500));
+// 1G 容器内必须严格背压：批次小、事件节流、flush 时暂停 stdout
+const UPSERT_BATCH = Math.max(50, Number(process.env.SYNC_UPSERT_BATCH || 200));
 const DEFAULT_MAX_DEPTH = Math.max(1, Number(process.env.SYNC_MAX_INDEX_DEPTH || 20));
-const EVENT_BACKLOG = 1000;
+const EVENT_BACKLOG = 200;
+const PROGRESS_EVENT_INTERVAL_MS = 5000; // progress 事件 5s 限频，避免 DB 灌爆
 
 function toSyncHash(item) {
   return crypto.createHash('md5')
@@ -253,25 +255,30 @@ function streamRunIlanzouScript({ source, mode, syncRunId, maxIndexDepth, resume
     let endEvent = null;
     let lineErr = null;
 
+    // 串行处理 NDJSON 行：readline 不会等 async handler，需要自己用队列把 onFile/onPage 串起来
+    // 任何时刻只有 1 个 handler 在运行，避免 batch 在 flush 期间无限堆积
     const rl = readline.createInterface({ input: child.stdout });
-    rl.on('line', async (line) => {
+    let processChain = Promise.resolve();
+    rl.on('line', (line) => {
       const trimmed = line.trim();
       if (!trimmed || trimmed[0] !== '{') return;
       let evt;
       try { evt = JSON.parse(trimmed); } catch (_) { return; }
-      try {
-        if (evt.event === 'file') {
-          await onFile(evt.data);
-        } else if (evt.event === 'page') {
-          await onPage(evt);
-        } else if (evt.event === 'message') {
-          if (typeof onMessage === 'function') await onMessage(evt);
-        } else if (evt.event === 'end') {
-          endEvent = evt;
+      processChain = processChain.then(async () => {
+        try {
+          if (evt.event === 'file') {
+            await onFile(evt.data, child);
+          } else if (evt.event === 'page') {
+            await onPage(evt);
+          } else if (evt.event === 'message') {
+            if (typeof onMessage === 'function') await onMessage(evt);
+          } else if (evt.event === 'end') {
+            endEvent = evt;
+          }
+        } catch (err) {
+          lineErr = err;
         }
-      } catch (err) {
-        lineErr = err;
-      }
+      });
     });
 
     child.stderr.on('data', (buf) => { stderr += buf.toString(); });
@@ -279,11 +286,12 @@ function streamRunIlanzouScript({ source, mode, syncRunId, maxIndexDepth, resume
       if (syncRunId) runningProcs.delete(syncRunId);
       reject(err);
     });
-    child.on('close', (code, signal) => {
+    child.on('close', async (code, signal) => {
       const wasPaused = syncRunId && runningProcs.get(syncRunId)?.paused;
       if (syncRunId) runningProcs.delete(syncRunId);
+      // 等所有排队中的事件处理完
+      try { await processChain; } catch (_) {}
       if (lineErr) return reject(lineErr);
-      // SIGTERM 是用户主动暂停，把它当作正常 paused 结束
       if (signal === 'SIGTERM' || wasPaused) {
         return resolve(endEvent || { ok: true, reason: 'paused_by_user', total_files: 0, total_calls: 0, remaining_folders: [] });
       }
@@ -370,17 +378,12 @@ async function syncSource(sourceId, mode = 'incremental') {
       onPage: async (p) => {
         totalCalls++;
         await upsertProgress(run.id, p.folder_id, p.next_offset, p.total_page, p.done);
-        // 不每页都写事件库（百万级会爆），改成定速 summary
-        if (Date.now() - lastSummaryAt >= 2000) {
+        // 事件入库限频（5s）；folder_done 也合并到 progress，避免百万级目录把 sync_run_events 灌爆
+        if (Date.now() - lastSummaryAt >= PROGRESS_EVENT_INTERVAL_MS) {
           lastSummaryAt = Date.now();
           await recordEvent(run.id, 'info', 'progress',
-            `已拉 ${totalCalls} 页 / ${totalFiles + batch.length} 文件入库 / 当前 folder=${p.folder_id} 第 ${p.next_offset - 1}/${p.total_page} 页`,
+            `已拉 ${totalCalls} 页 / ${totalFiles + batch.length} 文件入库 / 当前 folder=${p.folder_id} 第 ${Math.max(1, p.next_offset - 1)}/${p.total_page || '?'} 页`,
             { calls: totalCalls, files: totalFiles + batch.length, folder_id: p.folder_id });
-        }
-        if (p.done) {
-          await recordEvent(run.id, 'info', 'folder_done',
-            `folder=${p.folder_id} 已扫完 (共 ${p.total_page} 页)`,
-            { folder_id: p.folder_id, total_page: p.total_page });
         }
       },
       onMessage: async (m) => {
@@ -392,12 +395,21 @@ async function syncSource(sourceId, mode = 'incremental') {
     await bumpRunCounters(run.id, totalCalls, totalFiles);
 
     if (endEvt.reason === 'completed') {
-      const msg = `run#${run.id} 已完成: 累计文件 ${totalFiles}, list 调用 ${totalCalls}`;
+      // 整盘完整跑完一次后，把"本次 run 没碰过"的旧资源标 is_deleted=1
+      // 用 run.started_at 作分界点，比 NOT IN (整盘 file_id) 便宜 N 个数量级
+      let marked = 0;
+      try {
+        const r = await reconcileDeletedAfterRun(sourceId, run.started_at);
+        marked = r.marked || 0;
+      } catch (e) {
+        console.warn('[reconcileDeletedAfterRun] 失败:', e.message);
+      }
+      const msg = `run#${run.id} 已完成: 累计文件 ${totalFiles}, list 调用 ${totalCalls}, 标记已删除 ${marked}`;
       await completeRun(run.id, msg);
       await finishSyncLog(logId, 'success', msg, totalFiles);
-      const finalEvt = await recordEvent(run.id, 'done', 'completed', msg, { total_files: totalFiles, total_calls: totalCalls });
+      const finalEvt = await recordEvent(run.id, 'done', 'completed', msg, { total_files: totalFiles, total_calls: totalCalls, deleted_marked: marked });
       closeRunBus(run.id, finalEvt);
-      return { run_id: run.id, status: 'completed', total: totalFiles, calls: totalCalls };
+      return { run_id: run.id, status: 'completed', total: totalFiles, calls: totalCalls, deleted_marked: marked };
     }
     const reasonLabel = endEvt.reason === 'paused_by_user' ? '用户手动暂停' : `(${endEvt.reason})`;
     const msg = `run#${run.id} 暂停 ${reasonLabel}: 本次新增 ${totalFiles}, list 调用 ${totalCalls}, 剩余目录 ${(endEvt.remaining_folders || []).length}`;
