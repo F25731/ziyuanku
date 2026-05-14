@@ -221,6 +221,23 @@ async function deleteRunsBySource(sourceId) {
   await pool.query('DELETE FROM sync_runs WHERE source_id=?', [sourceId]);
 }
 
+// ===== 进行中 run -> 子进程引用映射，用于支持手动暂停 =====
+const runningProcs = new Map(); // runId -> { child, paused: false }
+
+function requestPause(runId) {
+  const entry = runningProcs.get(Number(runId));
+  if (!entry || !entry.child) return false;
+  if (entry.paused) return true;
+  entry.paused = true;
+  try {
+    // 用一个独立的控制管道发暂停信号：写到子进程的 stdin
+    // 注意：子进程 main() 已经把 stdin 读完，第二次 write 会失败 → 改用环境标志不可行
+    // 这里改成直接给子进程发 SIGTERM，子进程注册 handler 捕获后干净退出
+    entry.child.kill('SIGTERM');
+  } catch (_) {}
+  return true;
+}
+
 // ===== 流式跑子进程：边收 NDJSON 事件，边广播，边写库 =====
 function streamRunIlanzouScript({ source, mode, syncRunId, maxIndexDepth, resume, pendingFolders, depthMap, onFile, onPage, onMessage }) {
   return new Promise((resolve, reject) => {
@@ -230,6 +247,7 @@ function streamRunIlanzouScript({ source, mode, syncRunId, maxIndexDepth, resume
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env }
     });
+    if (syncRunId) runningProcs.set(syncRunId, { child, paused: false });
 
     let stderr = '';
     let endEvent = null;
@@ -257,9 +275,18 @@ function streamRunIlanzouScript({ source, mode, syncRunId, maxIndexDepth, resume
     });
 
     child.stderr.on('data', (buf) => { stderr += buf.toString(); });
-    child.on('error', reject);
-    child.on('close', (code) => {
+    child.on('error', (err) => {
+      if (syncRunId) runningProcs.delete(syncRunId);
+      reject(err);
+    });
+    child.on('close', (code, signal) => {
+      const wasPaused = syncRunId && runningProcs.get(syncRunId)?.paused;
+      if (syncRunId) runningProcs.delete(syncRunId);
       if (lineErr) return reject(lineErr);
+      // SIGTERM 是用户主动暂停，把它当作正常 paused 结束
+      if (signal === 'SIGTERM' || wasPaused) {
+        return resolve(endEvent || { ok: true, reason: 'paused_by_user', total_files: 0, total_calls: 0, remaining_folders: [] });
+      }
       if (code !== 0 && !endEvent) {
         return reject(new Error(stderr || `同步脚本退出码 ${code}`));
       }
@@ -372,7 +399,8 @@ async function syncSource(sourceId, mode = 'incremental') {
       closeRunBus(run.id, finalEvt);
       return { run_id: run.id, status: 'completed', total: totalFiles, calls: totalCalls };
     }
-    const msg = `run#${run.id} 暂停 (${endEvt.reason}): 本次新增 ${totalFiles}, list 调用 ${totalCalls}, 剩余目录 ${(endEvt.remaining_folders || []).length}`;
+    const reasonLabel = endEvt.reason === 'paused_by_user' ? '用户手动暂停' : `(${endEvt.reason})`;
+    const msg = `run#${run.id} 暂停 ${reasonLabel}: 本次新增 ${totalFiles}, list 调用 ${totalCalls}, 剩余目录 ${(endEvt.remaining_folders || []).length}`;
     await pauseRun(run.id, msg);
     await finishSyncLog(logId, 'success', msg, totalFiles);
     const finalEvt = await recordEvent(run.id, 'warn', 'paused', msg,
@@ -437,5 +465,5 @@ async function listSyncRuns(sourceId, limit = 30) {
 
 module.exports = {
   syncSource, testConnection, listSyncLogs, clearSyncLogs, listSyncRuns,
-  listRunEvents, getRun, subscribeRun, deleteRunsBySource
+  listRunEvents, getRun, subscribeRun, deleteRunsBySource, requestPause
 };

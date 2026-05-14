@@ -8,7 +8,7 @@ const {
 } = require('../services/sourceService');
 const {
   syncSource, testConnection, listSyncLogs, clearSyncLogs, listSyncRuns,
-  listRunEvents, getRun, subscribeRun
+  listRunEvents, getRun, subscribeRun, requestPause
 } = require('../services/lanzouSyncService');
 const {
   searchResources, listResources, deleteResource
@@ -189,6 +189,12 @@ router.get('/sync-runs/:id', asyncHandler(async (req, res) => {
   const run = await getRun(Number(req.params.id));
   if (!run) return res.status(404).json({ code: 404, message: 'run 不存在' });
   res.json({ code: 200, item: run });
+}));
+
+router.post('/sync-runs/:id/pause', adminRequired, asyncHandler(async (req, res) => {
+  const ok = requestPause(Number(req.params.id));
+  if (!ok) return res.status(409).json({ code: 409, message: 'run 当前不在运行中（可能已结束或运行在另一个进程）' });
+  res.json({ code: 200, message: '已发送暂停信号' });
 }));
 
 router.get('/sync-runs/:id/events', asyncHandler(async (req, res) => {

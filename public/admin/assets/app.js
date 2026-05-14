@@ -119,11 +119,8 @@ function dashboard() {
 
     sourceModal: { open: false, title: '', provider: 'ilanzou', loginType: 'account', account: '', passwordText: '', cookieText: '', rootFolderId: '0', maxIndexDepth: 20, remark: '' },
     sourceEditModal: { open: false, id: null, title: '', account: '', passwordText: '', rootFolderId: '0', maxIndexDepth: 20, remark: '', status: 1 },
-    syncPanel: {
-      open: false, runId: null, sourceId: null, title: '',
-      status: '-', totalFiles: 0, totalCalls: 0, tail: '',
-      lines: [], autoScroll: true, _es: null
-    },
+    // 嵌入式同步实时面板：每个 source 一个独立面板，扫到哪个源就出现哪个
+    syncPanels: {}, // { [sourceId]: { open, runId, mode, status, totalFiles, totalCalls, tail, lines, autoScroll, _es } }
     keyModal: { open: false, name: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', expireDays: 30, result: '' },
     keyEditModal: { open: false, id: null, name: '', key_prefix: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', expireText: '', addDays: 30, extendMsg: '' },
     linkModal: { open: false, fileName: '', url: '', expireText: '', cached: false, loading: false, error: '', detail: '' },
@@ -351,7 +348,7 @@ function dashboard() {
           if (src) { src._syncing = false; src._syncMode = ''; }
           return;
         }
-        this.openSyncPanel(d.run_id, src ? src.title : '#' + id, mode);
+        this.openSyncPanel(id, d.run_id, mode);
       } catch (e) {
         this.showError((mode === 'full' ? '全量' : '增量') + '同步触发失败', e);
         if (src) { src._syncing = false; src._syncMode = ''; }
@@ -371,17 +368,30 @@ function dashboard() {
         this.endTask(taskId);
       }
     },
+    async pauseSync(sourceId) {
+      const panel = this.syncPanels[sourceId];
+      if (!panel || !panel.runId) return;
+      try {
+        await api('/sync-runs/' + panel.runId + '/pause', { method: 'POST' });
+        this.notify('已发送暂停信号，等待当前页扫完后停止');
+      } catch (e) {
+        this.showError('暂停失败', e);
+      }
+    },
     // 兼容旧调用
     async checkSource(id) { return this.testSource(id); },
 
-    // ===== 同步实时面板 =====
-    openSyncPanel(runId, title, mode) {
-      this.closeSyncPanel(); // 关掉旧的
-      this.syncPanel = {
+    // ===== 嵌入式同步实时面板 =====
+    openSyncPanel(sourceId, runId, mode) {
+      // 如果已有面板（但 runId 不同），先关闭旧的
+      const existing = this.syncPanels[sourceId];
+      if (existing && existing._es) {
+        try { existing._es.close(); } catch (_) {}
+      }
+      this.syncPanels[sourceId] = {
         open: true,
         runId: runId,
-        sourceId: null,
-        title: (mode === 'full' ? '全量同步' : '增量同步') + ' · ' + title,
+        mode: mode || 'incremental',
         status: 'running',
         totalFiles: 0,
         totalCalls: 0,
@@ -390,20 +400,22 @@ function dashboard() {
         autoScroll: true,
         _es: null
       };
-      const token = localStorage.getItem('token') || '';
+      const token = localStorage.getItem('lrh_token') || '';
       const url = '/admin/sync-runs/' + runId + '/stream?token=' + encodeURIComponent(token);
       const es = new EventSource(url);
-      this.syncPanel._es = es;
-      es.onopen = () => { this.syncPanel.tail = '已连接，等待事件...'; };
+      this.syncPanels[sourceId]._es = es;
+      es.onopen = () => { if (this.syncPanels[sourceId]) this.syncPanels[sourceId].tail = '已连接，等待事件...'; };
       es.onerror = () => {
-        this.syncPanel.tail = '连接中断（浏览器会自动重连）';
+        if (this.syncPanels[sourceId]) this.syncPanels[sourceId].tail = '连接中断（浏览器会自动重连）';
       };
-      const handler = (e) => this.appendSyncEvent(e);
+      const handler = (e) => this.appendSyncEvent(sourceId, e);
       ['run_started','progress','folder_done','rate_limited','cooldown','retry','login_ok','paused','completed','failed','message','error'].forEach((name) => {
         es.addEventListener(name, handler);
       });
     },
-    appendSyncEvent(e) {
+    appendSyncEvent(sourceId, e) {
+      const panel = this.syncPanels[sourceId];
+      if (!panel) return;
       let data;
       try { data = JSON.parse(e.data); } catch (_) { return; }
       const ts = new Date(data.created_at || Date.now()).toLocaleTimeString('zh-CN', { hour12: false });
@@ -413,42 +425,43 @@ function dashboard() {
         completed: '🎉', paused: '⏸', failed: '💥', error: '⚠️', message: '·'
       })[data.event] || '·';
       const text = '[' + ts + '] ' + icon + ' ' + (data.message || data.event);
-      this.syncPanel.lines.push({
-        text,
-        level: data.level || 'info',
-        event: data.event
-      });
-      if (this.syncPanel.lines.length > 2000) this.syncPanel.lines.splice(0, this.syncPanel.lines.length - 2000);
+      panel.lines.push({ text, level: data.level || 'info', event: data.event });
+      if (panel.lines.length > 2000) panel.lines.splice(0, panel.lines.length - 2000);
       if (data.payload && typeof data.payload === 'object') {
-        if (typeof data.payload.files === 'number') this.syncPanel.totalFiles = data.payload.files;
-        if (typeof data.payload.calls === 'number') this.syncPanel.totalCalls = data.payload.calls;
-        if (typeof data.payload.total_files === 'number') this.syncPanel.totalFiles = data.payload.total_files;
-        if (typeof data.payload.total_calls === 'number') this.syncPanel.totalCalls = data.payload.total_calls;
+        if (typeof data.payload.files === 'number') panel.totalFiles = data.payload.files;
+        if (typeof data.payload.calls === 'number') panel.totalCalls = data.payload.calls;
+        if (typeof data.payload.total_files === 'number') panel.totalFiles = data.payload.total_files;
+        if (typeof data.payload.total_calls === 'number') panel.totalCalls = data.payload.total_calls;
       }
-      if (data.event === 'completed') { this.syncPanel.status = 'completed'; this.syncPanel.tail = '✅ 已完成'; this.afterSyncEnd(); }
-      else if (data.event === 'paused') { this.syncPanel.status = 'paused'; this.syncPanel.tail = '⏸ 已暂停'; this.afterSyncEnd(); }
-      else if (data.event === 'failed') { this.syncPanel.status = 'failed'; this.syncPanel.tail = '💥 失败'; this.afterSyncEnd(); }
-      else if (data.event === 'rate_limited') { this.syncPanel.status = 'paused'; this.syncPanel.tail = '⛔ 触发限流，已暂停'; this.afterSyncEnd(); }
+      if (data.event === 'completed') { panel.status = 'completed'; panel.tail = '✅ 已完成'; this.afterSyncEnd(sourceId); }
+      else if (data.event === 'paused') { panel.status = 'paused'; panel.tail = '⏸ 已暂停'; this.afterSyncEnd(sourceId); }
+      else if (data.event === 'failed') { panel.status = 'failed'; panel.tail = '💥 失败'; this.afterSyncEnd(sourceId); }
+      else if (data.event === 'rate_limited') { panel.status = 'paused'; panel.tail = '⛔ 触发限流，已暂停'; this.afterSyncEnd(sourceId); }
       this.$nextTick(() => {
-        if (this.syncPanel.autoScroll && this.$refs.syncLogBox) {
-          this.$refs.syncLogBox.scrollTop = this.$refs.syncLogBox.scrollHeight;
+        if (panel.autoScroll) {
+          const el = document.getElementById('syncBox_' + sourceId);
+          if (el) el.scrollTop = el.scrollHeight;
         }
       });
     },
-    afterSyncEnd() {
-      this.sources.forEach((s) => { s._syncing = false; s._syncMode = ''; });
+    afterSyncEnd(sourceId) {
+      const src = this.sources.find((s) => s.id === sourceId);
+      if (src) { src._syncing = false; src._syncMode = ''; }
       this.loadSources();
     },
-    closeSyncPanel() {
-      if (this.syncPanel && this.syncPanel._es) {
-        try { this.syncPanel._es.close(); } catch (_) {}
-      }
-      this.syncPanel = { open: false, runId: null, sourceId: null, title: '', status: '-', totalFiles: 0, totalCalls: 0, tail: '', lines: [], autoScroll: true, _es: null };
+    closeSyncPanel(sourceId) {
+      const panel = this.syncPanels[sourceId];
+      if (panel && panel._es) { try { panel._es.close(); } catch (_) {} }
+      delete this.syncPanels[sourceId];
     },
-    clearSyncPanel() { this.syncPanel.lines = []; },
-    async copySyncPanel() {
-      const text = this.syncPanel.lines.map((l) => l.text).join('\n');
-      try { await navigator.clipboard.writeText(text); this.notify('已复制 ' + this.syncPanel.lines.length + ' 行'); }
+    clearSyncPanel(sourceId) {
+      if (this.syncPanels[sourceId]) this.syncPanels[sourceId].lines = [];
+    },
+    async copySyncPanel(sourceId) {
+      const panel = this.syncPanels[sourceId];
+      if (!panel) return;
+      const text = panel.lines.map((l) => l.text).join('\n');
+      try { await navigator.clipboard.writeText(text); this.notify('已复制 ' + panel.lines.length + ' 行'); }
       catch (_) { this.notify('复制失败', 'error'); }
     },
     lineClass(line) {

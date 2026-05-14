@@ -147,6 +147,12 @@ async function readInput() {
   });
 }
 
+// 用户从后台点了"暂停"——上层会给本进程发 SIGTERM，
+// 这里捕获后只置标志，让主循环把当前页扫完后干净退出（进度照常落库）
+let pauseRequested = false;
+process.on('SIGTERM', () => { pauseRequested = true; });
+process.on('SIGINT',  () => { pauseRequested = true; });
+
 async function main() {
   const input = JSON.parse(await readInput());
   const account = String(input.account || '').trim();
@@ -194,6 +200,14 @@ async function main() {
     const limit = 60;
 
     while (true) {
+      // 用户从后台点了"暂停"
+      if (pauseRequested) {
+        emit({ event: 'page', folder_id: folderId, next_offset: offset, total_page: totalPage, done: 0 });
+        queue.unshift(folderId);
+        logMsg('warn', 'paused_by_user', '用户从后台手动暂停');
+        stopReason = 'paused_by_user';
+        break outer;
+      }
       let resp;
       try {
         resp = await callWithRetry(accountId, 'getFileList',
