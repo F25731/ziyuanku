@@ -1,37 +1,11 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
-const { LanZouYClient } = require('@netdrive-sdk/ilanzou');
 const { getRedis } = require('../config/redis');
-const { guarded, guardedWithRetry } = require('./rateLimiter');
+const { guardedWithRetry } = require('./rateLimiter');
+const ilanzouApi = require('./ilanzouApi');
 
 const UA_PC = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const LANZOU_HOSTS = ['lanzou', 'lanzoux', 'lanzoui', 'lanzouw', 'lanzouj', 'lanzouf', 'lanzoup', 'lanzouq', 'lanzouv', 'lanzouy', 'woozooo'];
-
-// 进程内 SDK client 缓存：同一账号 30 分钟内复用，不重新登录
-const CLIENT_TTL_MS = 30 * 60 * 1000;
-const clientCache = new Map(); // accountKey → { client, expireAt }
-
-async function getOrCreateClient(account, password) {
-  const key = 'ilanzou:' + account;
-  const now = Date.now();
-  const cached = clientCache.get(key);
-  if (cached && cached.expireAt > now) return { client: cached.client, accountKey: key };
-
-  const client = new LanZouYClient({ username: account, password });
-  client.config.apiUrl = 'https://apis.ilanzou.com';
-  client.client = client.client.extend({ prefixUrl: client.config.apiUrl });
-
-  const loginRes = await guarded(key, 'login', () => withTimeout(client.login(), 20000, '登录'));
-  if (!loginRes || loginRes.code !== 200) {
-    throw new Error('ilanzou 登录失败: ' + JSON.stringify(loginRes));
-  }
-  clientCache.set(key, { client, expireAt: now + CLIENT_TTL_MS });
-  return { client, accountKey: key };
-}
-
-function invalidateClient(account) {
-  clientCache.delete('ilanzou:' + account);
-}
 
 function isLanzouPublicUrl(url) {
   if (!url) return false;
@@ -63,13 +37,6 @@ async function setCached(resourceId, url, ttlSec) {
   } catch (_) { return Date.now() + ttlSec * 1000; }
 }
 
-function asString(v) {
-  if (v == null) return '';
-  if (typeof v === 'string') return v;
-  if (typeof v === 'object' && v.url) return String(v.url);
-  return String(v);
-}
-
 function withTimeout(promise, ms, label) {
   return Promise.race([
     promise,
@@ -78,6 +45,7 @@ function withTimeout(promise, ms, label) {
 }
 
 // -------- 方式 A：ilanzou (新版) 账号模式 --------
+// 走 OpenList 同款官方 web API：/unproved/file/redirect + AES 签名，1 次 RTT 拿 302 Location
 async function resolveByIlanzouAccount(resource) {
   if (!resource.source_account || !resource.source_password) {
     throw new Error('账号模式缺少账号/密码');
@@ -87,26 +55,23 @@ async function resolveByIlanzouAccount(resource) {
   }
   console.log(`[resolve] account-mode fileId=${resource.file_id} account=${resource.source_account}`);
 
-  let client, accountKey;
+  const accountKey = 'ilanzou:' + resource.source_account;
   try {
-    ({ client, accountKey } = await getOrCreateClient(resource.source_account, resource.source_password));
-  } catch (err) {
-    throw new Error('ilanzou 登录请求异常: ' + (err.message || err));
-  }
-
-  let direct;
-  try {
-    direct = await guardedWithRetry(accountKey, 'downloadFile',
-      () => withTimeout(client.downloadFile(String(resource.file_id), true), 30000, 'downloadFile'),
+    const url = await guardedWithRetry(accountKey, 'downloadFile',
+      () => withTimeout(
+        ilanzouApi.getDownloadUrl(resource.source_account, resource.source_password, String(resource.file_id)),
+        30000, 'file/redirect'
+      ),
       { maxRetries: 2, baseBackoffMs: 800 }
     );
+    if (url && /^https?:\/\//.test(url)) return String(url).trim();
+    throw new Error('file/redirect 未返回有效 URL: ' + JSON.stringify(url));
   } catch (err) {
-    if (/token|未登录|login/i.test(err.message || '')) invalidateClient(resource.source_account);
-    throw new Error('downloadFile 调用异常: ' + (err.message || err));
+    if (/token|appToken|未登录|login/i.test(err.message || '')) {
+      ilanzouApi.invalidateClient(resource.source_account);
+    }
+    throw new Error('file/redirect 调用异常: ' + (err.message || err));
   }
-  const url = asString(direct);
-  if (url && /^https?:\/\//.test(url)) return url.trim();
-  throw new Error('downloadFile 未返回 URL，原始: ' + JSON.stringify(direct));
 }
 
 // -------- 方式 B：公开 share_url 解析（lanzou.com / lanzoux / ...）--------

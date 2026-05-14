@@ -1,11 +1,13 @@
 #!/usr/bin/env node
-const { LanZouYClient } = require('@netdrive-sdk/ilanzou');
 const Redis = require('ioredis');
+const ilanzouApi = require('../services/ilanzouApi');
 
 // ===== 限速：和 services/rateLimiter.js 保持同一套策略 =====
-const LIMITS = { shareUrl: 15, login: 2, getFileList: 30, default: 20 };
-const MIN_INTERVAL_MS = 600;
-const JITTER_MS = 400;
+// shareUrl 已废弃（百万级会触发风控），同步只保留 getFileList
+// 阶段3：getFileList 30→15/分钟，间隔 600→1500ms，抖动 400→1500ms
+const LIMITS = { login: 2, getFileList: 15, default: 15 };
+const MIN_INTERVAL_MS = Number(process.env.LZ_MIN_INTERVAL_MS || 1500);
+const JITTER_MS = Number(process.env.LZ_JITTER_MS || 1500);
 
 let redis = null;
 function getRedis() {
@@ -22,6 +24,7 @@ function getRedis() {
 }
 
 function rand(max) { return Math.floor(Math.random() * (max + 1)); }
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 async function acquire(accountId, op = 'default') {
   if (!accountId) return;
@@ -50,12 +53,11 @@ async function acquire(accountId, op = 'default') {
     const lk = `ratelimit:last:${accountId}`;
     const last = Number(await r.get(lk) || 0);
     const wait = Math.max(0, MIN_INTERVAL_MS + rand(JITTER_MS) - (Date.now() - last));
-    if (wait > 0) await new Promise((res) => setTimeout(res, wait));
+    if (wait > 0) await sleep(wait);
     await r.set(lk, String(Date.now()), 'EX', 60);
   } catch (err) {
     if (err.code === 'COOLDOWN' || err.code === 'RATE_LIMITED') throw err;
-    // Redis 挂了不要阻塞同步流程，降级到固定间隔
-    await new Promise((res) => setTimeout(res, MIN_INTERVAL_MS + rand(JITTER_MS)));
+    await sleep(MIN_INTERVAL_MS + rand(JITTER_MS));
   }
 }
 
@@ -65,21 +67,8 @@ async function cooldown(accountId, seconds = 600) {
 
 function looksRateLimited(resp) {
   const txt = (resp && (resp.msg || resp.message || '')) || '';
-  return /频繁|请求过快|操作过快|验证|封|限制/.test(txt)
+  return /频繁|请求过快|操作过快|验证|封|限制|risk/i.test(txt)
     || (resp && (resp.code === 429 || resp.status === 429));
-}
-
-// ===== 工具 =====
-function fileToDict(item, parentFolderId, shareUrl = '') {
-  return {
-    parent_folder_id: String(parentFolderId ?? 0),
-    file_id: String(item.fileId || item.id || ''),
-    file_name: String(item.fileName || item.name || ''),
-    file_size: String(item.fileSize || item.size || ''),
-    file_type: String(item.fileType || item.type || ''),
-    file_time: String(item.updTime || item.addTime || item.updateTime || item.createTime || item.time || ''),
-    share_url: String(shareUrl || '').trim()
-  };
 }
 
 function withTimeout(promise, ms, label) {
@@ -89,46 +78,46 @@ function withTimeout(promise, ms, label) {
   ]);
 }
 
-// 带指数退避的调用：网络错/超时 重试；风控/冷却 不重试
 async function callWithRetry(accountId, op, fn, maxRetries = 2) {
   let lastErr;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    await acquire(accountId, op);
     try {
-      await acquire(accountId, op);
-    } catch (err) {
-      // 冷却 / 超配额直接抛，不重试
-      throw err;
-    }
-    try {
-      const r = await fn();
-      if (looksRateLimited(r)) {
-        await cooldown(accountId, 600);
-        throw new Error('风控触发: ' + JSON.stringify(r));
-      }
-      return r;
+      return await fn();
     } catch (err) {
       lastErr = err;
       if (err.code === 'COOLDOWN' || err.code === 'RATE_LIMITED') throw err;
       if (/风控|封|频繁|限制/.test(err.message || '')) throw err;
       if (attempt >= maxRetries) throw err;
-      const wait = 800 * Math.pow(3, attempt) + rand(400);
-      await new Promise((res) => setTimeout(res, wait));
+      const wait = 1500 * Math.pow(3, attempt) + rand(800);
+      await sleep(wait);
     }
   }
   throw lastErr;
 }
 
-async function safeShareUrl(client, accountId, fileId) {
-  try {
-    const res = await callWithRetry(accountId, 'shareUrl',
-      () => withTimeout(client.shareUrl(String(fileId || '')), 12000, 'shareUrl'),
-      1 // 单文件失败不要重试太多次，快速跳过
-    );
-    return String((res && res.shareUrl) || '').trim();
-  } catch (err) {
-    if (err.code === 'COOLDOWN') throw err;
-    return '';
-  }
+// ===== NDJSON 事件输出 =====
+function emit(obj) {
+  process.stdout.write(JSON.stringify(obj) + '\n');
+}
+
+function fileToDict(item, parentFolderId) {
+  return {
+    parent_folder_id: String(parentFolderId ?? 0),
+    file_id: String(item.fileId || item.id || ''),
+    file_name: String(item.fileName || item.name || ''),
+    file_size: String(item.fileSize || item.size || ''),
+    file_type: String(item.fileType || item.type || ''),
+    file_time: String(item.updTime || item.addTime || item.updateTime || item.createTime || item.time || ''),
+    share_url: ''
+  };
+}
+
+function isFolderItem(item) {
+  return Number(item?.fileType || item?.type || 0) === 2 && item?.folderId;
+}
+function isFileItem(item) {
+  return Number(item?.fileType || item?.type || 0) === 1 && (item?.fileId || item?.id);
 }
 
 async function readInput() {
@@ -141,98 +130,129 @@ async function readInput() {
   });
 }
 
-function isFolderItem(item) {
-  return Number(item?.fileType || item?.type || 0) === 2 && item?.folderId;
-}
-function isFileItem(item) {
-  return Number(item?.fileType || item?.type || 0) === 1 && (item?.fileId || item?.id);
-}
-
-async function fetchAllInFolder(ctx, folderId) {
-  const all = [];
-  const limit = 100;
-  let offset = 1;
-  while (true) {
-    const res = await callWithRetry(ctx.accountId, 'getFileList',
-      () => withTimeout(ctx.client.getFileList({ folderId, limit, offset }), 15000, `getFileList(${folderId})`),
-      2
-    );
-    if (!res || res.code !== 200) {
-      if (looksRateLimited(res)) {
-        await cooldown(ctx.accountId, 600);
-        throw new Error('风控触发，已冷却账号');
-      }
-      throw new Error((res && (res.msg || res.message)) || `ilanzou 列表获取失败, folderId=${folderId}`);
-    }
-    const list = Array.isArray(res.list) ? res.list : [];
-    all.push(...list);
-    const total = Number(res.total || 0);
-    if (list.length === 0) break;
-    if (total > 0 && all.length >= total) break;
-    offset += list.length;
-    if (list.length < limit && total === 0) break;
-  }
-  return all;
-}
-
-async function walk(ctx, folderId, files, visited) {
-  const key = String(folderId ?? 0);
-  if (visited.has(key)) return;
-  visited.add(key);
-  const items = await fetchAllInFolder(ctx, Number(folderId || 0));
-  for (const item of items) {
-    if (isFolderItem(item)) {
-      await walk(ctx, Number(item.folderId), files, visited);
-      continue;
-    }
-    if (isFileItem(item)) {
-      const fileId = String(item.fileId || item.id || '');
-      let shareUrl = '';
-      if (ctx.mode === 'incremental' && ctx.existing && ctx.existing[fileId]) {
-        shareUrl = ctx.existing[fileId];
-      } else if (ctx.mode !== 'check-only' && fileId) {
-        shareUrl = await safeShareUrl(ctx.client, ctx.accountId, fileId);
-      }
-      files.push(fileToDict(item, folderId, shareUrl));
-    }
-  }
-}
-
 async function main() {
   const input = JSON.parse(await readInput());
   const account = String(input.account || '').trim();
   const password = String(input.password || '');
-  const rootFolderId = Number(input.rootFolderId || 0);
-  const mode = String(input.mode || 'full');
-  const existing = input.existing && typeof input.existing === 'object' ? input.existing : {};
+  const rootFolderId = String(input.rootFolderId || '0');
+  const mode = String(input.mode || 'incremental');
+  const dailyBudget = Math.max(0, Number(input.dailyCallBudget || 0));
+  const resume = (input.resume && typeof input.resume === 'object') ? input.resume : {};
+  const initialPending = Array.isArray(input.pendingFolders) && input.pendingFolders.length
+    ? input.pendingFolders.map(String)
+    : [rootFolderId];
 
   if (!account || !password) throw new Error('账号或密码为空');
 
   const accountId = 'ilanzou:' + account;
-  const client = new LanZouYClient({ username: account, password });
-  client.config.apiUrl = 'https://apis.ilanzou.com';
-  client.client = client.client.extend({ prefixUrl: client.config.apiUrl });
 
+  // 预热登录（getUuid + login + user/account/map），失败立刻抛
   await acquire(accountId, 'login');
-  const loginRes = await withTimeout(client.login(), 20000, '登录');
-  if (!loginRes || loginRes.code !== 200) {
-    if (looksRateLimited(loginRes)) await cooldown(accountId, 600);
-    throw new Error((loginRes && (loginRes.msg || loginRes.message)) || 'ilanzou 登录失败');
+  try {
+    await withTimeout(ilanzouApi.getClient(account, password), 25000, '登录');
+  } catch (err) {
+    if (looksRateLimited({ msg: err && err.message })) await cooldown(accountId, 600);
+    throw err;
   }
 
-  const files = [];
-  await walk({ client, accountId, mode, existing }, rootFolderId, files, new Set());
+  // ===== BFS 主循环 =====
+  const queue = [...initialPending];
+  const enqueued = new Set(queue);
+  let callsLeft = dailyBudget;
+  let totalFiles = 0;
+  let stopReason = 'completed';
 
-  const reused = files.filter((f) => existing[f.file_id]).length;
-  const newOnes = files.length - reused;
-  process.stdout.write(JSON.stringify({
-    ok: true, total: files.length, reused, new: newOnes, mode, files
-  }));
+  outer:
+  while (queue.length > 0) {
+    const folderId = queue.shift();
+    const state = resume[folderId] || { next_offset: 1, total_page: 0, done: 0 };
+    if (state.done) continue; // 已完成的目录跳过
+    let offset = Math.max(1, Number(state.next_offset) || 1);
+    let totalPage = Math.max(0, Number(state.total_page) || 0);
+    const limit = 60; // OpenList 同款
+
+    while (true) {
+      if (callsLeft <= 0) {
+        // 当前页还没拉，next_offset 维持 offset（下次从这一页继续），done=0
+        emit({ event: 'progress', folder_id: folderId, next_offset: offset, total_page: totalPage, done: 0 });
+        // 把当前目录退回队首，剩余目录原样保留
+        queue.unshift(folderId);
+        stopReason = 'daily_quota_reached';
+        break outer;
+      }
+
+      let resp;
+      try {
+        resp = await callWithRetry(accountId, 'getFileList',
+          () => withTimeout(
+            ilanzouApi.listFolderPage(account, password, folderId, offset, limit),
+            15000, `record/file/list(${folderId} p${offset})`
+          ),
+          2
+        );
+      } catch (err) {
+        emit({ event: 'progress', folder_id: folderId, next_offset: offset, total_page: totalPage, done: 0 });
+        queue.unshift(folderId);
+        if (err.code === 'COOLDOWN') {
+          stopReason = 'cooldown';
+          break outer;
+        }
+        if (err.code === 'RATE_LIMITED') {
+          stopReason = 'rate_limited';
+          break outer;
+        }
+        if (looksRateLimited({ msg: err && err.message })) {
+          await cooldown(accountId, 600);
+          stopReason = 'cooldown';
+          break outer;
+        }
+        // 其他错误：直接抛，由上层 failRun
+        throw err;
+      }
+      callsLeft--;
+
+      const list = Array.isArray(resp && resp.list) ? resp.list : [];
+      totalPage = Number((resp && resp.totalPage) || totalPage);
+
+      for (const item of list) {
+        if (isFolderItem(item)) {
+          const sub = String(item.folderId);
+          if (!enqueued.has(sub)) {
+            enqueued.add(sub);
+            queue.push(sub);
+          }
+          continue;
+        }
+        if (isFileItem(item)) {
+          totalFiles++;
+          emit({ event: 'file', data: fileToDict(item, folderId) });
+        }
+      }
+
+      const isLastPage = list.length === 0 || (totalPage > 0 && offset >= totalPage);
+      const nextOffset = isLastPage ? offset : (offset + 1);
+      const done = isLastPage ? 1 : 0;
+      emit({ event: 'progress', folder_id: folderId, next_offset: nextOffset, total_page: totalPage, done });
+
+      if (isLastPage) break;
+      offset++;
+    }
+  }
+
+  emit({
+    event: 'end',
+    ok: true,
+    reason: stopReason,
+    total_files: totalFiles,
+    total_calls: dailyBudget - callsLeft,
+    remaining_folders: queue
+  });
+
   try { await redis && redis.quit(); } catch (_) {}
 }
 
 main().catch((err) => {
-  process.stdout.write(JSON.stringify({ ok: false, message: err?.message || String(err) }));
+  emit({ event: 'end', ok: false, message: err?.message || String(err) });
   try { redis && redis.quit(); } catch (_) {}
   process.exit(1);
 });

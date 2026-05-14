@@ -6,7 +6,7 @@ const { login, changePassword } = require('../services/userService');
 const {
   listSources, getSource, saveSource, updateSource, deleteSource, unlockSource
 } = require('../services/sourceService');
-const { syncSource, checkSource, listSyncLogs, clearSyncLogs } = require('../services/lanzouSyncService');
+const { syncSource, checkSource, listSyncLogs, clearSyncLogs, listSyncRuns } = require('../services/lanzouSyncService');
 const {
   searchResources, listResources, deleteResource
 } = require('../services/resourceService');
@@ -131,9 +131,11 @@ router.delete('/sources/:id', adminRequired, asyncHandler(async (req, res) => {
 }));
 
 router.post('/sources/:id/sync', adminRequired, asyncHandler(async (req, res) => {
+  // mode=incremental（默认）：自动续接最近未完成的 run；
+  // mode=full：把未完成 run 标记 failed，新建一个从根目录开始的 run
   const mode = (req.body && req.body.mode === 'full') ? 'full' : 'incremental';
   const result = await syncSource(Number(req.params.id), mode);
-  res.json({ code: 200, message: '同步完成', ...result });
+  res.json({ code: 200, message: '同步执行完成', ...result });
 }));
 
 router.post('/sources/:id/check', adminRequired, asyncHandler(async (req, res) => {
@@ -155,6 +157,13 @@ router.get('/sync-logs', asyncHandler(async (req, res) => {
 router.delete('/sync-logs', adminRequired, asyncHandler(async (req, res) => {
   await clearSyncLogs();
   res.json({ code: 200, message: '已清空' });
+}));
+
+// ---------- 同步 Run（断点续扫元数据） ----------
+router.get('/sync-runs', asyncHandler(async (req, res) => {
+  const sourceId = req.query.source_id ? Number(req.query.source_id) : null;
+  const items = await listSyncRuns(sourceId, Number(req.query.limit) || 30);
+  res.json({ code: 200, items });
 }));
 
 // ---------- API Key 管理 ----------

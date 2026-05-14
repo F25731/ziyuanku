@@ -1,16 +1,16 @@
 const { getRedis } = require('../config/redis');
 
 // 每个账号每分钟配额（按操作分类）
+// 阶段3：百万级扫描需要慢且像人——单点限制再放紧一档
 const DEFAULT_LIMITS = {
-  shareUrl: 15,
   login: 2,
-  getFileList: 30,
+  getFileList: 15,    // 原 30，对齐 OpenList 风格的随手翻目录
   downloadFile: 20,
-  default: 20
+  default: 15
 };
 
-const MIN_INTERVAL_MS = 600;
-const JITTER_MS = 400;
+const MIN_INTERVAL_MS = Number(process.env.LZ_MIN_INTERVAL_MS || 1500); // 原 600
+const JITTER_MS = Number(process.env.LZ_JITTER_MS || 1500);             // 原 400
 
 // 同账号信号量（同时最多 N 个 SDK 请求在飞）
 const ACCOUNT_CONCURRENCY = 1;
