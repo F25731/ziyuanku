@@ -14,7 +14,6 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@netdrive-sdk/ilanzou": "^1.0.3-alpha.4",
     "axios": "^1.7.9",
     "bcryptjs": "^2.4.3",
     "cheerio": "^1.0.0",
@@ -24,7 +23,6 @@
     "helmet": "^8.0.0",
     "ioredis": "^5.4.1",
     "jsonwebtoken": "^9.0.2",
-    "meilisearch": "^0.45.0",
     "morgan": "^1.10.0",
     "mysql2": "^3.12.0",
     "uuid": "^11.0.3"

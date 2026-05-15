@@ -139,7 +139,6 @@ function dashboard() {
     _searchDebounce: null,
     searchEngine: '', // 'meili' / 'mysql'，搜完后显示
     searchMs: 0,
-    indexStats: null,
 
     docs: window.LRH_DOCS || { endpoints: [], examples: {}, errors: [], notes: [] },
     docTab: 'curl',
@@ -648,37 +647,6 @@ function dashboard() {
         this.callLogs = d.items || [];
       } catch (e) { this.notify(e.message, 'error'); }
       finally { this.tabLoading.calllogs = false; }
-    },
-
-    async loadIndexStats() {
-      try {
-        this.indexStats = await api('/search-index/stats');
-        // 后端已返回 rebuild 状态：{ running, started_at, finished_at, total, error }
-        // 如果在跑，开启轮询；不跑了就停
-        if (this.indexStats?.rebuild?.running && !this._rebuildTimer) {
-          this._rebuildTimer = setInterval(() => this.loadIndexStats(), 3000);
-        } else if (!this.indexStats?.rebuild?.running && this._rebuildTimer) {
-          clearInterval(this._rebuildTimer);
-          this._rebuildTimer = null;
-          if (this.indexStats?.rebuild?.error) {
-            this.notify('重建失败：' + this.indexStats.rebuild.error, 'error');
-          } else if (this.indexStats?.rebuild?.finished_at) {
-            this.notify('重建完成，共 ' + (this.indexStats.rebuild.total || 0) + ' 条');
-          }
-        }
-      } catch (_) { this.indexStats = { enabled: false }; }
-    },
-    async rebuildIndex() {
-      if (this.indexStats?.rebuild?.running) {
-        this.notify('重建已在进行中，请等待完成', 'error');
-        return;
-      }
-      if (!confirm('确认从 MySQL 全量重建 Meilisearch 索引？几十万条以内大约 10-30 秒，百万级需要 10-30 分钟。')) return;
-      try {
-        await api('/search-index/rebuild', { method: 'POST' });
-        this.notify('重建已启动，进度会在下方实时刷新');
-        this.loadIndexStats(); // 立刻刷一次，开启轮询
-      } catch (e) { this.showError('重建失败', e); }
     },
 
     docExampleText(lang) {

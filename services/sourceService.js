@@ -88,30 +88,10 @@ async function updateSource(id, payload) {
 }
 
 async function deleteSource(id) {
-  // 级联清理 Meilisearch + sync_runs / sync_progress / sync_run_events / resources / sync_logs
+  // 级联清理 sync_runs / sync_progress / sync_run_events / resources / sync_logs
+  // 阶段5 之后：搜索完全靠 MySQL FULLTEXT，删 resources 即生效，不再需要同步删外部索引
   const { deleteRunsBySource } = require('./lanzouSyncService');
-  const searchIndex = require('./searchIndex');
-
-  // 1) 先把要删的 resource id 全量取出来，同步删 Meili 索引（前端搜索优先读 Meili）
-  if (searchIndex.isEnabled()) {
-    try {
-      const [rows] = await pool.query('SELECT id FROM resources WHERE source_id = ?', [id]);
-      const ids = rows.map((r) => r.id);
-      // 大批量分批删，避免一次请求过大
-      const BATCH = 5000;
-      for (let i = 0; i < ids.length; i += BATCH) {
-        await searchIndex.deleteById(ids.slice(i, i + BATCH)).catch((e) =>
-          console.warn('[search] deleteById on source delete failed:', e.message));
-      }
-    } catch (e) {
-      console.warn('[deleteSource] meili 清理失败（继续删 MySQL）:', e.message);
-    }
-  }
-
-  // 2) 同步进度 / 事件
   await deleteRunsBySource(id);
-
-  // 3) MySQL 资源 + 同步日志 + 源
   await pool.query('DELETE FROM resources WHERE source_id = ?', [id]);
   await pool.query('DELETE FROM sync_logs WHERE source_id = ?', [id]);
   await pool.query('DELETE FROM sources WHERE id = ?', [id]);

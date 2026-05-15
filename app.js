@@ -40,19 +40,6 @@ async function start() {
   await runMigrations();
   await ensureAdminUser();
 
-  // Meilisearch 启动时确保索引存在（失败不阻塞，会降级到 MySQL LIKE）
-  try {
-    const searchIndex = require('./services/searchIndex');
-    if (searchIndex.isEnabled()) {
-      await searchIndex.ensureIndex();
-      console.log('[OK] Meilisearch index ready');
-    } else {
-      console.log('[INFO] Meilisearch 未配置，搜索将使用 MySQL LIKE');
-    }
-  } catch (e) {
-    console.warn('[WARN] Meilisearch 初始化失败（将降级到 MySQL）:', e.message);
-  }
-
   app.listen(PORT, () => {
     console.log(`[OK] lanzou-resource-hub listening on :${PORT}`);
     console.log(`[OK] Admin UI:      http://127.0.0.1:${PORT}/admin/login.html`);

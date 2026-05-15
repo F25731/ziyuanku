@@ -262,41 +262,4 @@ router.get('/call-logs', asyncHandler(async (req, res) => {
   res.json({ code: 200, items: rows });
 }));
 
-// ---------- Meilisearch 索引 ----------
-const searchIndex = require('../services/searchIndex');
-
-// 重建索引是长任务（百万级数据 ~10-30 分钟），HTTP 不能阻塞等
-// 进程内维护 rebuild state，前端通过 stats 接口轮询进度
-let rebuildState = { running: false, started_at: null, finished_at: null, total: 0, error: null };
-
-router.get('/search-index/stats', asyncHandler(async (req, res) => {
-  const stats = await searchIndex.getStats();
-  res.json({ code: 200, ...stats, rebuild: rebuildState });
-}));
-
-router.post('/search-index/rebuild', adminRequired, asyncHandler(async (req, res) => {
-  if (!searchIndex.isEnabled()) {
-    return res.status(400).json({ code: 400, message: 'Meilisearch 未配置（MEILI_HOST 未设置）' });
-  }
-  if (rebuildState.running) {
-    return res.status(409).json({ code: 409, message: '重建已在进行中', rebuild: rebuildState });
-  }
-  rebuildState = { running: true, started_at: new Date().toISOString(), finished_at: null, total: 0, error: null };
-  // 异步跑：立刻返回，后台慢慢做
-  setImmediate(async () => {
-    try {
-      await searchIndex.ensureIndex();
-      const r = await searchIndex.rebuildFromDb();
-      rebuildState.total = r.total || 0;
-    } catch (e) {
-      rebuildState.error = e && e.message || String(e);
-      console.error('[search-index/rebuild] failed:', rebuildState.error);
-    } finally {
-      rebuildState.running = false;
-      rebuildState.finished_at = new Date().toISOString();
-    }
-  });
-  res.json({ code: 200, message: '重建已启动，请通过 stats 接口轮询进度', rebuild: rebuildState });
-}));
-
 module.exports = router;

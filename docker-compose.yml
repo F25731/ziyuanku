@@ -49,28 +49,6 @@ services:
       retries: 10
     networks: [internal]
 
-  meilisearch:
-    image: getmeili/meilisearch:v1.10
-    container_name: lrh-meili
-    restart: unless-stopped
-    environment:
-      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
-      MEILI_ENV: production
-      MEILI_NO_ANALYTICS: "true"
-    volumes:
-      - meili_data:/meili_data
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:7700/health"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
-    networks: [internal]
-
   app:
     build:
       context: .
@@ -83,12 +61,10 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      meilisearch:
-        condition: service_healthy
     environment:
       NODE_ENV: production
-      # 1.9G 总内存的轻量服务器：mysql 占 ~300M、meili ~150M、redis ~30M，
-      # app 给 Node 上限 768M 留 200M 给系统/子进程，刚好不溢出
+      # 1.9G 总内存的轻量服务器：mysql ~300M、redis ~30M，app 给 Node 上限 768M
+      # 阶段5 之后 Meilisearch 已下线，搜索靠 MySQL FULLTEXT (ngram) 实现
       NODE_OPTIONS: --max-old-space-size=768
       PORT: 3000
       TZ: Asia/Shanghai
@@ -100,15 +76,12 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_PASSWORD: ""
-      MEILI_HOST: http://meilisearch:7700
-      MEILI_KEY: ${MEILI_MASTER_KEY}
       JWT_SECRET: ${JWT_SECRET}
       JWT_EXPIRES_IN: 7d
       ADMIN_INIT_USERNAME: ${ADMIN_INIT_USERNAME:-admin}
       ADMIN_INIT_PASSWORD: ${ADMIN_INIT_PASSWORD:-Admin@123456}
       LINK_CACHE_TTL: ${LINK_CACHE_TTL:-1800}
       API_RATE_LIMIT_PER_MIN: ${API_RATE_LIMIT_PER_MIN:-60}
-      # 同步参数（可在 .env 覆盖）
       SYNC_UPSERT_BATCH: ${SYNC_UPSERT_BATCH:-200}
       SYNC_MAX_INDEX_DEPTH: ${SYNC_MAX_INDEX_DEPTH:-20}
     deploy:
@@ -130,7 +103,6 @@ services:
 volumes:
   mysql_data:
   redis_data:
-  meili_data:
 
 networks:
   internal:

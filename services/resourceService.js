@@ -1,51 +1,40 @@
 const { pool } = require('../config/db');
-const searchIndex = require('./searchIndex');
 
-async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = null }) {
-  // 优先走 Meilisearch
-  if (searchIndex.isEnabled()) {
-    try {
-      const r = await searchIndex.search({ q, page, pageSize, sourceId });
-      if (r) {
-        // 回表补 source_title（Meili 里已经有 source_title 就直接用）+ 格式对齐
-        return {
-          total: r.total,
-          page: r.page,
-          pageSize: r.pageSize,
-          items: r.items.map(h => ({
-            id: h.id,
-            source_id: h.source_id,
-            source_title: h.source_title,
-            source_provider: 'ilanzou',
-            file_id: h.file_id,
-            file_name: h.file_name,
-            file_size: h.file_size,
-            file_type: h.file_type,
-            file_time: h.file_time,
-            share_url: h.has_share_url ? 'yes' : '',
-            _highlight: h._formatted && h._formatted.file_name
-          })),
-          processing_ms: r.processing_ms,
-          engine: 'meili'
-        };
-      }
-    } catch (err) {
-      console.warn('[search] meili 查询失败，降级到 MySQL LIKE:', err.message);
-    }
-  }
-  return await searchByLike({ q, page, pageSize, sourceId });
+// 把用户输入的关键词转成 MySQL FULLTEXT BOOLEAN MODE 表达式
+// 多个空白分隔的词都用 + 前缀强制 AND，并按 ngram 拆词后的"短语"包起来更稳
+//   "蓝奏 资源" → "+蓝奏 +资源"
+// MySQL 默认 ngram_token_size=2，单字符词需要至少 2 字符才参与匹配；为了兼容单字搜索（"奏"），
+// 兜底再 OR 一个 LIKE。
+function buildBooleanQuery(q) {
+  const tokens = String(q || '').trim().split(/\s+/).filter(Boolean);
+  if (!tokens.length) return null;
+  // 转义 BOOLEAN MODE 的特殊字符： + - > < ( ) ~ * " @
+  const safe = tokens.map((t) => t.replace(/[+\-><()~*"@]/g, ' ').trim()).filter(Boolean);
+  if (!safe.length) return null;
+  return safe.map((t) => `+${t}*`).join(' '); // 每个词必须出现，前缀通配
 }
 
-async function searchByLike({ q = '', page = 1, pageSize = 20, sourceId = null }) {
+async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = null }) {
   page = Math.max(1, Number(page) || 1);
   pageSize = Math.min(100, Math.max(1, Number(pageSize) || 20));
   const offset = (page - 1) * pageSize;
+  q = String(q || '').trim();
 
   const where = ['r.is_deleted = 0'];
   const params = [];
-  if (q && String(q).trim()) {
-    where.push('r.file_name LIKE ?');
-    params.push(`%${String(q).trim()}%`);
+
+  let useFulltext = false;
+  if (q) {
+    const boolQ = buildBooleanQuery(q);
+    // 单字搜索（< ngram_token_size）走 LIKE 兜底，否则用 FULLTEXT
+    if (boolQ && q.length >= 2) {
+      where.push('MATCH(r.file_name) AGAINST(? IN BOOLEAN MODE)');
+      params.push(boolQ);
+      useFulltext = true;
+    } else {
+      where.push('r.file_name LIKE ?');
+      params.push(`%${q}%`);
+    }
   }
   if (sourceId) {
     where.push('r.source_id = ?');
@@ -57,7 +46,15 @@ async function searchByLike({ q = '', page = 1, pageSize = 20, sourceId = null }
     `SELECT COUNT(*) AS total FROM resources r ${whereSql}`,
     params
   );
+  const total = Number(countRow.total || 0);
 
+  // 排序：有关键词时按 FULLTEXT 相关度，没关键词按 id DESC
+  const orderSql = useFulltext
+    ? 'ORDER BY MATCH(r.file_name) AGAINST(? IN BOOLEAN MODE) DESC, r.id DESC'
+    : 'ORDER BY r.id DESC';
+  const orderParams = useFulltext ? [params[0]] : [];
+
+  const t0 = Date.now();
   const [rows] = await pool.query(
     `SELECT r.id, r.source_id, r.file_id, r.file_name, r.file_size, r.file_type, r.file_time,
             r.share_url, r.share_pwd, r.created_at,
@@ -65,17 +62,19 @@ async function searchByLike({ q = '', page = 1, pageSize = 20, sourceId = null }
        FROM resources r
        LEFT JOIN sources s ON s.id = r.source_id
        ${whereSql}
-      ORDER BY r.id DESC
+       ${orderSql}
       LIMIT ? OFFSET ?`,
-    [...params, pageSize, offset]
+    [...params, ...orderParams, pageSize, offset]
   );
+  const tookMs = Date.now() - t0;
 
   return {
-    total: Number(countRow.total || 0),
+    total,
     page,
     pageSize,
     items: rows,
-    engine: 'mysql'
+    processing_ms: tookMs,
+    engine: useFulltext ? 'mysql_fulltext' : 'mysql_like'
   };
 }
 
@@ -150,27 +149,8 @@ async function upsertResources(sourceId, files) {
     );
     await conn.commit();
 
-    // Meili 同步推送（**等待**完成再返回）：避免 setImmediate 在 1G 容器里
-    // 堆积大量 fire-and-forget 任务把 heap 顶爆。代价是每批多 ~50ms-200ms 网络耗时。
-    if (searchIndex.isEnabled()) {
-      try {
-        const fileIdsList = files.map((f) => String(f.file_id || '')).filter(Boolean);
-        if (fileIdsList.length) {
-          const placeholders = fileIdsList.map(() => '?').join(',');
-          const [rows] = await pool.query(
-            `SELECT r.id, r.source_id, r.file_id, r.file_name, r.file_size, r.file_type,
-                    r.file_time, r.share_url, r.is_deleted, r.created_at, s.title AS source_title
-               FROM resources r LEFT JOIN sources s ON s.id = r.source_id
-              WHERE r.source_id = ? AND r.file_id IN (${placeholders})`,
-            [sourceId, ...fileIdsList]
-          );
-          if (rows.length) await searchIndex.upsert(rows);
-        }
-      } catch (e) {
-        console.warn('[search] meili 推送失败:', e.message);
-      }
-    }
-
+    // 阶段5 之后：搜索完全靠 MySQL FULLTEXT 索引（005 migration 建好），
+    // upsert 写完就能搜——不再需要异步双写到 Meilisearch
     return { total, inserted, updated };
   } catch (err) {
     await conn.rollback();
@@ -201,9 +181,6 @@ async function listResources({ page = 1, pageSize = 50, sourceId = null } = {}) 
 
 async function deleteResource(id) {
   await pool.query('DELETE FROM resources WHERE id = ?', [id]);
-  if (searchIndex.isEnabled()) {
-    searchIndex.deleteById([id]).catch(e => console.warn('[search] delete failed:', e.message));
-  }
 }
 
 module.exports = { searchResources, getResource, upsertResources, reconcileDeletedAfterRun, listResources, deleteResource };
