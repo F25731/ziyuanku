@@ -8,7 +8,7 @@ const {
 } = require('../services/sourceService');
 const {
   syncSource, testConnection, listSyncLogs, clearSyncLogs, listSyncRuns,
-  listRunEvents, getRun, subscribeRun, requestPause
+  getRun, requestPause, getSyncStatus
 } = require('../services/lanzouSyncService');
 const {
   searchResources, listResources, deleteResource
@@ -197,85 +197,10 @@ router.post('/sync-runs/:id/pause', adminRequired, asyncHandler(async (req, res)
   res.json({ code: 200, message: '已发送暂停信号' });
 }));
 
-router.get('/sync-runs/:id/events', asyncHandler(async (req, res) => {
-  const sinceId = Number(req.query.since_id) || 0;
-  const limit = Math.min(Number(req.query.limit) || 500, 2000);
-  const events = await listRunEvents(Number(req.params.id), sinceId, limit);
-  res.json({ code: 200, items: events });
-}));
-
-// SSE：实时事件流。前端用 EventSource 订阅
-// 兼容浏览器 EventSource 不带自定义 header 的限制 → token 走 query string
-router.get('/sync-runs/:id/stream', asyncHandler(async (req, res) => {
-  // 浏览器 EventSource 不能带 Authorization header，从 query 取 token 自己验
-  const token = req.query.token;
-  if (!token) return res.status(401).json({ code: 401, message: '缺少 token' });
-  const { verifyToken, getUserById } = require('../services/userService');
-  let payload;
-  try { payload = verifyToken(String(token)); } catch (_) {
-    return res.status(401).json({ code: 401, message: 'token 无效' });
-  }
-  const user = payload && payload.sub ? await getUserById(payload.sub) : null;
-  if (!user || user.status !== 1) {
-    return res.status(401).json({ code: 401, message: '用户已失效' });
-  }
-  if (user.role !== 'admin') {
-    return res.status(403).json({ code: 403, message: '需要管理员权限' });
-  }
-
-  const runId = Number(req.params.id);
-  const run = await getRun(runId);
-  if (!run) return res.status(404).json({ code: 404, message: 'run 不存在' });
-
-  res.set({
-    'Content-Type': 'text/event-stream; charset=utf-8',
-    'Cache-Control': 'no-cache, no-transform',
-    'Connection': 'keep-alive',
-    'X-Accel-Buffering': 'no'
-  });
-  res.flushHeaders();
-
-  // last-event-id：浏览器自动重连时会在 header 里带；这里也支持 query
-  const lastEventId = Number(req.query.since_id || req.headers['last-event-id'] || 0);
-
-  // 1) 历史回放：从 sync_run_events 取
-  const history = await listRunEvents(runId, lastEventId, 2000);
-  for (const evt of history) {
-    res.write(`id: ${evt.event_id}\nevent: ${evt.event}\ndata: ${JSON.stringify(evt)}\n\n`);
-  }
-
-  // 2) 内存订阅：跟当前进行中的 run 保持实时
-  let cursor = history.length ? Number(history[history.length - 1].event_id) : lastEventId;
-  const sub = subscribeRun(runId, cursor);
-  for (const evt of sub.backlog) {
-    if (Number(evt.event_id) > cursor) {
-      res.write(`id: ${evt.event_id}\nevent: ${evt.event}\ndata: ${JSON.stringify(evt)}\n\n`);
-      cursor = Number(evt.event_id);
-    }
-  }
-
-  const onEvent = (evt) => {
-    if (Number(evt.event_id) <= cursor) return;
-    cursor = Number(evt.event_id);
-    res.write(`id: ${evt.event_id}\nevent: ${evt.event}\ndata: ${JSON.stringify(evt)}\n\n`);
-  };
-  sub.emitter.on('event', onEvent);
-
-  // 心跳防止代理超时
-  const heartbeat = setInterval(() => { try { res.write(': ping\n\n'); } catch (_) {} }, 25_000);
-
-  const onClose = () => {
-    clearInterval(heartbeat);
-    sub.emitter.off('event', onEvent);
-    try { res.end(); } catch (_) {}
-  };
-  req.on('close', onClose);
-  sub.emitter.once('close', () => {
-    // run 结束后保留连接 1s 让最后事件送达，再关
-    setTimeout(onClose, 1000);
-  });
-  // 如果 run 已经在订阅时就关闭了，5s 后主动关
-  if (sub.closed) setTimeout(onClose, 1000);
+// 给前端进度卡常驻轮询用：单次返回该源的 run 状态 + 进度统计
+router.get('/sources/:id/sync-status', asyncHandler(async (req, res) => {
+  const status = await getSyncStatus(Number(req.params.id));
+  res.json({ code: 200, ...status });
 }));
 
 // ---------- API Key 管理 ----------
@@ -340,18 +265,38 @@ router.get('/call-logs', asyncHandler(async (req, res) => {
 // ---------- Meilisearch 索引 ----------
 const searchIndex = require('../services/searchIndex');
 
+// 重建索引是长任务（百万级数据 ~10-30 分钟），HTTP 不能阻塞等
+// 进程内维护 rebuild state，前端通过 stats 接口轮询进度
+let rebuildState = { running: false, started_at: null, finished_at: null, total: 0, error: null };
+
 router.get('/search-index/stats', asyncHandler(async (req, res) => {
   const stats = await searchIndex.getStats();
-  res.json({ code: 200, ...stats });
+  res.json({ code: 200, ...stats, rebuild: rebuildState });
 }));
 
 router.post('/search-index/rebuild', adminRequired, asyncHandler(async (req, res) => {
   if (!searchIndex.isEnabled()) {
     return res.status(400).json({ code: 400, message: 'Meilisearch 未配置（MEILI_HOST 未设置）' });
   }
-  await searchIndex.ensureIndex();
-  const r = await searchIndex.rebuildFromDb();
-  res.json({ code: 200, message: '重建完成', ...r });
+  if (rebuildState.running) {
+    return res.status(409).json({ code: 409, message: '重建已在进行中', rebuild: rebuildState });
+  }
+  rebuildState = { running: true, started_at: new Date().toISOString(), finished_at: null, total: 0, error: null };
+  // 异步跑：立刻返回，后台慢慢做
+  setImmediate(async () => {
+    try {
+      await searchIndex.ensureIndex();
+      const r = await searchIndex.rebuildFromDb();
+      rebuildState.total = r.total || 0;
+    } catch (e) {
+      rebuildState.error = e && e.message || String(e);
+      console.error('[search-index/rebuild] failed:', rebuildState.error);
+    } finally {
+      rebuildState.running = false;
+      rebuildState.finished_at = new Date().toISOString();
+    }
+  });
+  res.json({ code: 200, message: '重建已启动，请通过 stats 接口轮询进度', rebuild: rebuildState });
 }));
 
 module.exports = router;

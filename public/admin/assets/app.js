@@ -119,8 +119,10 @@ function dashboard() {
 
     sourceModal: { open: false, title: '', provider: 'ilanzou', loginType: 'account', account: '', passwordText: '', cookieText: '', rootFolderId: '0', maxIndexDepth: 20, remark: '' },
     sourceEditModal: { open: false, id: null, title: '', account: '', passwordText: '', rootFolderId: '0', maxIndexDepth: 20, remark: '', status: 1 },
-    // 嵌入式同步实时面板：每个 source 一个独立面板，扫到哪个源就出现哪个
-    syncPanels: {}, // { [sourceId]: { open, runId, mode, status, totalFiles, totalCalls, tail, lines, autoScroll, _es } }
+    // 进度卡：每个源独立的状态快照（由 2s 轮询 GET /sources/:id/sync-status 填充）
+    syncStatus: {},          // { [sourceId]: {has_run, status, total_files, total_calls, progress, ...} }
+    syncRate: {},            // { [sourceId]: 文件/秒 } 由前端按差分算
+    _syncStatusTimers: {},   // { [sourceId]: setInterval handle } 不会被 Alpine 反应式追踪
     keyModal: { open: false, name: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', expireDays: 30, result: '' },
     keyEditModal: { open: false, id: null, name: '', key_prefix: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', expireText: '', addDays: 30, extendMsg: '' },
     linkModal: { open: false, fileName: '', url: '', expireText: '', cached: false, loading: false, error: '', detail: '' },
@@ -294,6 +296,8 @@ function dashboard() {
       try {
         const d = await api('/sources');
         this.sources = (d.items || []).map((s) => ({ ...s, _syncing: false, _syncMode: '', _checking: false }));
+        // 回到这个 tab / 重进页面 / 删完源后自动拉一遍状态，发现 running 的就开轮询
+        await this.refreshAllSyncStatus();
       } catch (e) { this.notify(e.message, 'error'); }
       finally { this.tabLoading.sources = false; }
     },
@@ -343,14 +347,15 @@ function dashboard() {
       if (src) { src._syncing = true; src._syncMode = mode; }
       try {
         const d = await api('/sources/' + id + '/sync', { method: 'POST', body: { mode } });
-        if (!d.run_id) {
-          this.notify('同步已触发，但未返回 run_id', 'error');
-          if (src) { src._syncing = false; src._syncMode = ''; }
-          return;
+        if (d.run_id) {
+          // 立刻刷新一次状态，进度卡马上出现，用户能看到 spinner
+          this.refreshSyncStatus(id);
+          this.startSyncStatusPolling(id);
+          this.notify((mode === 'full' ? '全量' : '增量') + '扫描已启动');
         }
-        this.openSyncPanel(id, d.run_id, mode);
       } catch (e) {
         this.showError((mode === 'full' ? '全量' : '增量') + '同步触发失败', e);
+      } finally {
         if (src) { src._syncing = false; src._syncMode = ''; }
       }
     },
@@ -369,118 +374,75 @@ function dashboard() {
       }
     },
     async pauseSync(sourceId) {
-      const panel = this.syncPanels[sourceId];
-      if (!panel || !panel.runId) return;
+      const status = this.syncStatus[sourceId];
+      if (!status || !status.run_id) return;
       try {
-        await api('/sync-runs/' + panel.runId + '/pause', { method: 'POST' });
+        await api('/sync-runs/' + status.run_id + '/pause', { method: 'POST' });
         this.notify('已发送暂停信号，等待当前页扫完后停止');
+        // 立刻刷新一次，UI 反应快
+        setTimeout(() => this.refreshSyncStatus(sourceId), 500);
       } catch (e) {
         this.showError('暂停失败', e);
+      }
+    },
+    async resetSyncProgress(sourceId) {
+      if (!confirm('重置后该源会从根目录重新扫，已入库的资源不会丢，但本次未跑完的目录进度会丢失。继续？')) return;
+      try {
+        await api('/sources/' + sourceId + '/sync', { method: 'POST', body: { mode: 'full' } });
+        this.notify('已从根目录重新启动扫描');
+        this.refreshSyncStatus(sourceId);
+        this.startSyncStatusPolling(sourceId);
+      } catch (e) {
+        this.showError('重置失败', e);
       }
     },
     // 兼容旧调用
     async checkSource(id) { return this.testSource(id); },
 
-    // ===== 嵌入式同步实时面板 =====
-    openSyncPanel(sourceId, runId, mode) {
-      // 如果已有面板（但 runId 不同），先关闭旧的
-      const existing = this.syncPanels[sourceId];
-      if (existing && existing._es) {
-        try { existing._es.close(); } catch (_) {}
-      }
-      this.syncPanels[sourceId] = {
-        open: true,
-        runId: runId,
-        mode: mode || 'incremental',
-        status: 'running',
-        totalFiles: 0,
-        totalCalls: 0,
-        tail: '正在连接事件流...',
-        lines: [],
-        autoScroll: true,
-        _es: null
-      };
-      const token = localStorage.getItem('lrh_token') || '';
-      const url = '/api/admin/sync-runs/' + runId + '/stream?token=' + encodeURIComponent(token);
-      const es = new EventSource(url);
-      this.syncPanels[sourceId]._es = es;
-      es.onopen = () => { if (this.syncPanels[sourceId]) this.syncPanels[sourceId].tail = '已连接，等待事件...'; };
-      es.onerror = (err) => {
-        const panel = this.syncPanels[sourceId];
-        if (!panel) return;
-        // EventSource readyState: 0=CONNECTING, 1=OPEN, 2=CLOSED
-        if (es.readyState === 2) {
-          panel.tail = '连接已关闭（运行可能已结束，可关闭面板）';
-        } else {
-          panel.tail = '连接中断（浏览器自动重连中…）';
+    // ===== 进度卡：2s 轮询 GET /sources/:id/sync-status =====
+    async refreshSyncStatus(sourceId) {
+      try {
+        const d = await api('/sources/' + sourceId + '/sync-status', { method: 'GET' });
+        const prev = this.syncStatus[sourceId];
+        // 速率：每次轮询算 (Δfiles / Δseconds)
+        if (prev && prev._lastTs) {
+          const dt = (Date.now() - prev._lastTs) / 1000;
+          const df = (d.total_files || 0) - (prev.total_files || 0);
+          if (dt > 0 && df >= 0) {
+            const rate = Math.round(df / dt);
+            // 平滑：跟之前的速率做个简单滑动平均
+            const oldRate = this.syncRate[sourceId] || 0;
+            this.syncRate[sourceId] = Math.round(oldRate * 0.5 + rate * 0.5);
+          }
         }
-      };
-      const handler = (e) => this.appendSyncEvent(sourceId, e);
-      ['run_started','progress','folder_done','rate_limited','cooldown','retry','login_ok','paused','completed','failed','message','error'].forEach((name) => {
-        es.addEventListener(name, handler);
-      });
-    },
-    appendSyncEvent(sourceId, e) {
-      const panel = this.syncPanels[sourceId];
-      if (!panel) return;
-      let data;
-      try { data = JSON.parse(e.data); } catch (_) { return; }
-      const ts = new Date(data.created_at || Date.now()).toLocaleTimeString('zh-CN', { hour12: false });
-      const icon = ({
-        run_started: '🚀', login_ok: '🔑', progress: '📊', folder_done: '📁',
-        rate_limited: '⛔', cooldown: '🧊', retry: '🔁',
-        completed: '🎉', paused: '⏸', failed: '💥', error: '⚠️', message: '·'
-      })[data.event] || '·';
-      const text = '[' + ts + '] ' + icon + ' ' + (data.message || data.event);
-      panel.lines.push({ text, level: data.level || 'info', event: data.event });
-      if (panel.lines.length > 2000) panel.lines.splice(0, panel.lines.length - 2000);
-      if (data.payload && typeof data.payload === 'object') {
-        if (typeof data.payload.files === 'number') panel.totalFiles = data.payload.files;
-        if (typeof data.payload.calls === 'number') panel.totalCalls = data.payload.calls;
-        if (typeof data.payload.total_files === 'number') panel.totalFiles = data.payload.total_files;
-        if (typeof data.payload.total_calls === 'number') panel.totalCalls = data.payload.total_calls;
-      }
-      if (data.event === 'completed') { panel.status = 'completed'; panel.tail = '✅ 已完成'; this.afterSyncEnd(sourceId); }
-      else if (data.event === 'paused') { panel.status = 'paused'; panel.tail = '⏸ 已暂停'; this.afterSyncEnd(sourceId); }
-      else if (data.event === 'failed') { panel.status = 'failed'; panel.tail = '💥 失败'; this.afterSyncEnd(sourceId); }
-      else if (data.event === 'rate_limited') { panel.status = 'paused'; panel.tail = '⛔ 触发限流，已暂停'; this.afterSyncEnd(sourceId); }
-      this.$nextTick(() => {
-        if (panel.autoScroll) {
-          const el = document.getElementById('syncBox_' + sourceId);
-          if (el) el.scrollTop = el.scrollHeight;
+        d._lastTs = Date.now();
+        this.syncStatus[sourceId] = d;
+        // 如果运行结束了就停止轮询，并刷新源列表（last_sync_at 等字段会变）
+        if (!d.is_active && this._syncStatusTimers[sourceId]) {
+          this.stopSyncStatusPolling(sourceId);
+          this.loadSources();
         }
-      });
+      } catch (_) {
+        // 静默失败，下一次再试
+      }
     },
-    afterSyncEnd(sourceId) {
-      const src = this.sources.find((s) => s.id === sourceId);
-      if (src) { src._syncing = false; src._syncMode = ''; }
-      this.loadSources();
+    startSyncStatusPolling(sourceId) {
+      this.stopSyncStatusPolling(sourceId);
+      this._syncStatusTimers[sourceId] = setInterval(() => this.refreshSyncStatus(sourceId), 2000);
     },
-    closeSyncPanel(sourceId) {
-      const panel = this.syncPanels[sourceId];
-      if (panel && panel._es) { try { panel._es.close(); } catch (_) {} }
-      delete this.syncPanels[sourceId];
+    stopSyncStatusPolling(sourceId) {
+      if (this._syncStatusTimers[sourceId]) {
+        clearInterval(this._syncStatusTimers[sourceId]);
+        delete this._syncStatusTimers[sourceId];
+      }
     },
-    clearSyncPanel(sourceId) {
-      if (this.syncPanels[sourceId]) this.syncPanels[sourceId].lines = [];
-    },
-    async copySyncPanel(sourceId) {
-      const panel = this.syncPanels[sourceId];
-      if (!panel) return;
-      const text = panel.lines.map((l) => l.text).join('\n');
-      try { await navigator.clipboard.writeText(text); this.notify('已复制 ' + panel.lines.length + ' 行'); }
-      catch (_) { this.notify('复制失败', 'error'); }
-    },
-    lineClass(line) {
-      if (!line) return '';
-      if (line.event === 'completed') return 'text-emerald-400';
-      if (line.event === 'paused' || line.event === 'rate_limited' || line.event === 'cooldown') return 'text-amber-400';
-      if (line.event === 'failed' || line.event === 'error') return 'text-rose-400';
-      if (line.level === 'warn') return 'text-amber-300';
-      if (line.level === 'error') return 'text-rose-400';
-      if (line.event === 'folder_done') return 'text-cyan-400';
-      if (line.event === 'progress') return 'text-slate-300';
-      return 'text-slate-200';
+    // 进入页面 / loadSources 后调用：找出"当前正跑"的源，开始轮询
+    async refreshAllSyncStatus() {
+      for (const s of this.sources) {
+        await this.refreshSyncStatus(s.id);
+        const st = this.syncStatus[s.id];
+        if (st && st.is_active) this.startSyncStatusPolling(s.id);
+      }
     },
     async deleteSource(id) {
       if (!confirm('确认删除该来源？关联的资源和日志会一并清除')) return;
@@ -682,18 +644,34 @@ function dashboard() {
     },
 
     async loadIndexStats() {
-      try { this.indexStats = await api('/search-index/stats'); }
-      catch (_) { this.indexStats = { enabled: false }; }
+      try {
+        this.indexStats = await api('/search-index/stats');
+        // 后端已返回 rebuild 状态：{ running, started_at, finished_at, total, error }
+        // 如果在跑，开启轮询；不跑了就停
+        if (this.indexStats?.rebuild?.running && !this._rebuildTimer) {
+          this._rebuildTimer = setInterval(() => this.loadIndexStats(), 3000);
+        } else if (!this.indexStats?.rebuild?.running && this._rebuildTimer) {
+          clearInterval(this._rebuildTimer);
+          this._rebuildTimer = null;
+          if (this.indexStats?.rebuild?.error) {
+            this.notify('重建失败：' + this.indexStats.rebuild.error, 'error');
+          } else if (this.indexStats?.rebuild?.finished_at) {
+            this.notify('重建完成，共 ' + (this.indexStats.rebuild.total || 0) + ' 条');
+          }
+        }
+      } catch (_) { this.indexStats = { enabled: false }; }
     },
     async rebuildIndex() {
-      if (!confirm('确认从 MySQL 全量重建 Meilisearch 索引？几十万条以内大约 10-30 秒。')) return;
-      const taskId = this.startTask('重建搜索索引');
+      if (this.indexStats?.rebuild?.running) {
+        this.notify('重建已在进行中，请等待完成', 'error');
+        return;
+      }
+      if (!confirm('确认从 MySQL 全量重建 Meilisearch 索引？几十万条以内大约 10-30 秒，百万级需要 10-30 分钟。')) return;
       try {
-        const d = await api('/search-index/rebuild', { method: 'POST', timeout: 600000 });
-        this.notify('重建完成，共 ' + (d.total || 0) + ' 条');
-        this.loadIndexStats();
+        await api('/search-index/rebuild', { method: 'POST' });
+        this.notify('重建已启动，进度会在下方实时刷新');
+        this.loadIndexStats(); // 立刻刷一次，开启轮询
       } catch (e) { this.showError('重建失败', e); }
-      finally { this.endTask(taskId); }
     },
 
     docExampleText(lang) {
