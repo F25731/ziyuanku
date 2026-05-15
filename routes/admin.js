@@ -299,20 +299,35 @@ router.delete('/cleanup/rules/:id', adminRequired, asyncHandler(async (req, res)
 
 // 启动一次清理：立即返回 run_id，真正的扫描在后台跑（避免 HTTP 超时）
 router.post('/cleanup/run', adminRequired, asyncHandler(async (req, res) => {
-  const { ruleId, scopeSourceIds, crossSource, dryRun } = req.body || {};
+  const { ruleId, scopeSourceIds, crossSource, dryRun, confirmOver } = req.body || {};
   if (!ruleId) return res.status(400).json({ code: 400, message: 'ruleId 必填' });
   const result = await cleanupService.startCleanup({
     ruleId: Number(ruleId),
     scopeSourceIds: Array.isArray(scopeSourceIds) ? scopeSourceIds : [],
     crossSource: !!crossSource,
-    dryRun: dryRun !== false
+    dryRun: dryRun !== false,
+    confirmOver: !!confirmOver
   });
-  res.json({ code: 200, message: '已启动，正在后台扫描', ...result });
+  res.json({ code: 200, message: result.already_running ? '已有任务在跑，已接管' : '已启动，正在后台扫描', ...result });
+}));
+
+// 全局设置（safe_ratio 等）
+router.get('/cleanup/settings', asyncHandler(async (req, res) => {
+  const item = await cleanupService.getSettings();
+  res.json({ code: 200, item });
+}));
+router.post('/cleanup/settings', adminRequired, asyncHandler(async (req, res) => {
+  const item = await cleanupService.updateSettings(req.body || {});
+  res.json({ code: 200, message: '已保存', item });
 }));
 
 router.get('/cleanup/runs', asyncHandler(async (req, res) => {
   const items = await cleanupService.listRuns({ limit: req.query.limit });
   res.json({ code: 200, items });
+}));
+router.get('/cleanup/runs/latest', asyncHandler(async (req, res) => {
+  const item = await cleanupService.getLatestRun();
+  res.json({ code: 200, item });
 }));
 router.get('/cleanup/runs/:id', asyncHandler(async (req, res) => {
   const item = await cleanupService.getRun(Number(req.params.id));
@@ -322,6 +337,15 @@ router.get('/cleanup/runs/:id', asyncHandler(async (req, res) => {
 router.get('/cleanup/runs/:id/samples', asyncHandler(async (req, res) => {
   const items = await cleanupService.getRunSamples(Number(req.params.id), req.query.limit);
   res.json({ code: 200, items });
+}));
+router.post('/cleanup/runs/:id/pause', adminRequired, asyncHandler(async (req, res) => {
+  const ok = cleanupService.requestPause(Number(req.params.id));
+  if (!ok) return res.status(409).json({ code: 409, message: 'Run 不在运行中（可能已结束或不在本进程内）' });
+  res.json({ code: 200, message: '已发送暂停信号' });
+}));
+router.post('/cleanup/runs/:id/resume', adminRequired, asyncHandler(async (req, res) => {
+  const r = await cleanupService.resumeRun(Number(req.params.id));
+  res.json({ code: 200, message: '已恢复', ...r });
 }));
 router.post('/cleanup/runs/:id/undo', adminRequired, asyncHandler(async (req, res) => {
   await cleanupService.undoRun(Number(req.params.id));

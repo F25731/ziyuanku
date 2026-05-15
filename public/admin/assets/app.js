@@ -184,11 +184,11 @@ function dashboard() {
     cleanup: {
       rules: [],
       runs: [],
-      busy: false,
-      currentRun: null,         // 跑中的 run 数据，2s 轮询更新
-      currentRunTimer: null,    // setInterval 句柄
-      lastResult: null,
-      runForm: { ruleId: 0, scopeSourceIds: [], crossSource: false }
+      busy: false,                  // 启动 API 飞行中（防双击）
+      currentRun: null,             // 当前正在显示的 run（卡片数据来源）
+      currentRunTimer: null,
+      runForm: { ruleId: 0, scopeSourceIds: [], crossSource: false },
+      settings: { safe_ratio: 0.3, safeRatioPct: 30, savedMsg: '' }
     },
     cleanupRuleModal: { open: false, id: null, name: '', description: '', enabled: true, configText: '', parseError: '' },
     linkModal: { open: false, fileName: '', url: '', expireText: '', cached: false, loading: false, error: '', detail: '' },
@@ -228,7 +228,13 @@ function dashboard() {
         if (v === 'synclogs') this.loadSyncLogs();
         if (v === 'calllogs') this.loadCallLogs();
         if (v === 'dashboard') this.loadStats();
-        if (v === 'cleanup') { this.loadCleanupRules(); this.loadCleanupRuns(); this.loadSourcesLite(); }
+        if (v === 'cleanup') {
+          this.loadCleanupRules();
+          this.loadCleanupRuns();
+          this.loadSourcesLite();
+          this.loadCleanupSettings();
+          this.loadLatestCleanupRun();
+        }
         else { this._stopCleanupPolling(); }
       });
     },
@@ -755,26 +761,38 @@ function dashboard() {
       try {
         const d = await api('/cleanup/runs');
         this.cleanup.runs = d.items || [];
-        // 如果有正在跑的 run（比如刷新页面后），自动恢复轮询
-        if (!this.cleanup.currentRunTimer) {
-          const running = this.cleanup.runs.find((r) => r.status === 'running');
-          if (running) {
-            this.cleanup.busy = true;
-            this.cleanup.currentRun = {
-              id: running.id,
-              dry_run: !!running.dry_run,
-              status: 'running',
-              total_examined: running.total_examined || 0,
-              removed_by_format: running.removed_by_format || 0,
-              removed_by_dedupe: running.removed_by_dedupe || 0,
-              total_removed: (running.removed_by_format || 0) + (running.removed_by_dedupe || 0),
-              target_total: 0,
-              samples: null
-            };
-            this._startCleanupPolling(running.id);
+      } catch (e) { this.showError('加载历史失败', e); }
+    },
+    async loadCleanupSettings() {
+      try {
+        const d = await api('/cleanup/settings');
+        const r = Number(d.item && d.item.safe_ratio) || 0.3;
+        this.cleanup.settings.safe_ratio = r;
+        this.cleanup.settings.safeRatioPct = Math.round(r * 100);
+      } catch (_) {}
+    },
+    async saveCleanupSettings() {
+      try {
+        const pct = Math.max(1, Math.min(100, Number(this.cleanup.settings.safeRatioPct) || 30));
+        const d = await api('/cleanup/settings', { method: 'POST', body: { safeRatio: pct / 100 } });
+        const r = Number(d.item && d.item.safe_ratio) || 0.3;
+        this.cleanup.settings.safe_ratio = r;
+        this.cleanup.settings.safeRatioPct = Math.round(r * 100);
+        this.cleanup.settings.savedMsg = '已保存';
+        setTimeout(() => { this.cleanup.settings.savedMsg = ''; }, 2500);
+      } catch (e) { this.showError('保存阈值失败', e); }
+    },
+    // 进入 cleanup tab 时调用：拉最近一次 run 显示卡片，如果在跑就开始轮询
+    async loadLatestCleanupRun() {
+      try {
+        const d = await api('/cleanup/runs/latest');
+        if (d.item) {
+          this.cleanup.currentRun = { ...d.item, target_total: d.item.total_examined || 0 };
+          if (d.item.is_running) {
+            this._startCleanupPolling(d.item.id);
           }
         }
-      } catch (e) { this.showError('加载历史失败', e); }
+      } catch (_) {}
     },
     ruleTypeOf(r) {
       const cfg = typeof r.config === 'string' ? safeJSON(r.config) : (r.config || {});
@@ -795,7 +813,6 @@ function dashboard() {
     },
     openCleanupRuleModal(r) {
       if (r) {
-        const cfg = typeof r.config === 'string' ? r.config : JSON.stringify(r.config, null, 2);
         this.cleanupRuleModal = {
           open: true, id: r.id, name: r.name, description: r.description || '',
           enabled: !!r.enabled,
@@ -849,40 +866,49 @@ function dashboard() {
         this.loadCleanupRules();
       } catch (e) { this.showError('删除失败', e); }
     },
-    async runCleanupDry() { return this._startCleanup(true); },
-    async runCleanupApply() {
-      if (!confirm('立即执行会软删除匹配的资源（可一键撤销）。继续？')) return;
-      return this._startCleanup(false);
+    // dryRun = true 永远不删；dryRun = false 走立即执行（可选 confirmOver 跳过阈值）
+    async runCleanupDry() { return this._startCleanup(true, false); },
+    async runCleanupApply(confirmOver) {
+      if (!confirmOver) {
+        if (!confirm('立即执行会软删除匹配的资源（可一键撤销）。继续？')) return;
+      }
+      return this._startCleanup(false, !!confirmOver);
     },
-    async _startCleanup(dryRun) {
+    async _startCleanup(dryRun, confirmOver) {
+      if (this.cleanup.busy) return;     // 防双击
       const f = this.cleanup.runForm;
       this.cleanup.busy = true;
-      this.cleanup.lastResult = null;
-      this.cleanup.currentRun = null;
       try {
-        // 启动 → 立即返回 run_id（不等扫描完）
         const d = await api('/cleanup/run', { method: 'POST', body: {
           ruleId: f.ruleId,
           scopeSourceIds: f.scopeSourceIds,
           crossSource: f.crossSource,
-          dryRun
+          dryRun,
+          confirmOver
         }});
-        // 进入轮询模式
+        if (d.already_running) {
+          this.notify('已有清理在跑，已为你接管显示');
+        }
+        // 立即拉一次完整状态（先把 target_total 拿到，后面进度条好算）
         this.cleanup.currentRun = {
           id: d.run_id,
+          rule_name: (this.cleanup.rules.find((r) => r.id === f.ruleId) || {}).name || ('Rule ' + f.ruleId),
           dry_run: dryRun,
           status: 'running',
+          is_running: true,
+          cross_source: f.crossSource,
           total_examined: 0,
           removed_by_format: 0,
           removed_by_dedupe: 0,
           total_removed: 0,
           target_total: d.total_examined || 0,
-          samples: null
+          samples: []
         };
         this._startCleanupPolling(d.run_id);
       } catch (e) {
-        this.cleanup.busy = false;
         this.showError(dryRun ? '试运行启动失败' : '执行启动失败', e);
+      } finally {
+        this.cleanup.busy = false;
       }
     },
     _startCleanupPolling(runId) {
@@ -892,36 +918,26 @@ function dashboard() {
           const d = await api('/cleanup/runs/' + runId);
           const r = d.item;
           if (!r) return;
-          // 把 target_total 保留住（后端 total_examined 跑完才是最终值，跑中是已扫数）
-          const target = this.cleanup.currentRun ? this.cleanup.currentRun.target_total : 0;
-          this.cleanup.currentRun = { ...r, target_total: target };
-          if (r.status !== 'running') {
+          const target = this.cleanup.currentRun ? (this.cleanup.currentRun.target_total || 0) : 0;
+          // 跑中时 total_examined 是已扫数；跑完后变成全量扫描数（也作为目标）
+          this.cleanup.currentRun = {
+            ...r,
+            target_total: r.is_running ? target : (r.total_examined || target)
+          };
+          if (!r.is_running) {
             this._stopCleanupPolling();
-            this.cleanup.busy = false;
-            // 跑完了，把结果搬到 lastResult，关闭遮罩
-            this.cleanup.lastResult = {
-              dry_run: r.dry_run,
-              status: r.status,
-              total_examined: r.total_examined,
-              removed_by_format: r.removed_by_format,
-              removed_by_dedupe: r.removed_by_dedupe,
-              total_removed: r.total_removed,
-              samples: r.samples || [],
-              error_message: r.error_message
-            };
-            this.cleanup.currentRun = null;
             this.loadCleanupRuns();
-            if (r.status === 'failed') {
+            if (r.status === 'failed' && !r.safety_blocked) {
               this.notify(r.error_message || '执行失败', 'error');
-            } else {
+            } else if (r.status === 'completed') {
               this.notify(r.dry_run ? '试运行完成' : ('已执行：删除 ' + r.total_removed + ' 条'));
+            } else if (r.status === 'paused') {
+              this.notify('已暂停');
             }
           }
         } catch (e) {
-          // 单次轮询失败不致命，继续轮询；除非 404
           if (e && /404/.test(String(e.message))) {
             this._stopCleanupPolling();
-            this.cleanup.busy = false;
             this.cleanup.currentRun = null;
             this.showError('查询任务状态失败', e);
           }
@@ -941,12 +957,40 @@ function dashboard() {
       if (!c || !c.target_total) return 0;
       return Math.min(99, Math.floor((c.total_examined / c.target_total) * 100));
     },
+    dismissCleanupCard() {
+      this.cleanup.currentRun = null;
+      this._stopCleanupPolling();
+    },
+    async pauseCleanupRun() {
+      const c = this.cleanup.currentRun;
+      if (!c || !c.id) return;
+      try {
+        await api('/cleanup/runs/' + c.id + '/pause', { method: 'POST' });
+        this.notify('已发送暂停信号');
+      } catch (e) { this.showError('暂停失败', e); }
+    },
+    async resumeCleanupRun() {
+      const c = this.cleanup.currentRun;
+      if (!c || !c.id) return;
+      if (!confirm('重新启动会基于原规则范围跑一次（旧 run 标为已撤销）。继续？')) return;
+      try {
+        const d = await api('/cleanup/runs/' + c.id + '/resume', { method: 'POST' });
+        this.notify('已重新启动');
+        // 等服务端拿到 liveTotal，再用 latest 拉初始状态
+        await this.loadLatestCleanupRun();
+        if (d.run_id) this._startCleanupPolling(d.run_id);
+      } catch (e) { this.showError('重启失败', e); }
+    },
     async undoCleanupRun(id) {
       if (!confirm('撤销这次清理（恢复被软删除的资源）？')) return;
       try {
         await api('/cleanup/runs/' + id + '/undo', { method: 'POST' });
         this.notify('已撤销');
         this.loadCleanupRuns();
+        // 撤销后刷新卡片
+        if (this.cleanup.currentRun && this.cleanup.currentRun.id === id) {
+          this.cleanup.currentRun.status = 'undone';
+        }
       } catch (e) { this.showError('撤销失败', e); }
     },
 

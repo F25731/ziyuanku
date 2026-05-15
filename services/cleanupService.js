@@ -1,17 +1,42 @@
-// 阶段7：清理/去重服务
-// 设计要点：
-//  - 规则用 JSON DSL 表达，不跑用户写的 JS（安全 + 可导入导出）
-//  - 大表操作全部分批：每批 5000~50000 行，不会全表锁
-//  - 软删除（is_deleted=1），所有删的行写到 cleanup_deleted，可一键撤销
-//  - 临时分组表 _cleanup_temp 跑完清空（DELETE，不 DROP）
+// 阶段7（重写版）：清理 / 去重服务
+// 关键设计：
+//  - 规则 JSON DSL，不执行用户 JS
+//  - **完全不写 MySQL 中间表**：去重在 Node 内存里跑 Map<group_key, winner>，
+//    losers id 收集到数组，最后批量软删除——避免之前 _cleanup_temp 撑爆磁盘
+//  - 批次内每 N 行检查 pauseRequested，可中途暂停
+//  - 进度每 ~2 秒节流写 cleanup_runs，让前端轮询能看到数字跳
+//  - samples 写独立的 cleanup_run_samples 表（不再借用 error_message）
+//  - 安全阈值从 cleanup_settings 读，dry-run 永远过；apply 超阈值返 422 让前端确认
 
 const { pool } = require('../config/db');
 const HttpError = require('../utils/httpError');
 
 const BATCH_SCAN = 5000;       // 一次从 resources 拉多少行
-const BATCH_UPDATE = 20000;    // UPDATE 一次最多动多少行
-const SAFE_DELETE_RATIO = 0.5; // 单次最多删活跃资源的 50%，超过 abort（防误删）
-const SAMPLE_LIMIT = 50;       // dry-run 返回的样例条数
+const BATCH_UPDATE = 20000;    // UPDATE / INSERT 一次最多动多少行
+const SAMPLE_LIMIT = 50;
+const PROGRESS_FLUSH_MS = 2000;
+
+// runId -> { pauseRequested: bool }
+const runningCleanups = new Map();
+
+// ---------- 全局设置（cleanup_settings 单行表） ----------
+async function getSettings() {
+  const [[row]] = await pool.query('SELECT * FROM cleanup_settings WHERE id = 1 LIMIT 1');
+  if (!row) {
+    await pool.query('INSERT IGNORE INTO cleanup_settings (id, safe_ratio) VALUES (1, 0.3)');
+    return { safe_ratio: 0.3 };
+  }
+  return { safe_ratio: Number(row.safe_ratio) || 0.3 };
+}
+async function updateSettings({ safeRatio }) {
+  const r = Math.max(0.01, Math.min(1, Number(safeRatio)));
+  if (!Number.isFinite(r)) throw new HttpError(400, 'safeRatio 不合法');
+  await pool.query(
+    'INSERT INTO cleanup_settings (id, safe_ratio) VALUES (1, ?) ON DUPLICATE KEY UPDATE safe_ratio = VALUES(safe_ratio)',
+    [r]
+  );
+  return getSettings();
+}
 
 // ---------- 规则 CRUD ----------
 async function listRules() {
@@ -49,29 +74,26 @@ async function deleteRule(id) {
   await pool.query('DELETE FROM cleanup_rules WHERE id = ?', [id]);
 }
 
-// ---------- 配置校验：保证用户传进来的 JSON 不会让运行炸 ----------
+// ---------- 配置校验 ----------
 function validateConfig(cfg) {
   if (!cfg || typeof cfg !== 'object') throw new HttpError(400, 'config 必须是对象');
-  // qualifier 可空，空就是全部资源都参与
   if (cfg.qualifier && cfg.qualifier.name_must_match) {
     try { new RegExp(cfg.qualifier.name_must_match); }
     catch (_) { throw new HttpError(400, 'qualifier.name_must_match 不是合法正则'); }
   }
-  // score_rules 里的 pattern 都得是合法正则
   if (Array.isArray(cfg.score_rules)) {
     for (const r of cfg.score_rules) {
       try { new RegExp(r.pattern); }
       catch (_) { throw new HttpError(400, `score_rules 里 ${r.pattern} 不是合法正则`); }
     }
   }
-  // format_filter
   const ff = cfg.format_filter || {};
   if (ff.mode && !['off', 'whitelist', 'blacklist'].includes(ff.mode)) {
     throw new HttpError(400, 'format_filter.mode 必须是 off/whitelist/blacklist');
   }
 }
 
-// ---------- DSL 求值：单条资源 → group_key + score ----------
+// ---------- DSL 求值 ----------
 function compileRule(cfg) {
   const qualMatch = cfg.qualifier && cfg.qualifier.name_must_match
     ? new RegExp(cfg.qualifier.name_must_match, 'i') : null;
@@ -131,15 +153,14 @@ function getExt(name) {
   return m ? m[1].toLowerCase() : '';
 }
 
-// ---------- run 一次清理 ----------
-// 立即返回 run_id，真正的扫描放到后台跑——避免 HTTP 90s 超时；
-// 前端轮询 GET /cleanup/runs/:id 看进度
-async function startCleanup({ ruleId, scopeSourceIds = [], crossSource = false, dryRun = true, ruleConfigOverride = null }) {
+// ---------- 启动一次清理 ----------
+// HTTP 立即返回 run_id；扫描通过 setImmediate 在后台跑
+// confirmOver 用于"超过安全阈值时前端二次确认"：第一次返 422，前端 confirm 后带 confirmOver=true 再 POST
+async function startCleanup({ ruleId, scopeSourceIds = [], crossSource = false, dryRun = true, confirmOver = false }) {
   const rule = await getRule(ruleId);
   if (!rule) throw new HttpError(404, '规则不存在');
-  if (!rule.enabled && !ruleConfigOverride) throw new HttpError(400, '规则已禁用');
 
-  const config = ruleConfigOverride || (typeof rule.config === 'string' ? JSON.parse(rule.config) : rule.config);
+  const config = typeof rule.config === 'string' ? JSON.parse(rule.config) : rule.config;
   validateConfig(config);
 
   const scopeIds = (Array.isArray(scopeSourceIds) ? scopeSourceIds : []).map(Number).filter(Boolean);
@@ -153,114 +174,147 @@ async function startCleanup({ ruleId, scopeSourceIds = [], crossSource = false, 
   const liveTotal = Number(liveRow.total || 0);
   if (liveTotal === 0) throw new HttpError(400, '当前范围内没有可清理的资源');
 
-  // 同一时间最多一个 run，防止用户连点
   const [[busy]] = await pool.query(
     `SELECT id FROM cleanup_runs WHERE status='running' ORDER BY id DESC LIMIT 1`
   );
   if (busy && busy.id) {
-    throw new HttpError(409, `已有清理任务在跑（run #${busy.id}），请等待完成或刷新页面查看`);
+    // 不再 throw 让前端弹错——直接把"正在跑"的 run_id 返回，前端无缝接管
+    return { run_id: busy.id, already_running: true, total_examined: liveTotal };
   }
 
-  // 创建 run 前先清掉 _cleanup_temp 里"非 running run"的死行——
-  // 上一次跑挂了（OOM/磁盘满）时，_cleanup_temp 不会被 finally 清干净，会越攒越多
-  await pool.query(
-    `DELETE t FROM _cleanup_temp t
-       LEFT JOIN cleanup_runs r ON r.id = t.run_id
-      WHERE r.id IS NULL OR r.status <> 'running'`
-  );
-
   const [r] = await pool.query(
-    `INSERT INTO cleanup_runs (rule_id, rule_name_snapshot, config_snapshot, scope_source_ids, cross_source, dry_run, status)
-     VALUES (?, ?, ?, ?, ?, ?, 'running')`,
+    `INSERT INTO cleanup_runs (rule_id, rule_name_snapshot, config_snapshot, scope_source_ids, cross_source, dry_run, status, confirm_over)
+     VALUES (?, ?, ?, ?, ?, ?, 'running', ?)`,
     [rule.id, rule.name, JSON.stringify(config), scopeIds.length ? scopeIds.join(',') : null,
-     crossSource ? 1 : 0, dryRun ? 1 : 0]
+     crossSource ? 1 : 0, dryRun ? 1 : 0, confirmOver ? 1 : 0]
   );
   const runId = r.insertId;
 
-  // 后台跑（不 await，让 HTTP 立即返回）
+  runningCleanups.set(runId, { pauseRequested: false });
+
   setImmediate(() => {
-    executeCleanup({ runId, config, scopeIds, crossSource, dryRun, liveTotal })
-      .catch((err) => {
+    executeCleanup({ runId, config, scopeIds, crossSource, dryRun, liveTotal, confirmOver })
+      .catch(async (err) => {
         console.error(`[cleanup #${runId}] failed:`, err);
-        pool.query(
+        const msg = String(err && err.message || err).slice(0, 1000);
+        await pool.query(
           `UPDATE cleanup_runs SET status='failed', error_message=?, finished_at=NOW() WHERE id=?`,
-          [String(err.message || err).slice(0, 500), runId]
+          [msg, runId]
         ).catch(() => {});
       })
       .finally(() => {
-        // 不管成功失败，清掉本 run 的 _cleanup_temp 行（不 DROP 表）
-        pool.query('DELETE FROM _cleanup_temp WHERE run_id = ?', [runId]).catch(() => {});
+        runningCleanups.delete(runId);
       });
   });
 
   return { run_id: runId, total_examined: liveTotal };
 }
 
-async function executeCleanup({ runId, config, scopeIds, crossSource, dryRun, liveTotal }) {
+async function executeCleanup({ runId, config, scopeIds, crossSource, dryRun, liveTotal, confirmOver }) {
   const compiled = compileRule(config);
-  const samples = [];
+  const samples = [];          // [{reason, id, file_name, source_id, group_key, score, winner_*}]
   let removedFmt = 0;
   let removedDedupe = 0;
 
-  // 把"将存为 result_summary"的样例先写到 cleanup_runs.error_message 里？
-  // 不，单独一个表太重，直接挂在内存里、跑完写 cleanup_run_samples 也可以。
-  // 但前端只要看进度数字，样例放在 cleanup_deleted 也能 JOIN 查到，先不做样例写库。
-
+  // 阶段 A：格式过滤
   if (config.format_filter && config.format_filter.mode && config.format_filter.mode !== 'off') {
-    const res = await runFormatFilter({
-      compiled, scopeIds, runId, dryRun, samples
-    });
+    const res = await runFormatFilter({ compiled, scopeIds, runId, dryRun, samples });
     removedFmt = res.removed;
+    if (res.paused) {
+      await pool.query(
+        `UPDATE cleanup_runs SET status='paused', removed_by_format=?, paused_at=NOW() WHERE id=?`,
+        [removedFmt, runId]
+      );
+      await persistSamples(runId, samples);
+      return;
+    }
   }
 
+  // 阶段 B：去重（全内存 Map）
   const hasDedupe = (config.score_rules && config.score_rules.length) || config.key_extractor;
   if (hasDedupe) {
-    const res = await runDedupe({
-      compiled, scopeIds, crossSource, runId, dryRun, samples
-    });
+    const res = await runDedupeInMemory({ compiled, scopeIds, crossSource, runId, dryRun, samples });
     removedDedupe = res.removed;
+    if (res.paused) {
+      await pool.query(
+        `UPDATE cleanup_runs SET status='paused', removed_by_format=?, removed_by_dedupe=?, paused_at=NOW() WHERE id=?`,
+        [removedFmt, removedDedupe, runId]
+      );
+      await persistSamples(runId, samples);
+      return;
+    }
   }
 
-  // 安全阈值（dry-run 不强制）
+  // 安全阈值（仅 apply 模式 + 未确认时）
   const totalRemove = removedFmt + removedDedupe;
-  if (!dryRun && totalRemove > Math.floor(liveTotal * SAFE_DELETE_RATIO)) {
+  const settings = await getSettings();
+  if (!dryRun && !confirmOver && totalRemove > Math.floor(liveTotal * settings.safe_ratio)) {
     await rollbackRun(runId);
-    const msg = `安全阈值阻断：本次将删除 ${totalRemove} / ${liveTotal} 条 (超过 ${Math.floor(SAFE_DELETE_RATIO * 100)}%)，已自动回滚`;
+    const pct = ((totalRemove / liveTotal) * 100).toFixed(1);
+    const msg = `SAFETY_THRESHOLD:超过安全阈值 ${Math.round(settings.safe_ratio * 100)}%：本次将删除 ${totalRemove} / ${liveTotal} 条 (${pct}%)，已自动回滚。如确认请勾选"忽略阈值"重试。`;
     await pool.query(
-      `UPDATE cleanup_runs SET status='failed', error_message=?, finished_at=NOW() WHERE id=?`,
-      [msg, runId]
+      `UPDATE cleanup_runs SET status='failed', error_message=?, total_examined=?, finished_at=NOW() WHERE id=?`,
+      [msg, liveTotal, runId]
     );
+    await persistSamples(runId, samples);
     return;
   }
 
-  // 把样例 JSON 存到 error_message（复用字段，前端取来展示）
-  // 名字叫 error_message 但实际兼做"结果摘要"——避免再加表
-  const samplesJson = JSON.stringify(samples.slice(0, SAMPLE_LIMIT));
   await pool.query(
     `UPDATE cleanup_runs
-        SET status='completed', total_examined=?, removed_by_format=?, removed_by_dedupe=?,
-            error_message=?, finished_at=NOW()
+        SET status='completed', total_examined=?, removed_by_format=?, removed_by_dedupe=?, finished_at=NOW()
       WHERE id=?`,
-    [liveTotal, removedFmt, removedDedupe, samplesJson.slice(0, 16000), runId]
+    [liveTotal, removedFmt, removedDedupe, runId]
+  );
+  await persistSamples(runId, samples);
+}
+
+async function persistSamples(runId, samples) {
+  // 先清，再插（防 run 第二次接管时残留）
+  await pool.query('DELETE FROM cleanup_run_samples WHERE run_id = ?', [runId]).catch(() => {});
+  const list = samples.slice(0, SAMPLE_LIMIT);
+  if (!list.length) return;
+  const placeholders = list.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(',');
+  const params = [];
+  list.forEach((s, idx) => {
+    params.push(
+      runId, idx,
+      s.reason || 'dedupe',
+      Number(s.id) || 0,
+      Number(s.source_id) || 0,
+      String(s.file_name || '').slice(0, 500),
+      String(s.group_key || '').slice(0, 255),
+      Number(s.score) || 0,
+      String(s.ext || '').slice(0, 20),
+      s.winner_id ? Number(s.winner_id) : null,
+      String(s.winner_file_name || '').slice(0, 500)
+    );
+  });
+  await pool.query(
+    `INSERT INTO cleanup_run_samples
+       (run_id, idx, reason, resource_id, source_id, file_name, group_key, score, ext, winner_id, winner_file_name)
+     VALUES ${placeholders}`,
+    params
   );
 }
 
-// 兼容旧调用：admin.js 仍可调 runCleanup（同步等完）；
-// 实际用 startCleanup 启动后台 + 立即返回
-async function runCleanup(opts) {
-  return startCleanup(opts);
+// 暂停信号：算法的循环每批检查一次
+function shouldPause(runId) {
+  const e = runningCleanups.get(runId);
+  return !!(e && e.pauseRequested);
 }
+
 // ===== 格式过滤 =====
 async function runFormatFilter({ compiled, scopeIds, runId, dryRun, samples }) {
   const ff = compiled.formatFilter;
-  if (ff.mode === 'off') return { removed: 0 };
-  if (!ff.set.size) return { removed: 0 };
+  if (ff.mode === 'off' || !ff.set.size) return { removed: 0, paused: false };
 
   let removed = 0;
   let lastId = 0;
   let examined = 0;
   let lastReportAt = 0;
   while (true) {
+    if (shouldPause(runId)) return { removed, paused: true };
     const scopeWhere = scopeIds.length
       ? `AND r.source_id IN (${scopeIds.map(() => '?').join(',')})`
       : '';
@@ -290,26 +344,10 @@ async function runFormatFilter({ compiled, scopeIds, runId, dryRun, samples }) {
     }
     if (idsToKill.length) {
       removed += idsToKill.length;
-      if (!dryRun) {
-        for (let i = 0; i < idsToKill.length; i += BATCH_UPDATE) {
-          const slice = idsToKill.slice(i, i + BATCH_UPDATE);
-          await pool.query(
-            `UPDATE resources SET is_deleted=1 WHERE id IN (${slice.map(() => '?').join(',')}) AND is_deleted=0`,
-            slice
-          );
-          const valueRows = slice.map(() => '(?, ?, ?)').join(',');
-          const valueParams = [];
-          for (const rid of slice) valueParams.push(runId, rid, 'format');
-          await pool.query(
-            `INSERT IGNORE INTO cleanup_deleted (run_id, resource_id, reason) VALUES ${valueRows}`,
-            valueParams
-          );
-        }
-      }
+      if (!dryRun) await applySoftDelete(runId, idsToKill, 'format');
     }
 
-    // 每 2 秒回写一次进度，前端轮询读
-    if (Date.now() - lastReportAt > 2000) {
+    if (Date.now() - lastReportAt > PROGRESS_FLUSH_MS) {
       lastReportAt = Date.now();
       pool.query(
         `UPDATE cleanup_runs SET total_examined=?, removed_by_format=? WHERE id=?`,
@@ -317,16 +355,30 @@ async function runFormatFilter({ compiled, scopeIds, runId, dryRun, samples }) {
       ).catch(() => {});
     }
   }
-  return { removed };
+  pool.query(
+    `UPDATE cleanup_runs SET total_examined=?, removed_by_format=? WHERE id=?`,
+    [examined, removed, runId]
+  ).catch(() => {});
+  return { removed, paused: false };
 }
 
-// ===== 去重 =====
-async function runDedupe({ compiled, scopeIds, crossSource, runId, dryRun, samples }) {
-  // 1) 流式扫描，写 _cleanup_temp（每行的 group_key + score）
-  let lastId = 0;
+// ===== 全内存 Map 去重 =====
+//  - winners: Map<group_key, {id, score}>  每个 key 大约 60+8+8 = 76 字节
+//  - losers: number[]  每个 id 8 字节
+// 200 万行预估：~200MB 内存（仅 dedupe 阶段），完全跑完释放
+async function runDedupeInMemory({ compiled, scopeIds, crossSource, runId, dryRun, samples }) {
+  const tieAsc = compiled.tieBreaker === 'id_asc';
+  const winners = new Map();      // group_key -> {id, score, file_name}
+  const losers = [];              // [{id, group_key, score, winner_id}]
   let examined = 0;
+  let lastId = 0;
   let lastReportAt = 0;
+
   while (true) {
+    if (shouldPause(runId)) {
+      // 暂停：直接退出循环（已经积累的 losers 不删——保持原子性）
+      return { removed: 0, paused: true };
+    }
     const scopeWhere = scopeIds.length
       ? `AND r.source_id IN (${scopeIds.map(() => '?').join(',')})`
       : '';
@@ -342,130 +394,147 @@ async function runDedupe({ compiled, scopeIds, crossSource, runId, dryRun, sampl
     lastId = rows[rows.length - 1].id;
     examined += rows.length;
 
-    const buf = [];
     for (const row of rows) {
       if (!compiled.qualifies(row.file_name)) continue;
       const k = compiled.extractKey(row.file_name);
       if (!k) continue;
-      // 跨库 vs 库内独立：库内独立时把 source_id 拼到 group_key 里
       const groupKey = (crossSource ? '' : `s${row.source_id}|`) + k;
       const score = compiled.score(row.file_name, row.file_type);
-      buf.push([runId, row.id, groupKey.slice(0, 250), score]);
-    }
-    if (buf.length) {
-      const placeholders = buf.map(() => '(?, ?, ?, ?)').join(',');
-      const flat = [];
-      for (const b of buf) flat.push(...b);
-      await pool.query(
-        `INSERT INTO _cleanup_temp (run_id, resource_id, group_key, score) VALUES ${placeholders}
-         ON DUPLICATE KEY UPDATE score = VALUES(score), group_key = VALUES(group_key)`,
-        flat
-      );
+
+      const cur = winners.get(groupKey);
+      if (!cur) {
+        winners.set(groupKey, { id: row.id, score, file_name: row.file_name });
+        continue;
+      }
+      const newBeatsOld = (score > cur.score)
+        || (score === cur.score && (tieAsc ? row.id < cur.id : row.id > cur.id));
+      if (newBeatsOld) {
+        // 旧 winner 变 loser
+        losers.push({ id: cur.id, group_key: groupKey, score: cur.score, winner_id: row.id, winner_file_name: row.file_name, loser_file_name: cur.file_name, source_id: row.source_id });
+        // 修正：上面 push 用的是 cur 的 source_id，但 cur 没存。简化：losers 不记 source_id，取样例时再查
+        winners.set(groupKey, { id: row.id, score, file_name: row.file_name });
+      } else {
+        losers.push({ id: row.id, group_key: groupKey, score, winner_id: cur.id, winner_file_name: cur.file_name, loser_file_name: row.file_name, source_id: row.source_id });
+      }
     }
 
-    // 节流回写扫描进度（去重阶段，removed 暂时还没算）
-    if (Date.now() - lastReportAt > 2000) {
+    if (Date.now() - lastReportAt > PROGRESS_FLUSH_MS) {
       lastReportAt = Date.now();
       pool.query(
-        `UPDATE cleanup_runs SET total_examined=? WHERE id=?`,
-        [examined, runId]
+        `UPDATE cleanup_runs SET total_examined=?, removed_by_dedupe=? WHERE id=?`,
+        [examined, losers.length, runId]
       ).catch(() => {});
     }
   }
 
-  // 2) 找每组 winner——不用 ROW_NUMBER（会写 tempfile，容器 /tmp 默认 64MB 装不下大库）
-  // 改成按 (run_id, group_key) 索引顺序流式扫，每个 group 在 Node 里挑赢家
-  // 该索引已存在（_cleanup_temp 的 idx_cleanup_temp_group），ORDER BY 不会触发 filesort
-  const tieAscNum = compiled.tieBreaker === 'id_asc' ? 1 : 0;
-  const idsToKill = [];
-  let cursorGroup = '';
-  let cursorRid = 0;
-  // 累积当前 group 的所有候选；group 变了就结算
-  let curGroup = null;
-  let curWinner = null;        // {resource_id, score}
-  let curLosersOfGroup = [];   // [resource_id, ...]
-
-  const flushGroup = () => {
-    if (curLosersOfGroup.length) {
-      for (const rid of curLosersOfGroup) idsToKill.push(rid);
-    }
-    curWinner = null;
-    curLosersOfGroup = [];
-  };
-
-  while (true) {
-    const [rows] = await pool.query(
-      `SELECT resource_id, group_key, score
-         FROM _cleanup_temp
-        WHERE run_id = ?
-          AND (group_key > ? OR (group_key = ? AND resource_id > ?))
-        ORDER BY group_key, resource_id
-        LIMIT ?`,
-      [runId, cursorGroup, cursorGroup, cursorRid, BATCH_SCAN]
-    );
-    if (!rows.length) break;
-    const last = rows[rows.length - 1];
-    cursorGroup = last.group_key;
-    cursorRid = last.resource_id;
-
-    for (const r of rows) {
-      if (curGroup !== r.group_key) {
-        flushGroup();
-        curGroup = r.group_key;
-        curWinner = { resource_id: r.resource_id, score: r.score };
-        continue;
-      }
-      // 同一组：比较分数，分高的或满足 tie 的当 winner，旧 winner 进 losers
-      const cur = curWinner;
-      const win = (r.score > cur.score)
-        || (r.score === cur.score && (tieAscNum ? r.resource_id < cur.resource_id : r.resource_id > cur.resource_id));
-      if (win) {
-        curLosersOfGroup.push(cur.resource_id);
-        curWinner = { resource_id: r.resource_id, score: r.score };
-      } else {
-        curLosersOfGroup.push(r.resource_id);
-      }
-    }
+  // 取样例（最多 SAMPLE_LIMIT - 已有的）
+  const need = Math.max(0, SAMPLE_LIMIT - samples.length);
+  for (let i = 0; i < Math.min(need, losers.length); i++) {
+    const L = losers[i];
+    samples.push({
+      reason: 'dedupe',
+      id: L.id,
+      file_name: L.loser_file_name,
+      source_id: L.source_id,
+      group_key: L.group_key,
+      score: L.score,
+      winner_id: L.winner_id,
+      winner_file_name: L.winner_file_name
+    });
   }
-  // 最后一个 group 也要结算
-  flushGroup();
 
-  // 取样例（最多 SAMPLE_LIMIT - 已有的 format 样例）
-  if (samples.length < SAMPLE_LIMIT && idsToKill.length) {
-    const need = SAMPLE_LIMIT - samples.length;
-    const sampleIds = idsToKill.slice(0, need);
-    const [sampleRows] = await pool.query(
-      `SELECT r.id, r.file_name, r.source_id, t.group_key, t.score
-         FROM resources r JOIN _cleanup_temp t ON t.resource_id = r.id AND t.run_id = ?
-        WHERE r.id IN (${sampleIds.map(() => '?').join(',')})`,
-      [runId, ...sampleIds]
-    );
-    for (const sr of sampleRows) {
-      samples.push({ reason: 'dedupe', id: sr.id, file_name: sr.file_name, source_id: sr.source_id, group_key: sr.group_key, score: sr.score });
+  // 应用软删除
+  if (!dryRun && losers.length) {
+    const ids = losers.map((L) => L.id);
+    for (let i = 0; i < ids.length; i += BATCH_UPDATE) {
+      if (shouldPause(runId)) return { removed: i, paused: true };
+      await applySoftDelete(runId, ids.slice(i, i + BATCH_UPDATE), 'dedupe');
     }
   }
 
-  if (!dryRun && idsToKill.length) {
-    for (let i = 0; i < idsToKill.length; i += BATCH_UPDATE) {
-      const slice = idsToKill.slice(i, i + BATCH_UPDATE);
-      await pool.query(
-        `UPDATE resources SET is_deleted=1 WHERE id IN (${slice.map(() => '?').join(',')}) AND is_deleted=0`,
-        slice
-      );
-      const valueRows = slice.map(() => '(?, ?, ?)').join(',');
-      const valueParams = [];
-      for (const rid of slice) valueParams.push(runId, rid, 'dedupe');
-      await pool.query(
-        `INSERT IGNORE INTO cleanup_deleted (run_id, resource_id, reason) VALUES ${valueRows}`,
-        valueParams
-      );
-    }
+  // 最后一次写回最终进度
+  pool.query(
+    `UPDATE cleanup_runs SET total_examined=?, removed_by_dedupe=? WHERE id=?`,
+    [examined, losers.length, runId]
+  ).catch(() => {});
+
+  return { removed: losers.length, paused: false };
+}
+
+async function applySoftDelete(runId, ids, reason) {
+  if (!ids.length) return;
+  await pool.query(
+    `UPDATE resources SET is_deleted=1 WHERE id IN (${ids.map(() => '?').join(',')}) AND is_deleted=0`,
+    ids
+  );
+  const placeholders = ids.map(() => '(?, ?, ?)').join(',');
+  const params = [];
+  for (const rid of ids) params.push(runId, rid, reason);
+  await pool.query(
+    `INSERT IGNORE INTO cleanup_deleted (run_id, resource_id, reason) VALUES ${placeholders}`,
+    params
+  );
+}
+
+// ---------- 暂停 / 恢复 ----------
+function requestPause(runId) {
+  const e = runningCleanups.get(Number(runId));
+  if (!e) return false;
+  e.pauseRequested = true;
+  return true;
+}
+
+// 恢复就是按原 run 的规则 / 范围重新启动一个新 run（简单可靠；旧 run 标 'undone'）
+async function resumeRun(oldRunId) {
+  const [[row]] = await pool.query('SELECT * FROM cleanup_runs WHERE id = ? LIMIT 1', [oldRunId]);
+  if (!row) throw new HttpError(404, '原 run 不存在');
+  if (row.status !== 'paused' && row.status !== 'failed') {
+    throw new HttpError(400, '只能从 paused/failed 状态恢复');
   }
+  const config = typeof row.config_snapshot === 'string' ? JSON.parse(row.config_snapshot) : row.config_snapshot;
+  const scopeIds = row.scope_source_ids
+    ? row.scope_source_ids.split(',').map(Number).filter(Boolean)
+    : [];
+  // 旧 run 标 undone 收尾
+  await pool.query("UPDATE cleanup_runs SET status='undone' WHERE id=?", [oldRunId]);
+  // 用相同参数启动新 run（用新 rule_id；如果 rule 已删，用 snapshot）
+  // 这里直接复用 startCleanup 的入口需要 ruleId，但 rule 可能已被删；改成手工建 run + setImmediate
+  const [r] = await pool.query(
+    `INSERT INTO cleanup_runs (rule_id, rule_name_snapshot, config_snapshot, scope_source_ids, cross_source, dry_run, status, confirm_over)
+     VALUES (?, ?, ?, ?, ?, ?, 'running', ?)`,
+    [row.rule_id, row.rule_name_snapshot, JSON.stringify(config),
+     scopeIds.length ? scopeIds.join(',') : null,
+     row.cross_source ? 1 : 0, row.dry_run ? 1 : 0, row.confirm_over ? 1 : 0]
+  );
+  const newRunId = r.insertId;
+  runningCleanups.set(newRunId, { pauseRequested: false });
 
-  // 3) 清理临时表（只删本次 run 的行）
-  await pool.query('DELETE FROM _cleanup_temp WHERE run_id = ?', [runId]);
+  const scopeWhere = scopeIds.length
+    ? `AND r.source_id IN (${scopeIds.map(() => '?').join(',')})`
+    : '';
+  const [[liveRow]] = await pool.query(
+    `SELECT COUNT(*) AS total FROM resources r WHERE r.is_deleted = 0 ${scopeWhere}`,
+    scopeIds
+  );
+  const liveTotal = Number(liveRow.total || 0);
 
-  return { removed: idsToKill.length, examined };
+  setImmediate(() => {
+    executeCleanup({
+      runId: newRunId, config, scopeIds,
+      crossSource: !!row.cross_source, dryRun: !!row.dry_run,
+      liveTotal, confirmOver: !!row.confirm_over
+    })
+      .catch(async (err) => {
+        console.error(`[cleanup #${newRunId}] failed:`, err);
+        const msg = String(err && err.message || err).slice(0, 1000);
+        await pool.query(
+          `UPDATE cleanup_runs SET status='failed', error_message=?, finished_at=NOW() WHERE id=?`,
+          [msg, newRunId]
+        ).catch(() => {});
+      })
+      .finally(() => { runningCleanups.delete(newRunId); });
+  });
+  return { run_id: newRunId };
 }
 
 // ---------- 撤销 ----------
@@ -480,7 +549,6 @@ async function undoRun(runId) {
 }
 
 async function rollbackRun(runId) {
-  // 分批从 cleanup_deleted 拉 ids，把 is_deleted 改回 0
   let lastId = 0;
   while (true) {
     const [rows] = await pool.query(
@@ -498,6 +566,7 @@ async function rollbackRun(runId) {
   await pool.query('DELETE FROM cleanup_deleted WHERE run_id = ?', [runId]);
 }
 
+// ---------- 查询 ----------
 async function listRuns({ limit = 30 } = {}) {
   const [rows] = await pool.query(
     `SELECT id, rule_id, rule_name_snapshot, scope_source_ids, cross_source,
@@ -506,33 +575,37 @@ async function listRuns({ limit = 30 } = {}) {
        FROM cleanup_runs ORDER BY id DESC LIMIT ?`,
     [Math.min(Number(limit) || 30, 200)]
   );
-  // 跑完的 run 里 error_message 装的是 samples JSON，前端不需要看；只在 status=failed 时返回
-  for (const r of rows) {
-    if (r.status !== 'failed' && r.error_message) r.error_message = null;
-  }
   return rows;
 }
 
-// 单 run 详情：前端轮询用
 async function getRun(runId) {
   const [[row]] = await pool.query(
     `SELECT id, rule_id, rule_name_snapshot, scope_source_ids, cross_source,
-            dry_run, status, total_examined, removed_by_format, removed_by_dedupe,
-            error_message, started_at, finished_at
+            dry_run, confirm_over, status, total_examined, removed_by_format, removed_by_dedupe,
+            error_message, started_at, paused_at, finished_at
        FROM cleanup_runs WHERE id = ? LIMIT 1`,
     [runId]
   );
   if (!row) return null;
-  // status=completed 时 error_message 复用为 samples JSON
-  let samples = null;
-  let errorMessage = null;
-  if (row.error_message) {
-    if (row.status === 'failed') {
-      errorMessage = row.error_message;
-    } else {
-      try { samples = JSON.parse(row.error_message); } catch (_) { samples = null; }
-    }
+  const [samples] = await pool.query(
+    `SELECT idx, reason, resource_id AS id, source_id, file_name, group_key, score, ext, winner_id, winner_file_name
+       FROM cleanup_run_samples WHERE run_id = ? ORDER BY idx ASC LIMIT 100`,
+    [runId]
+  );
+
+  const aliveInProc = runningCleanups.has(Number(row.id));
+  let displayStatus = row.status;
+  // 容器重启后 running 但进程内没了 → orphaned
+  if (row.status === 'running' && !aliveInProc) displayStatus = 'orphaned';
+
+  // 安全阈值阻断错误：把前缀拆出来，给前端识别用
+  let safetyBlocked = false;
+  let errMsg = row.error_message || null;
+  if (errMsg && errMsg.startsWith('SAFETY_THRESHOLD:')) {
+    safetyBlocked = true;
+    errMsg = errMsg.replace(/^SAFETY_THRESHOLD:/, '');
   }
+
   return {
     id: row.id,
     rule_id: row.rule_id,
@@ -540,24 +613,36 @@ async function getRun(runId) {
     scope_source_ids: row.scope_source_ids,
     cross_source: !!row.cross_source,
     dry_run: !!row.dry_run,
-    status: row.status,
+    confirm_over: !!row.confirm_over,
+    status: displayStatus,
+    is_running: displayStatus === 'running',
+    safety_blocked: safetyBlocked,
     total_examined: row.total_examined,
     removed_by_format: row.removed_by_format,
     removed_by_dedupe: row.removed_by_dedupe,
     total_removed: (row.removed_by_format || 0) + (row.removed_by_dedupe || 0),
-    error_message: errorMessage,
+    error_message: errMsg,
     samples,
     started_at: row.started_at,
+    paused_at: row.paused_at,
     finished_at: row.finished_at
   };
+}
+
+// 拉某个 source 的"最近一次清理"——前端进 cleanup tab 自动恢复进度卡用
+async function getLatestRun() {
+  const [[row]] = await pool.query(
+    `SELECT id FROM cleanup_runs ORDER BY id DESC LIMIT 1`
+  );
+  if (!row) return null;
+  return getRun(row.id);
 }
 
 async function getRunSamples(runId, limit = 50) {
   const cap = Math.min(Number(limit) || 50, 500);
   const [rows] = await pool.query(
-    `SELECT d.run_id, d.resource_id, d.reason, r.file_name, r.source_id, r.is_deleted
-       FROM cleanup_deleted d LEFT JOIN resources r ON r.id = d.resource_id
-      WHERE d.run_id = ? LIMIT ?`,
+    `SELECT idx, reason, resource_id AS id, source_id, file_name, group_key, score, ext, winner_id, winner_file_name
+       FROM cleanup_run_samples WHERE run_id = ? ORDER BY idx ASC LIMIT ?`,
     [runId, cap]
   );
   return rows;
@@ -565,5 +650,7 @@ async function getRunSamples(runId, limit = 50) {
 
 module.exports = {
   listRules, getRule, createRule, updateRule, deleteRule,
-  runCleanup, startCleanup, undoRun, listRuns, getRun, getRunSamples
+  getSettings, updateSettings,
+  startCleanup, requestPause, resumeRun, undoRun,
+  listRuns, getRun, getLatestRun, getRunSamples
 };
