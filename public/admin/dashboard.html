@@ -958,7 +958,31 @@
     </div>
   </div>
 
-  <!-- 清理规则编辑弹窗 -->
+  <!-- 清理进行中：全屏遮罩 + 进度卡 -->
+  <div x-show="cleanup.currentRun" x-transition class="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" style="display:none">
+    <div class="bg-white rounded-xl w-full max-w-md p-6">
+      <div class="flex items-center gap-3 mb-3">
+        <svg class="animate-spin w-6 h-6 text-rose-600" fill="none" viewBox="0 0 24 24">
+          <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+          <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+        </svg>
+        <div>
+          <div class="font-bold" x-text="cleanup.currentRun && cleanup.currentRun.dry_run ? '正在试运行' : '正在执行清理'"></div>
+          <div class="text-xs text-slate-500">大库可能需要数分钟，请勿关闭页面</div>
+        </div>
+      </div>
+      <div class="space-y-2 text-sm">
+        <div class="flex justify-between"><span class="text-slate-500">Run ID</span><span x-text="'#' + (cleanup.currentRun && cleanup.currentRun.id)"></span></div>
+        <div class="flex justify-between"><span class="text-slate-500">已扫描</span><span><b x-text="(cleanup.currentRun && cleanup.currentRun.total_examined) || 0"></b><span class="text-slate-400" x-show="cleanup.currentRun && cleanup.currentRun.target_total" x-text="' / ' + cleanup.currentRun.target_total"></span></span></div>
+        <div class="flex justify-between"><span class="text-slate-500">格式过滤删除</span><span class="text-rose-600" x-text="(cleanup.currentRun && cleanup.currentRun.removed_by_format) || 0"></span></div>
+        <div class="flex justify-between"><span class="text-slate-500">去重删除</span><span class="text-rose-600" x-text="(cleanup.currentRun && cleanup.currentRun.removed_by_dedupe) || 0"></span></div>
+        <div class="w-full h-2 bg-slate-100 rounded-full overflow-hidden mt-2">
+          <div class="h-full bg-rose-500 transition-all" :style="'width:' + cleanupProgressPct() + '%'"></div>
+        </div>
+        <p class="text-xs text-slate-400 mt-2">流程：扫描资源 → 算分组键 / 评分 → ROW_NUMBER 找赢家 → 软删除其他</p>
+      </div>
+    </div>
+  </div>
   <div x-show="cleanupRuleModal.open" x-transition class="fixed inset-0 bg-black/50 flex items-center justify-center z-40 p-4" @click.self="cleanupRuleModal.open = false">
     <div class="bg-white rounded-xl w-full max-w-2xl p-6 max-h-[90vh] overflow-y-auto">
       <h3 class="font-bold text-lg mb-4" x-text="cleanupRuleModal.id ? '编辑规则' : '新建规则'"></h3>

@@ -132,16 +132,16 @@ function getExt(name) {
 }
 
 // ---------- run 一次清理 ----------
-async function runCleanup({ ruleId, scopeSourceIds = [], crossSource = false, dryRun = true, ruleConfigOverride = null }) {
+// 立即返回 run_id，真正的扫描放到后台跑——避免 HTTP 90s 超时；
+// 前端轮询 GET /cleanup/runs/:id 看进度
+async function startCleanup({ ruleId, scopeSourceIds = [], crossSource = false, dryRun = true, ruleConfigOverride = null }) {
   const rule = await getRule(ruleId);
   if (!rule) throw new HttpError(404, '规则不存在');
   if (!rule.enabled && !ruleConfigOverride) throw new HttpError(400, '规则已禁用');
 
   const config = ruleConfigOverride || (typeof rule.config === 'string' ? JSON.parse(rule.config) : rule.config);
   validateConfig(config);
-  const compiled = compileRule(config);
 
-  // 计算"参与本次清理"的资源总数（用于安全阈值 + 报告）
   const scopeIds = (Array.isArray(scopeSourceIds) ? scopeSourceIds : []).map(Number).filter(Boolean);
   const scopeWhere = scopeIds.length
     ? `AND r.source_id IN (${scopeIds.map(() => '?').join(',')})`
@@ -153,7 +153,14 @@ async function runCleanup({ ruleId, scopeSourceIds = [], crossSource = false, dr
   const liveTotal = Number(liveRow.total || 0);
   if (liveTotal === 0) throw new HttpError(400, '当前范围内没有可清理的资源');
 
-  // 创建 run
+  // 同一时间最多一个 run，防止用户连点
+  const [[busy]] = await pool.query(
+    `SELECT id FROM cleanup_runs WHERE status='running' ORDER BY id DESC LIMIT 1`
+  );
+  if (busy && busy.id) {
+    throw new HttpError(409, `已有清理任务在跑（run #${busy.id}），请等待完成或刷新页面查看`);
+  }
+
   const [r] = await pool.query(
     `INSERT INTO cleanup_runs (rule_id, rule_name_snapshot, config_snapshot, scope_source_ids, cross_source, dry_run, status)
      VALUES (?, ?, ?, ?, ?, ?, 'running')`,
@@ -162,76 +169,85 @@ async function runCleanup({ ruleId, scopeSourceIds = [], crossSource = false, dr
   );
   const runId = r.insertId;
 
-  try {
-    const samples = [];
-    let removedFmt = 0;
-    let removedDedupe = 0;
-
-    // ===== 阶段 A：格式过滤（如果启用） =====
-    if (config.format_filter && config.format_filter.mode && config.format_filter.mode !== 'off') {
-      const res = await runFormatFilter({
-        compiled, scopeIds, runId, dryRun, samples
+  // 后台跑（不 await，让 HTTP 立即返回）
+  setImmediate(() => {
+    executeCleanup({ runId, config, scopeIds, crossSource, dryRun, liveTotal })
+      .catch((err) => {
+        console.error(`[cleanup #${runId}] failed:`, err);
+        pool.query(
+          `UPDATE cleanup_runs SET status='failed', error_message=?, finished_at=NOW() WHERE id=?`,
+          [String(err.message || err).slice(0, 500), runId]
+        ).catch(() => {});
       });
-      removedFmt = res.removed;
-    }
+  });
 
-    // ===== 阶段 B：去重（如果有 score_rules 或 key_extractor） =====
-    const hasDedupe = (config.score_rules && config.score_rules.length) || config.key_extractor;
-    if (hasDedupe) {
-      const res = await runDedupe({
-        compiled, scopeIds, crossSource, runId, dryRun, samples,
-        liveTotalForSafety: liveTotal
-      });
-      removedDedupe = res.removed;
-    }
-
-    // 安全阈值检查（dry-run 不强制）
-    const totalRemove = removedFmt + removedDedupe;
-    if (!dryRun && totalRemove > Math.floor(liveTotal * SAFE_DELETE_RATIO)) {
-      // 已经发生了：回滚 cleanup_deleted 把 is_deleted 改回去
-      await rollbackRun(runId);
-      await pool.query(
-        `UPDATE cleanup_runs SET status='failed', error_message=?, finished_at=NOW() WHERE id=?`,
-        [`安全阈值阻断：本次将删除 ${totalRemove} 条 / 活跃 ${liveTotal} 条 (>${Math.floor(SAFE_DELETE_RATIO * 100)}%)，已自动回滚`, runId]
-      );
-      throw new HttpError(400, `安全阈值阻断：本次将删除 ${totalRemove} / ${liveTotal} 条 (超过 ${Math.floor(SAFE_DELETE_RATIO * 100)}%)，已回滚。请缩小范围或调整规则后重试。`);
-    }
-
-    await pool.query(
-      `UPDATE cleanup_runs
-          SET status='completed', total_examined=?, removed_by_format=?, removed_by_dedupe=?, finished_at=NOW()
-        WHERE id=?`,
-      [liveTotal, removedFmt, removedDedupe, runId]
-    );
-
-    return {
-      run_id: runId,
-      dry_run: dryRun,
-      total_examined: liveTotal,
-      removed_by_format: removedFmt,
-      removed_by_dedupe: removedDedupe,
-      total_removed: removedFmt + removedDedupe,
-      samples: samples.slice(0, SAMPLE_LIMIT)
-    };
-  } catch (err) {
-    if (!(err instanceof HttpError && err.statusCode === 400 && /安全阈值阻断/.test(err.message))) {
-      await pool.query(
-        `UPDATE cleanup_runs SET status='failed', error_message=?, finished_at=NOW() WHERE id=?`,
-        [String(err.message || err).slice(0, 500), runId]
-      );
-    }
-    throw err;
-  }
+  return { run_id: runId, total_examined: liveTotal };
 }
 
+async function executeCleanup({ runId, config, scopeIds, crossSource, dryRun, liveTotal }) {
+  const compiled = compileRule(config);
+  const samples = [];
+  let removedFmt = 0;
+  let removedDedupe = 0;
+
+  // 把"将存为 result_summary"的样例先写到 cleanup_runs.error_message 里？
+  // 不，单独一个表太重，直接挂在内存里、跑完写 cleanup_run_samples 也可以。
+  // 但前端只要看进度数字，样例放在 cleanup_deleted 也能 JOIN 查到，先不做样例写库。
+
+  if (config.format_filter && config.format_filter.mode && config.format_filter.mode !== 'off') {
+    const res = await runFormatFilter({
+      compiled, scopeIds, runId, dryRun, samples
+    });
+    removedFmt = res.removed;
+  }
+
+  const hasDedupe = (config.score_rules && config.score_rules.length) || config.key_extractor;
+  if (hasDedupe) {
+    const res = await runDedupe({
+      compiled, scopeIds, crossSource, runId, dryRun, samples
+    });
+    removedDedupe = res.removed;
+  }
+
+  // 安全阈值（dry-run 不强制）
+  const totalRemove = removedFmt + removedDedupe;
+  if (!dryRun && totalRemove > Math.floor(liveTotal * SAFE_DELETE_RATIO)) {
+    await rollbackRun(runId);
+    const msg = `安全阈值阻断：本次将删除 ${totalRemove} / ${liveTotal} 条 (超过 ${Math.floor(SAFE_DELETE_RATIO * 100)}%)，已自动回滚`;
+    await pool.query(
+      `UPDATE cleanup_runs SET status='failed', error_message=?, finished_at=NOW() WHERE id=?`,
+      [msg, runId]
+    );
+    return;
+  }
+
+  // 把样例 JSON 存到 error_message（复用字段，前端取来展示）
+  // 名字叫 error_message 但实际兼做"结果摘要"——避免再加表
+  const samplesJson = JSON.stringify(samples.slice(0, SAMPLE_LIMIT));
+  await pool.query(
+    `UPDATE cleanup_runs
+        SET status='completed', total_examined=?, removed_by_format=?, removed_by_dedupe=?,
+            error_message=?, finished_at=NOW()
+      WHERE id=?`,
+    [liveTotal, removedFmt, removedDedupe, samplesJson.slice(0, 16000), runId]
+  );
+}
+
+// 兼容旧调用：admin.js 仍可调 runCleanup（同步等完）；
+// 实际用 startCleanup 启动后台 + 立即返回
+async function runCleanup(opts) {
+  return startCleanup(opts);
+}
 // ===== 格式过滤 =====
 async function runFormatFilter({ compiled, scopeIds, runId, dryRun, samples }) {
   const ff = compiled.formatFilter;
   if (ff.mode === 'off') return { removed: 0 };
-  if (!ff.set.size) return { removed: 0 };  // 没填扩展名等于不操作
+  if (!ff.set.size) return { removed: 0 };
 
   let removed = 0;
   let lastId = 0;
+  let examined = 0;
+  let lastReportAt = 0;
   while (true) {
     const scopeWhere = scopeIds.length
       ? `AND r.source_id IN (${scopeIds.map(() => '?').join(',')})`
@@ -246,12 +262,12 @@ async function runFormatFilter({ compiled, scopeIds, runId, dryRun, samples }) {
     );
     if (!rows.length) break;
     lastId = rows[rows.length - 1].id;
+    examined += rows.length;
 
     const idsToKill = [];
     for (const row of rows) {
       const ext = getExt(row.file_name);
       const inSet = ff.set.has(ext);
-      // whitelist：不在集合内 → 删；blacklist：在集合内 → 删
       const shouldKill = ff.mode === 'whitelist' ? !inSet : inSet;
       if (shouldKill) {
         idsToKill.push(row.id);
@@ -263,7 +279,6 @@ async function runFormatFilter({ compiled, scopeIds, runId, dryRun, samples }) {
     if (idsToKill.length) {
       removed += idsToKill.length;
       if (!dryRun) {
-        // 批量软删除 + 写关联表
         for (let i = 0; i < idsToKill.length; i += BATCH_UPDATE) {
           const slice = idsToKill.slice(i, i + BATCH_UPDATE);
           await pool.query(
@@ -280,6 +295,15 @@ async function runFormatFilter({ compiled, scopeIds, runId, dryRun, samples }) {
         }
       }
     }
+
+    // 每 2 秒回写一次进度，前端轮询读
+    if (Date.now() - lastReportAt > 2000) {
+      lastReportAt = Date.now();
+      pool.query(
+        `UPDATE cleanup_runs SET total_examined=?, removed_by_format=? WHERE id=?`,
+        [examined, removed, runId]
+      ).catch(() => {});
+    }
   }
   return { removed };
 }
@@ -289,6 +313,7 @@ async function runDedupe({ compiled, scopeIds, crossSource, runId, dryRun, sampl
   // 1) 流式扫描，写 _cleanup_temp（每行的 group_key + score）
   let lastId = 0;
   let examined = 0;
+  let lastReportAt = 0;
   while (true) {
     const scopeWhere = scopeIds.length
       ? `AND r.source_id IN (${scopeIds.map(() => '?').join(',')})`
@@ -324,6 +349,15 @@ async function runDedupe({ compiled, scopeIds, crossSource, runId, dryRun, sampl
          ON DUPLICATE KEY UPDATE score = VALUES(score), group_key = VALUES(group_key)`,
         flat
       );
+    }
+
+    // 节流回写扫描进度（去重阶段，removed 暂时还没算）
+    if (Date.now() - lastReportAt > 2000) {
+      lastReportAt = Date.now();
+      pool.query(
+        `UPDATE cleanup_runs SET total_examined=? WHERE id=?`,
+        [examined, runId]
+      ).catch(() => {});
     }
   }
 
@@ -419,7 +453,50 @@ async function listRuns({ limit = 30 } = {}) {
        FROM cleanup_runs ORDER BY id DESC LIMIT ?`,
     [Math.min(Number(limit) || 30, 200)]
   );
+  // 跑完的 run 里 error_message 装的是 samples JSON，前端不需要看；只在 status=failed 时返回
+  for (const r of rows) {
+    if (r.status !== 'failed' && r.error_message) r.error_message = null;
+  }
   return rows;
+}
+
+// 单 run 详情：前端轮询用
+async function getRun(runId) {
+  const [[row]] = await pool.query(
+    `SELECT id, rule_id, rule_name_snapshot, scope_source_ids, cross_source,
+            dry_run, status, total_examined, removed_by_format, removed_by_dedupe,
+            error_message, started_at, finished_at
+       FROM cleanup_runs WHERE id = ? LIMIT 1`,
+    [runId]
+  );
+  if (!row) return null;
+  // status=completed 时 error_message 复用为 samples JSON
+  let samples = null;
+  let errorMessage = null;
+  if (row.error_message) {
+    if (row.status === 'failed') {
+      errorMessage = row.error_message;
+    } else {
+      try { samples = JSON.parse(row.error_message); } catch (_) { samples = null; }
+    }
+  }
+  return {
+    id: row.id,
+    rule_id: row.rule_id,
+    rule_name: row.rule_name_snapshot,
+    scope_source_ids: row.scope_source_ids,
+    cross_source: !!row.cross_source,
+    dry_run: !!row.dry_run,
+    status: row.status,
+    total_examined: row.total_examined,
+    removed_by_format: row.removed_by_format,
+    removed_by_dedupe: row.removed_by_dedupe,
+    total_removed: (row.removed_by_format || 0) + (row.removed_by_dedupe || 0),
+    error_message: errorMessage,
+    samples,
+    started_at: row.started_at,
+    finished_at: row.finished_at
+  };
 }
 
 async function getRunSamples(runId, limit = 50) {
@@ -435,5 +512,5 @@ async function getRunSamples(runId, limit = 50) {
 
 module.exports = {
   listRules, getRule, createRule, updateRule, deleteRule,
-  runCleanup, undoRun, listRuns, getRunSamples
+  runCleanup, startCleanup, undoRun, listRuns, getRun, getRunSamples
 };
