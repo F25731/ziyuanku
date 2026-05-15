@@ -60,6 +60,12 @@ const CLEANUP_TEMPLATES = {
       mode: 'blacklist',
       extensions: ['url','lnk','tmp','dat','db','log','bak','crdownload','part','!ut']
     }
+  },
+  small_files: {
+    size_filter: { mode: 'remove_smaller_than', threshold: '1KB' }
+  },
+  size_range: {
+    size_filter: { mode: 'keep_only_between', min: '100KB', max: '2GB' }
   }
 };
 
@@ -797,12 +803,15 @@ function dashboard() {
     ruleTypeOf(r) {
       const cfg = typeof r.config === 'string' ? safeJSON(r.config) : (r.config || {});
       const ff = cfg.format_filter || {};
+      const sf = cfg.size_filter || {};
       const hasFmt = ff.mode && ff.mode !== 'off' && (ff.extensions || []).length;
+      const hasSize = sf.mode && sf.mode !== 'off';
       const hasDedupe = (cfg.score_rules && cfg.score_rules.length) || cfg.key_extractor;
-      if (hasFmt && hasDedupe) return '混合';
-      if (hasFmt) return '格式过滤';
-      if (hasDedupe) return '去重';
-      return '空';
+      const parts = [];
+      if (hasSize) parts.push('大小');
+      if (hasFmt) parts.push('格式');
+      if (hasDedupe) parts.push('去重');
+      return parts.join(' + ') || '空';
     },
     durationOf(run) {
       if (!run.started_at || !run.finished_at) return '-';

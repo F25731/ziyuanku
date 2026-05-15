@@ -91,6 +91,20 @@ function validateConfig(cfg) {
   if (ff.mode && !['off', 'whitelist', 'blacklist'].includes(ff.mode)) {
     throw new HttpError(400, 'format_filter.mode 必须是 off/whitelist/blacklist');
   }
+  const sf = cfg.size_filter || {};
+  if (sf.mode && !['off', 'remove_smaller_than', 'remove_larger_than', 'keep_only_between'].includes(sf.mode)) {
+    throw new HttpError(400, 'size_filter.mode 必须是 off/remove_smaller_than/remove_larger_than/keep_only_between');
+  }
+  if (sf.mode && sf.mode !== 'off') {
+    if (sf.mode === 'keep_only_between') {
+      const a = parseSizeExprToBytes(sf.min);
+      const b = parseSizeExprToBytes(sf.max);
+      if (a == null || b == null) throw new HttpError(400, 'size_filter.min / size_filter.max 不合法（示例: "100KB" / "2MB"）');
+    } else {
+      const t = parseSizeExprToBytes(sf.threshold);
+      if (t == null) throw new HttpError(400, 'size_filter.threshold 不合法（示例: "1KB" / "500B" / "2MB"）');
+    }
+  }
 }
 
 // ---------- DSL 求值 ----------
@@ -109,6 +123,16 @@ function compileRule(cfg) {
   const tie = cfg.tie_breaker === 'id_asc' ? 'id_asc' : 'id_desc';
   const ff = cfg.format_filter || { mode: 'off' };
   const ffSet = new Set((ff.extensions || []).map((s) => String(s).toLowerCase().trim()).filter(Boolean));
+
+  // size_filter 编译
+  const sf = cfg.size_filter || { mode: 'off' };
+  const sfCompiled = { mode: sf.mode || 'off' };
+  if (sfCompiled.mode === 'keep_only_between') {
+    sfCompiled.minBytes = parseSizeExprToBytes(sf.min);
+    sfCompiled.maxBytes = parseSizeExprToBytes(sf.max);
+  } else if (sfCompiled.mode === 'remove_smaller_than' || sfCompiled.mode === 'remove_larger_than') {
+    sfCompiled.thresholdBytes = parseSizeExprToBytes(sf.threshold);
+  }
 
   return {
     qualifies(name) {
@@ -144,13 +168,58 @@ function compileRule(cfg) {
       return n;
     },
     tieBreaker: tie,
-    formatFilter: { mode: ff.mode || 'off', set: ffSet }
+    formatFilter: { mode: ff.mode || 'off', set: ffSet },
+    sizeFilter: sfCompiled
   };
 }
 
 function getExt(name) {
   const m = String(name || '').match(/\.([A-Za-z0-9]{1,8})$/);
   return m ? m[1].toLowerCase() : '';
+}
+
+// 把蓝奏 file_size（"4260"=KB / "12.3 M" / "1.5GB"）转成字节数
+// ilanzou：纯数字 → KB；老蓝奏：带单位
+function parseFileSizeToBytes(raw) {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  const m = s.match(/^([\d.]+)\s*([a-zA-Z]*)\s*$/);
+  if (!m) return null;
+  const num = parseFloat(m[1]);
+  if (!Number.isFinite(num)) return null;
+  let unit = (m[2] || '').toUpperCase();
+  if (/^[KMGT]$/.test(unit)) unit += 'B';
+  if (!unit) return Math.round(num * 1024); // 纯数字按 KB
+  switch (unit) {
+    case 'B':  return Math.round(num);
+    case 'KB': return Math.round(num * 1024);
+    case 'MB': return Math.round(num * 1024 * 1024);
+    case 'GB': return Math.round(num * 1024 * 1024 * 1024);
+    case 'TB': return Math.round(num * 1024 * 1024 * 1024 * 1024);
+    default:   return null;
+  }
+}
+// 把用户在 DSL 里写的 "1k" / "500B" / "2.5MB" / 数字（默认 B）转字节
+function parseSizeExprToBytes(v) {
+  if (v == null || v === '') return null;
+  if (typeof v === 'number') return Math.round(v);
+  const s = String(v).trim();
+  const m = s.match(/^([\d.]+)\s*([a-zA-Z]*)\s*$/);
+  if (!m) return null;
+  const num = parseFloat(m[1]);
+  if (!Number.isFinite(num)) return null;
+  let unit = (m[2] || '').toUpperCase();
+  if (/^[KMGT]$/.test(unit)) unit += 'B';
+  if (!unit) return Math.round(num); // 不带单位 = 字节
+  switch (unit) {
+    case 'B':  return Math.round(num);
+    case 'KB': return Math.round(num * 1024);
+    case 'MB': return Math.round(num * 1024 * 1024);
+    case 'GB': return Math.round(num * 1024 * 1024 * 1024);
+    case 'TB': return Math.round(num * 1024 * 1024 * 1024 * 1024);
+    default:   return null;
+  }
 }
 
 // ---------- 启动一次清理 ----------
@@ -212,9 +281,24 @@ async function startCleanup({ ruleId, scopeSourceIds = [], crossSource = false, 
 
 async function executeCleanup({ runId, config, scopeIds, crossSource, dryRun, liveTotal, confirmOver }) {
   const compiled = compileRule(config);
-  const samples = [];          // [{reason, id, file_name, source_id, group_key, score, winner_*}]
+  const samples = [];
+  let removedSize = 0;
   let removedFmt = 0;
   let removedDedupe = 0;
+
+  // 阶段 A0：大小筛选（独立于格式 / 去重，先跑）
+  if (compiled.sizeFilter && compiled.sizeFilter.mode !== 'off') {
+    const res = await runSizeFilter({ compiled, scopeIds, runId, dryRun, samples });
+    removedSize = res.removed;
+    if (res.paused) {
+      await pool.query(
+        `UPDATE cleanup_runs SET status='paused', removed_by_format=?, paused_at=NOW() WHERE id=?`,
+        [removedSize + removedFmt, runId]
+      );
+      await persistSamples(runId, samples);
+      return;
+    }
+  }
 
   // 阶段 A：格式过滤
   if (config.format_filter && config.format_filter.mode && config.format_filter.mode !== 'off') {
@@ -223,7 +307,7 @@ async function executeCleanup({ runId, config, scopeIds, crossSource, dryRun, li
     if (res.paused) {
       await pool.query(
         `UPDATE cleanup_runs SET status='paused', removed_by_format=?, paused_at=NOW() WHERE id=?`,
-        [removedFmt, runId]
+        [removedSize + removedFmt, runId]
       );
       await persistSamples(runId, samples);
       return;
@@ -238,7 +322,7 @@ async function executeCleanup({ runId, config, scopeIds, crossSource, dryRun, li
     if (res.paused) {
       await pool.query(
         `UPDATE cleanup_runs SET status='paused', removed_by_format=?, removed_by_dedupe=?, paused_at=NOW() WHERE id=?`,
-        [removedFmt, removedDedupe, runId]
+        [removedSize + removedFmt, removedDedupe, runId]
       );
       await persistSamples(runId, samples);
       return;
@@ -246,7 +330,7 @@ async function executeCleanup({ runId, config, scopeIds, crossSource, dryRun, li
   }
 
   // 安全阈值（仅 apply 模式 + 未确认时）
-  const totalRemove = removedFmt + removedDedupe;
+  const totalRemove = removedSize + removedFmt + removedDedupe;
   const settings = await getSettings();
   if (!dryRun && !confirmOver && totalRemove > Math.floor(liveTotal * settings.safe_ratio)) {
     await rollbackRun(runId);
@@ -264,7 +348,7 @@ async function executeCleanup({ runId, config, scopeIds, crossSource, dryRun, li
     `UPDATE cleanup_runs
         SET status='completed', total_examined=?, removed_by_format=?, removed_by_dedupe=?, finished_at=NOW()
       WHERE id=?`,
-    [liveTotal, removedFmt, removedDedupe, runId]
+    [liveTotal, removedSize + removedFmt, removedDedupe, runId]
   );
   await persistSamples(runId, samples);
 }
@@ -302,6 +386,71 @@ async function persistSamples(runId, samples) {
 function shouldPause(runId) {
   const e = runningCleanups.get(runId);
   return !!(e && e.pauseRequested);
+}
+
+// ===== 大小筛选 =====
+// remove_smaller_than: 小于 threshold 的全删（"小说扫盘抓到一堆 0 字节空文件"）
+// remove_larger_than: 大于 threshold 的全删（极少用）
+// keep_only_between:  保留 [min, max]，区间外全删
+async function runSizeFilter({ compiled, scopeIds, runId, dryRun, samples }) {
+  const sf = compiled.sizeFilter;
+  if (sf.mode === 'off') return { removed: 0, paused: false };
+
+  let removed = 0;
+  let lastId = 0;
+  let examined = 0;
+  let lastReportAt = 0;
+  while (true) {
+    if (shouldPause(runId)) return { removed, paused: true };
+    const scopeWhere = scopeIds.length
+      ? `AND r.source_id IN (${scopeIds.map(() => '?').join(',')})`
+      : '';
+    const [rows] = await pool.query(
+      `SELECT r.id, r.file_name, r.file_size, r.source_id
+         FROM resources r
+        WHERE r.is_deleted = 0 ${scopeWhere} AND r.id > ?
+        ORDER BY r.id ASC
+        LIMIT ?`,
+      [...scopeIds, lastId, BATCH_SCAN]
+    );
+    if (!rows.length) break;
+    lastId = rows[rows.length - 1].id;
+    examined += rows.length;
+
+    const idsToKill = [];
+    for (const row of rows) {
+      const bytes = parseFileSizeToBytes(row.file_size);
+      if (bytes == null) continue;          // 大小解不出来的保留（保守）
+      let kill = false;
+      if (sf.mode === 'remove_smaller_than') kill = bytes < sf.thresholdBytes;
+      else if (sf.mode === 'remove_larger_than') kill = bytes > sf.thresholdBytes;
+      else if (sf.mode === 'keep_only_between') kill = (bytes < sf.minBytes || bytes > sf.maxBytes);
+      if (kill) {
+        idsToKill.push(row.id);
+        if (samples.length < SAMPLE_LIMIT) {
+          samples.push({
+            reason: 'size',
+            id: row.id, file_name: row.file_name, source_id: row.source_id,
+            ext: getExt(row.file_name),
+            group_key: bytes + ' bytes'   // 借 group_key 显示实际大小，前端样例表能直接看
+          });
+        }
+      }
+    }
+    if (idsToKill.length) {
+      removed += idsToKill.length;
+      if (!dryRun) await applySoftDelete(runId, idsToKill, 'size');
+    }
+
+    if (Date.now() - lastReportAt > PROGRESS_FLUSH_MS) {
+      lastReportAt = Date.now();
+      pool.query(
+        `UPDATE cleanup_runs SET total_examined=?, removed_by_format=? WHERE id=?`,
+        [examined, removed, runId]
+      ).catch(() => {});
+    }
+  }
+  return { removed, paused: false };
 }
 
 // ===== 格式过滤 =====
