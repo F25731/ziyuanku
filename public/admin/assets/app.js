@@ -122,6 +122,7 @@ function dashboard() {
     // 进度卡：每个源独立的状态快照（由 2s 轮询 GET /sources/:id/sync-status 填充）
     syncStatus: {},          // { [sourceId]: {has_run, status, total_files, total_calls, progress, ...} }
     syncRate: {},            // { [sourceId]: 文件/秒 } 由前端按差分算
+    panelDismissed: {},      // { [sourceId]: true } 用户点 × 隐藏掉这条结束态卡片，下次 syncSource 时清掉
     _syncStatusTimers: {},   // { [sourceId]: setInterval handle } 不会被 Alpine 反应式追踪
     keyModal: { open: false, name: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', expireDays: 30, result: '' },
     keyEditModal: { open: false, id: null, name: '', key_prefix: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', expireText: '', addDays: 30, extendMsg: '' },
@@ -345,10 +346,11 @@ function dashboard() {
       mode = mode || 'incremental';
       const src = this.sources.find((s) => s.id === id);
       if (src) { src._syncing = true; src._syncMode = mode; }
+      // 用户开启新一轮，把上一次"已关闭"标记清掉，让进度卡重新显示
+      delete this.panelDismissed[id];
       try {
         const d = await api('/sources/' + id + '/sync', { method: 'POST', body: { mode } });
         if (d.run_id) {
-          // 立刻刷新一次状态，进度卡马上出现，用户能看到 spinner
           this.refreshSyncStatus(id);
           this.startSyncStatusPolling(id);
           this.notify((mode === 'full' ? '全量' : '增量') + '扫描已启动');
@@ -387,6 +389,7 @@ function dashboard() {
     },
     async resetSyncProgress(sourceId) {
       if (!confirm('重置后该源会从根目录重新扫，已入库的资源不会丢，但本次未跑完的目录进度会丢失。继续？')) return;
+      delete this.panelDismissed[sourceId];
       try {
         await api('/sources/' + sourceId + '/sync', { method: 'POST', body: { mode: 'full' } });
         this.notify('已从根目录重新启动扫描');
@@ -395,6 +398,10 @@ function dashboard() {
       } catch (e) {
         this.showError('重置失败', e);
       }
+    },
+    // 关闭进度卡（仅 UI 状态，不影响数据库 run；下次同步时会自动重新显示）
+    dismissSyncPanel(sourceId) {
+      this.panelDismissed[sourceId] = true;
     },
     // 兼容旧调用
     async checkSource(id) { return this.testSource(id); },

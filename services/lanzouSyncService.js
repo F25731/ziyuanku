@@ -135,11 +135,11 @@ async function upsertProgress(runId, folderId, nextOffset, totalPage, done) {
   );
 }
 
-async function bumpRunCounters(runId, addCalls, addFiles) {
-  if (!addCalls && !addFiles) return;
+async function bumpRunCounters(runId, addCalls, addFiles, addInsertedNew = 0) {
+  if (!addCalls && !addFiles && !addInsertedNew) return;
   await pool.query(
-    'UPDATE sync_runs SET total_calls=total_calls+?, total_files=total_files+? WHERE id=?',
-    [Number(addCalls) || 0, Number(addFiles) || 0, runId]
+    'UPDATE sync_runs SET total_calls=total_calls+?, total_files=total_files+?, inserted_new=inserted_new+? WHERE id=?',
+    [Number(addCalls) || 0, Number(addFiles) || 0, Number(addInsertedNew) || 0, runId]
   );
 }
 
@@ -257,7 +257,7 @@ function streamRunIlanzouScript({ source, mode, syncRunId, maxIndexDepth, resume
 async function getSyncStatus(sourceId) {
   const [[run]] = await pool.query(
     `SELECT id, source_id, mode, status, root_folder_id, max_index_depth,
-            total_calls, total_files, last_message,
+            total_calls, total_files, inserted_new, last_message,
             started_at, last_resume_at, paused_at, finished_at
        FROM sync_runs
       WHERE source_id = ?
@@ -308,6 +308,7 @@ async function getSyncStatus(sourceId) {
     finished_at: run.finished_at,
     total_calls: Number(run.total_calls) || 0,
     total_files: Number(run.total_files) || 0,
+    inserted_new: Number(run.inserted_new) || 0,
     max_index_depth: run.max_index_depth,
     progress: {
       total_dirs: Number(prog.total_dirs) || 0,
@@ -349,29 +350,34 @@ async function syncSource(sourceId, mode = 'incremental') {
 
   // 流式入库分批缓冲
   let batch = [];
-  let totalFiles = 0;     // 真正已 flush 入库的文件数
-  let totalCalls = 0;     // 真正完成的 list 调用数
-  let committedCalls = 0; // 已 += 到 sync_runs.total_calls 的快照
-  let committedFiles = 0; // 已 += 到 sync_runs.total_files 的快照
+  let totalFiles = 0;       // 已 flush 进 MySQL 的文件总数（含新增 + 复用刷新）
+  let totalInserted = 0;    // 真正新插入的文件数（affectedRows 反推）
+  let totalCalls = 0;       // 完成的 list 调用数
+  let committedCalls = 0;   // 已写库的快照
+  let committedFiles = 0;
+  let committedInserted = 0;
   let lastSummaryAt = Date.now();
 
   const flush = async () => {
     if (!batch.length) return;
     const items = batch.map((f) => ({ ...f, sync_hash: toSyncHash(f) }));
-    await upsertResources(sourceId, items);
+    const r = await upsertResources(sourceId, items);
     totalFiles += items.length;
+    totalInserted += Number(r && r.inserted) || 0;
     batch = [];
   };
 
-  // 5s 节流：把自上次以来的"增量"写到 sync_runs.total_calls/total_files + last_message
+  // 5s 节流：把自上次以来的"增量"写到 sync_runs.total_calls/total_files/inserted_new + last_message
   // 这样前端 GET sync-status 轮询能看到数字一直在涨
   const flushCountersToDb = async (msg) => {
     const dCalls = totalCalls - committedCalls;
     const dFiles = totalFiles - committedFiles;
-    if (dCalls > 0 || dFiles > 0) {
-      await bumpRunCounters(run.id, dCalls, dFiles);
+    const dInserted = totalInserted - committedInserted;
+    if (dCalls > 0 || dFiles > 0 || dInserted > 0) {
+      await bumpRunCounters(run.id, dCalls, dFiles, dInserted);
       committedCalls = totalCalls;
       committedFiles = totalFiles;
+      committedInserted = totalInserted;
     }
     if (msg) await setLastMessage(run.id, msg);
   };
@@ -417,16 +423,16 @@ async function syncSource(sourceId, mode = 'incremental') {
       } catch (e) {
         console.warn('[reconcileDeletedAfterRun] 失败:', e.message);
       }
-      const msg = `run#${run.id} 已完成: 累计文件 ${totalFiles}, list 调用 ${totalCalls}, 标记已删除 ${marked}`;
+      const msg = `run#${run.id} 已完成: 扫到 ${totalFiles}（含新增 ${totalInserted} / 复用 ${totalFiles - totalInserted}）, list 调用 ${totalCalls}, 标记已删除 ${marked}`;
       await completeRun(run.id, msg);
       await finishSyncLog(logId, 'success', msg, totalFiles);
-      return { run_id: run.id, status: 'completed', total: totalFiles, calls: totalCalls, deleted_marked: marked };
+      return { run_id: run.id, status: 'completed', total: totalFiles, inserted: totalInserted, calls: totalCalls, deleted_marked: marked };
     }
     const reasonLabel = endEvt.reason === 'paused_by_user' ? '用户手动暂停' : `(${endEvt.reason})`;
-    const msg = `run#${run.id} 暂停 ${reasonLabel}: 本次新增 ${totalFiles}, list 调用 ${totalCalls}, 剩余目录 ${(endEvt.remaining_folders || []).length}`;
+    const msg = `run#${run.id} 暂停 ${reasonLabel}: 扫到 ${totalFiles}（含新增 ${totalInserted} / 复用 ${totalFiles - totalInserted}）, list 调用 ${totalCalls}, 剩余目录 ${(endEvt.remaining_folders || []).length}`;
     await pauseRun(run.id, msg);
     await finishSyncLog(logId, 'success', msg, totalFiles);
-    return { run_id: run.id, status: 'paused', reason: endEvt.reason, total: totalFiles, calls: totalCalls };
+    return { run_id: run.id, status: 'paused', reason: endEvt.reason, total: totalFiles, inserted: totalInserted, calls: totalCalls };
   } catch (err) {
     try { await flush(); } catch (_) {}
     try { await flushCountersToDb(null); } catch (_) {}

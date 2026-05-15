@@ -94,7 +94,7 @@ async function getResource(id) {
 
 async function upsertResources(sourceId, files) {
   if (!Array.isArray(files) || files.length === 0) {
-    return { inserted: 0, marked_deleted: 0 };
+    return { total: 0, inserted: 0, updated: 0 };
   }
 
   const conn = await pool.getConnection();
@@ -115,7 +115,7 @@ async function upsertResources(sourceId, files) {
       0
     ]);
 
-    await conn.query(
+    const [result] = await conn.query(
       `INSERT INTO resources
          (source_id, parent_folder_id, file_id, file_name, file_size, file_type, file_time,
           share_url, share_pwd, sync_hash, is_deleted)
@@ -132,6 +132,14 @@ async function upsertResources(sourceId, files) {
          is_deleted = 0`,
       [values]
     );
+
+    // MySQL 多行 INSERT...ON DUPLICATE KEY 的 affectedRows 规则：
+    //   每行新插入 +1，每行命中重复键且实际更新 +2，未改动 +0
+    // 反推: inserted = 2*total - affectedRows, updated = affectedRows - total
+    const total = files.length;
+    const aff = Number(result.affectedRows) || 0;
+    const inserted = Math.max(0, 2 * total - aff);
+    const updated = Math.max(0, aff - total);
 
     // 注意：以前这里有一段 "UPDATE ... WHERE file_id NOT IN (?)" 的逻辑——
     // 在流式批量 upsert 模式下，每批 200 条都会把表里**其余所有数据标 is_deleted=1**，
@@ -163,7 +171,7 @@ async function upsertResources(sourceId, files) {
       }
     }
 
-    return { inserted: files.length };
+    return { total, inserted, updated };
   } catch (err) {
     await conn.rollback();
     throw err;

@@ -340,11 +340,12 @@
                   </td>
                 </tr>
                 <!-- 进度卡：常驻在源行下方。后端 2s 轮询，扫盘期间数字一直跳，退出重进继续 -->
-                <tr x-show="syncStatus[s.id] && syncStatus[s.id].has_run && syncStatus[s.id].status !== 'completed'">
+                <tr x-show="syncStatus[s.id] && syncStatus[s.id].has_run && !panelDismissed[s.id]">
                   <td colspan="7" class="p-0 bg-slate-50">
                     <div class="px-5 py-3 border-t border-slate-200" :class="{
                         'bg-blue-50/60': syncStatus[s.id]?.is_active,
                         'bg-amber-50/60': syncStatus[s.id]?.status === 'paused',
+                        'bg-emerald-50/60': syncStatus[s.id]?.status === 'completed',
                         'bg-rose-50/60': syncStatus[s.id]?.status === 'failed' || syncStatus[s.id]?.status === 'orphaned'
                       }">
                       <div class="flex items-center justify-between flex-wrap gap-3">
@@ -360,12 +361,17 @@
                               <span x-text="syncStatus[s.id]?.mode === 'full' ? '全量扫描中' : '增量扫描中'"></span>
                             </span>
                             <span x-show="syncStatus[s.id]?.status === 'paused'">已暂停</span>
+                            <span x-show="syncStatus[s.id]?.status === 'completed'">✓ 已完成</span>
                             <span x-show="syncStatus[s.id]?.status === 'failed'">失败</span>
                             <span x-show="syncStatus[s.id]?.status === 'orphaned'">中断（容器重启过）</span>
                           </span>
                           <span class="text-slate-600">
                             <span class="font-semibold text-slate-800" x-text="(syncStatus[s.id]?.total_files || 0).toLocaleString()"></span>
-                            <span class="text-xs">个文件</span>
+                            <span class="text-xs">项</span>
+                            <span class="text-xs text-slate-500" x-show="(syncStatus[s.id]?.total_files || 0) > 0">
+                              （含新增 <b class="text-emerald-700" x-text="(syncStatus[s.id]?.inserted_new || 0).toLocaleString()"></b>
+                              / 复用 <b class="text-slate-600" x-text="((syncStatus[s.id]?.total_files || 0) - (syncStatus[s.id]?.inserted_new || 0)).toLocaleString()"></b>）
+                            </span>
                           </span>
                           <span class="text-slate-500 text-xs">
                             <span x-text="syncStatus[s.id]?.progress?.done_dirs || 0"></span>/<span x-text="syncStatus[s.id]?.progress?.total_dirs || 0"></span> 目录已完成
@@ -383,14 +389,17 @@
                           <button x-show="syncStatus[s.id]?.status === 'paused' || syncStatus[s.id]?.status === 'failed' || syncStatus[s.id]?.status === 'orphaned'"
                             @click="syncSource(s.id, 'incremental')" :disabled="s._syncing"
                             class="px-3 py-1 rounded border border-emerald-300 bg-white text-emerald-700 hover:bg-emerald-50 text-xs disabled:opacity-50">▶ 继续</button>
-                          <button x-show="!syncStatus[s.id]?.is_active" @click="resetSyncProgress(s.id)"
+                          <button x-show="!syncStatus[s.id]?.is_active && syncStatus[s.id]?.status !== 'completed'" @click="resetSyncProgress(s.id)"
                             class="px-3 py-1 rounded border border-slate-300 bg-white text-slate-600 hover:bg-slate-50 text-xs">重置进度</button>
+                          <button x-show="!syncStatus[s.id]?.is_active" @click="dismissSyncPanel(s.id)"
+                            title="关闭这条进度卡（不影响数据，下次同步时会自动重新出现）"
+                            class="w-6 h-6 flex items-center justify-center rounded text-slate-400 hover:text-slate-700 hover:bg-slate-200 text-base leading-none">×</button>
                         </div>
                       </div>
                       <div class="mt-2 text-xs text-slate-500" x-show="syncStatus[s.id]?.last_message" x-text="syncStatus[s.id]?.last_message"></div>
                       <div class="mt-1 text-xs text-slate-400"
-                           x-show="syncStatus[s.id]?.progress?.current_folder_id"
-                           x-text="'当前目录 ID: ' + syncStatus[s.id]?.progress?.current_folder_id + '（第 ' + ((syncStatus[s.id]?.progress?.current_folder_next_offset || 1) - 1) + '/' + (syncStatus[s.id]?.progress?.current_folder_total_page || '?') + ' 页）'"></div>
+                           x-show="syncStatus[s.id]?.is_active && syncStatus[s.id]?.progress?.current_folder_id"
+                           x-text="'当前目录 ID: ' + syncStatus[s.id]?.progress?.current_folder_id + '，已扫 ' + Math.max(0, (syncStatus[s.id]?.progress?.current_folder_next_offset || 1) - 1) + '/' + (syncStatus[s.id]?.progress?.current_folder_total_page || '?') + ' 页'"></div>
                     </div>
                   </td>
                 </tr>
