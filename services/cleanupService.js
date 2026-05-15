@@ -161,6 +161,14 @@ async function startCleanup({ ruleId, scopeSourceIds = [], crossSource = false, 
     throw new HttpError(409, `已有清理任务在跑（run #${busy.id}），请等待完成或刷新页面查看`);
   }
 
+  // 创建 run 前先清掉 _cleanup_temp 里"非 running run"的死行——
+  // 上一次跑挂了（OOM/磁盘满）时，_cleanup_temp 不会被 finally 清干净，会越攒越多
+  await pool.query(
+    `DELETE t FROM _cleanup_temp t
+       LEFT JOIN cleanup_runs r ON r.id = t.run_id
+      WHERE r.id IS NULL OR r.status <> 'running'`
+  );
+
   const [r] = await pool.query(
     `INSERT INTO cleanup_runs (rule_id, rule_name_snapshot, config_snapshot, scope_source_ids, cross_source, dry_run, status)
      VALUES (?, ?, ?, ?, ?, ?, 'running')`,
@@ -178,6 +186,10 @@ async function startCleanup({ ruleId, scopeSourceIds = [], crossSource = false, 
           `UPDATE cleanup_runs SET status='failed', error_message=?, finished_at=NOW() WHERE id=?`,
           [String(err.message || err).slice(0, 500), runId]
         ).catch(() => {});
+      })
+      .finally(() => {
+        // 不管成功失败，清掉本 run 的 _cleanup_temp 行（不 DROP 表）
+        pool.query('DELETE FROM _cleanup_temp WHERE run_id = ?', [runId]).catch(() => {});
       });
   });
 
@@ -361,23 +373,64 @@ async function runDedupe({ compiled, scopeIds, crossSource, runId, dryRun, sampl
     }
   }
 
-  // 2) 在 _cleanup_temp 里找每组 winner（score DESC, id 按 tie_breaker），其他都标记
-  // MySQL 8 ROW_NUMBER；找出 rn>1 的就是要删的
-  const orderId = compiled.tieBreaker === 'id_asc' ? 'ASC' : 'DESC';
-  const [losers] = await pool.query(
-    `SELECT t.resource_id, t.group_key, t.score
-       FROM (
-         SELECT resource_id, group_key, score,
-                ROW_NUMBER() OVER (PARTITION BY group_key ORDER BY score DESC, resource_id ${orderId}) AS rn
-           FROM _cleanup_temp
-          WHERE run_id = ?
-       ) t
-      WHERE t.rn > 1`,
-    [runId]
-  );
-  const idsToKill = losers.map((x) => x.resource_id);
+  // 2) 找每组 winner——不用 ROW_NUMBER（会写 tempfile，容器 /tmp 默认 64MB 装不下大库）
+  // 改成按 (run_id, group_key) 索引顺序流式扫，每个 group 在 Node 里挑赢家
+  // 该索引已存在（_cleanup_temp 的 idx_cleanup_temp_group），ORDER BY 不会触发 filesort
+  const tieAscNum = compiled.tieBreaker === 'id_asc' ? 1 : 0;
+  const idsToKill = [];
+  let cursorGroup = '';
+  let cursorRid = 0;
+  // 累积当前 group 的所有候选；group 变了就结算
+  let curGroup = null;
+  let curWinner = null;        // {resource_id, score}
+  let curLosersOfGroup = [];   // [resource_id, ...]
 
-  // 取样例（带文件名）
+  const flushGroup = () => {
+    if (curLosersOfGroup.length) {
+      for (const rid of curLosersOfGroup) idsToKill.push(rid);
+    }
+    curWinner = null;
+    curLosersOfGroup = [];
+  };
+
+  while (true) {
+    const [rows] = await pool.query(
+      `SELECT resource_id, group_key, score
+         FROM _cleanup_temp
+        WHERE run_id = ?
+          AND (group_key > ? OR (group_key = ? AND resource_id > ?))
+        ORDER BY group_key, resource_id
+        LIMIT ?`,
+      [runId, cursorGroup, cursorGroup, cursorRid, BATCH_SCAN]
+    );
+    if (!rows.length) break;
+    const last = rows[rows.length - 1];
+    cursorGroup = last.group_key;
+    cursorRid = last.resource_id;
+
+    for (const r of rows) {
+      if (curGroup !== r.group_key) {
+        flushGroup();
+        curGroup = r.group_key;
+        curWinner = { resource_id: r.resource_id, score: r.score };
+        continue;
+      }
+      // 同一组：比较分数，分高的或满足 tie 的当 winner，旧 winner 进 losers
+      const cur = curWinner;
+      const win = (r.score > cur.score)
+        || (r.score === cur.score && (tieAscNum ? r.resource_id < cur.resource_id : r.resource_id > cur.resource_id));
+      if (win) {
+        curLosersOfGroup.push(cur.resource_id);
+        curWinner = { resource_id: r.resource_id, score: r.score };
+      } else {
+        curLosersOfGroup.push(r.resource_id);
+      }
+    }
+  }
+  // 最后一个 group 也要结算
+  flushGroup();
+
+  // 取样例（最多 SAMPLE_LIMIT - 已有的 format 样例）
   if (samples.length < SAMPLE_LIMIT && idsToKill.length) {
     const need = SAMPLE_LIMIT - samples.length;
     const sampleIds = idsToKill.slice(0, need);
