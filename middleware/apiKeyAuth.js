@@ -24,6 +24,13 @@ async function rateLimit(apiKey) {
   }
 }
 
+// 哪些路径算"消耗配额"——目前只算解析直链
+// /api/v1/resources/:id/link → req.path 在 v1Router 里是 "/resources/:id/link"
+function isQuotaPath(req) {
+  const p = req.path || '';
+  return /^\/resources\/[^/]+\/link\/?$/.test(p);
+}
+
 async function apiKeyRequired(req, res, next) {
   const started = Date.now();
   const plain = extractKey(req);
@@ -37,7 +44,9 @@ async function apiKeyRequired(req, res, next) {
   if (apiKey.__exhausted) {
     return res.status(429).json({ code: 429, message: '总次数已用尽' });
   }
-  if (apiKey.daily_limit > 0) {
+  // 配额只在"消耗资源"的路径才检查 + 计数
+  const willConsumeQuota = isQuotaPath(req);
+  if (willConsumeQuota && apiKey.daily_limit > 0) {
     const used = await getDailyUsage(apiKey.id);
     if (used >= apiKey.daily_limit) {
       return res.status(429).json({ code: 429, message: '今日次数已用尽', daily_limit: apiKey.daily_limit, used_today: used });
@@ -49,9 +58,12 @@ async function apiKeyRequired(req, res, next) {
     return res.status(429).json({ code: 429, message: '请求过于频繁，请稍后再试' });
   }
   req.apiKey = apiKey;
+  req.apiKeyConsumesQuota = willConsumeQuota;
 
   res.on('finish', () => {
-    recordCall(apiKey.id, req.originalUrl || req.url, req.ip, res.statusCode, Date.now() - started).catch(() => {});
+    // 成功响应才计费（4xx/5xx 不算配额）
+    const consumed = willConsumeQuota && res.statusCode >= 200 && res.statusCode < 300;
+    recordCall(apiKey.id, req.originalUrl || req.url, req.ip, res.statusCode, Date.now() - started, consumed ? 1 : 0).catch(() => {});
   });
 
   return next();

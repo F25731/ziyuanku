@@ -118,6 +118,14 @@ router.get('/sources', asyncHandler(async (req, res) => {
   res.json({ code: 200, items });
 }));
 
+// 给"签发/编辑 API Key"弹窗选库用：只回 id + title，不回密码相关字段
+router.get('/sources-lite', asyncHandler(async (req, res) => {
+  const [rows] = await pool.query(
+    'SELECT id, title FROM sources WHERE status=1 ORDER BY id ASC'
+  );
+  res.json({ code: 200, items: rows });
+}));
+
 router.post('/sources', adminRequired, asyncHandler(async (req, res) => {
   const item = await saveSource(req.body || {});
   res.json({ code: 200, message: '保存成功', item });
@@ -216,8 +224,10 @@ router.post('/api-keys', adminRequired, asyncHandler(async (req, res) => {
     dailyLimit: body.dailyLimit,
     totalLimit: body.totalLimit,
     ratePerMin: body.ratePerMin,
+    maxResults: body.maxResults,
+    allowedSourceIds: body.allowedSourceIds,
+    expireDays: body.expireDays,
     remark: body.remark,
-    expireAt: body.expireAt,
     ownerUserId: req.user.id
   });
   res.json({ code: 200, message: '创建成功', item });

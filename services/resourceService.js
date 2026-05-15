@@ -14,7 +14,7 @@ function buildBooleanQuery(q) {
   return safe.map((t) => `+${t}*`).join(' '); // 每个词必须出现，前缀通配
 }
 
-async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = null }) {
+async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = null, allowedSourceIds = null, cap = 0 }) {
   page = Math.max(1, Number(page) || 1);
   pageSize = Math.min(100, Math.max(1, Number(pageSize) || 20));
   const offset = (page - 1) * pageSize;
@@ -36,23 +36,65 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
       params.push(`%${q}%`);
     }
   }
+  // 单源筛选（前端 source_id 参数）
   if (sourceId) {
     where.push('r.source_id = ?');
     params.push(Number(sourceId));
   }
+  // API Key 维度的库白名单：只能搜这几个 source 的资源
+  // 注意：如果 sourceId 也指定了，必须在白名单内才有效，否则强制空结果
+  if (Array.isArray(allowedSourceIds) && allowedSourceIds.length > 0) {
+    if (sourceId && !allowedSourceIds.includes(Number(sourceId))) {
+      return {
+        total: 0, page, pageSize, items: [],
+        capped: false, cap_limit: Number(cap) || 0,
+        processing_ms: 0, engine: 'mysql_scope_block'
+      };
+    }
+    where.push(`r.source_id IN (${allowedSourceIds.map(() => '?').join(',')})`);
+    params.push(...allowedSourceIds);
+  }
   const whereSql = 'WHERE ' + where.join(' AND ');
 
-  const [[countRow]] = await pool.query(
-    `SELECT COUNT(*) AS total FROM resources r ${whereSql}`,
-    params
-  );
-  const total = Number(countRow.total || 0);
+  // cap > 0 时走"截顶 COUNT"：用子查询 LIMIT cap 包一层，最多 count 到 cap+1 行
+  // 这样关键词命中 50w 也只走索引扫前 cap+1 条，COUNT 几十毫秒内回；
+  // 真有更多结果时返回 capped=true 让前端能提示
+  const capN = Math.max(0, Number(cap) || 0);
+  let total;
+  let capped = false;
+  if (capN > 0) {
+    const [[countRow]] = await pool.query(
+      `SELECT COUNT(*) AS total FROM (
+         SELECT 1 FROM resources r ${whereSql} LIMIT ?
+       ) AS sub`,
+      [...params, capN + 1]
+    );
+    total = Number(countRow.total || 0);
+    if (total > capN) { total = capN; capped = true; }
+  } else {
+    const [[countRow]] = await pool.query(
+      `SELECT COUNT(*) AS total FROM resources r ${whereSql}`,
+      params
+    );
+    total = Number(countRow.total || 0);
+  }
 
   // 排序：有关键词时按 FULLTEXT 相关度，没关键词按 id DESC
   const orderSql = useFulltext
     ? 'ORDER BY MATCH(r.file_name) AGAINST(? IN BOOLEAN MODE) DESC, r.id DESC'
     : 'ORDER BY r.id DESC';
   const orderParams = useFulltext ? [params[0]] : [];
+
+  // 分页超过 cap 时直接返回空（前端不该翻到那里，也别让 OFFSET 浪费 IO）
+  if (capN > 0 && offset >= capN) {
+    return {
+      total, page, pageSize, items: [],
+      capped, cap_limit: capN,
+      processing_ms: 0, engine: useFulltext ? 'mysql_fulltext' : 'mysql_like'
+    };
+  }
+  // pageSize 不能跨过 cap 边界
+  const effectiveLimit = capN > 0 ? Math.min(pageSize, capN - offset) : pageSize;
 
   const t0 = Date.now();
   const [rows] = await pool.query(
@@ -64,7 +106,7 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
        ${whereSql}
        ${orderSql}
       LIMIT ? OFFSET ?`,
-    [...params, ...orderParams, pageSize, offset]
+    [...params, ...orderParams, effectiveLimit, offset]
   );
   const tookMs = Date.now() - t0;
 
@@ -73,6 +115,8 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
     page,
     pageSize,
     items: rows,
+    capped,
+    cap_limit: capN,
     processing_ms: tookMs,
     engine: useFulltext ? 'mysql_fulltext' : 'mysql_like'
   };
@@ -175,8 +219,8 @@ async function reconcileDeletedAfterRun(sourceId, runStartedAt) {
   return { marked: r.affectedRows || 0 };
 }
 
-async function listResources({ page = 1, pageSize = 50, sourceId = null } = {}) {
-  return searchResources({ q: '', page, pageSize, sourceId });
+async function listResources({ page = 1, pageSize = 50, sourceId = null, allowedSourceIds = null, cap = 0 } = {}) {
+  return searchResources({ q: '', page, pageSize, sourceId, allowedSourceIds, cap });
 }
 
 async function deleteResource(id) {

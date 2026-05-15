@@ -124,8 +124,9 @@ function dashboard() {
     syncRate: {},            // { [sourceId]: 文件/秒 } 由前端按差分算
     panelDismissed: {},      // { [sourceId]: true } 用户点 × 隐藏掉这条结束态卡片，下次 syncSource 时清掉
     _syncStatusTimers: {},   // { [sourceId]: setInterval handle } 不会被 Alpine 反应式追踪
-    keyModal: { open: false, name: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', expireDays: 30, result: '' },
-    keyEditModal: { open: false, id: null, name: '', key_prefix: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', expireText: '', addDays: 30, extendMsg: '' },
+    keyModal: { open: false, name: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, maxResults: 1000, allowedSourceIds: [], remark: '', expireDays: 30, result: '' },
+    keyEditModal: { open: false, id: null, name: '', key_prefix: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, maxResults: 1000, allowedSourceIds: [], remark: '', expireText: '', addDays: 30, extendMsg: '' },
+    sourcesLite: [],  // [{id, title}] 用于"签发/编辑 Key"弹窗里的库勾选
     linkModal: { open: false, fileName: '', url: '', expireText: '', cached: false, loading: false, error: '', detail: '' },
     errorModal: { open: false, title: '', message: '', detail: '' },
     batchResolve: { running: false, total: 0, done: 0, success: 0, failed: 0, canceled: false, summary: false, sources: 0 },
@@ -229,7 +230,7 @@ function dashboard() {
           _linkError: '',
           _linkMs: 0
         }));
-        this.resList = { items, total: d.total || 0 };
+        this.resList = { items, total: d.total || 0, capped: !!d.capped };
       } catch (e) { this.notify(e.message, 'error'); }
       finally { this.tabLoading.resources = false; }
     },
@@ -402,6 +403,11 @@ function dashboard() {
     dismissSyncPanel(sourceId) {
       this.panelDismissed[sourceId] = true;
     },
+    // 重新显示上次扫描详情卡（用户点过 × 之后想再看）
+    showSyncPanel(sourceId) {
+      delete this.panelDismissed[sourceId];
+      this.refreshSyncStatus(sourceId);
+    },
     // 兼容旧调用
     async checkSource(id) { return this.testSource(id); },
 
@@ -543,7 +549,8 @@ function dashboard() {
       finally { this.tabLoading.apikeys = false; }
     },
     openKeyModal() {
-      this.keyModal = { open: true, name: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, remark: '', expireDays: 30, result: '' };
+      this.keyModal = { open: true, name: '', dailyLimit: 0, totalLimit: 0, ratePerMin: 60, maxResults: 1000, allowedSourceIds: [], remark: '', expireDays: 30, result: '' };
+      this.loadSourcesLite();
     },
     closeKeyModal() {
       this.keyModal.open = false;
@@ -551,7 +558,12 @@ function dashboard() {
     },
     async saveKey() {
       try {
-        const d = await api('/api-keys', { method: 'POST', body: this.keyModal });
+        const body = {
+          ...this.keyModal,
+          // 后端按数字数组反解，发空数组等价于"全部库"
+          allowedSourceIds: (this.keyModal.allowedSourceIds || []).map((x) => Number(x))
+        };
+        const d = await api('/api-keys', { method: 'POST', body });
         this.keyModal.result = d.item.plain_key;
         this.notify('已签发');
       } catch (e) { this.showError('签发失败', e); }
@@ -570,11 +582,16 @@ function dashboard() {
         dailyLimit: Number(k.daily_limit || 0),
         totalLimit: Number(k.total_limit || 0),
         ratePerMin: Number(k.rate_per_min || 60),
+        maxResults: Number(k.max_results || 1000),
+        allowedSourceIds: k.allowed_source_ids
+          ? String(k.allowed_source_ids).split(',').map((s) => Number(s.trim())).filter(Boolean)
+          : [],
         remark: k.remark || '',
         expireText,
         addDays: 30,
         extendMsg: ''
       };
+      this.loadSourcesLite();
     },
     async saveKeyEdit() {
       const m = this.keyEditModal;
@@ -583,6 +600,8 @@ function dashboard() {
         dailyLimit: m.dailyLimit,
         totalLimit: m.totalLimit,
         ratePerMin: m.ratePerMin,
+        maxResults: m.maxResults,
+        allowedSourceIds: (m.allowedSourceIds || []).map((x) => Number(x)),
         remark: m.remark
       };
       try {
@@ -591,6 +610,16 @@ function dashboard() {
         this.notify('已保存');
         this.loadApiKeys();
       } catch (e) { this.showError('保存失败', e); }
+    },
+    async loadSourcesLite() {
+      // 缓存一下：弹窗反复打开不重复请求
+      if (this.sourcesLite && this.sourcesLite.length) return;
+      try {
+        const d = await api('/sources-lite');
+        this.sourcesLite = d.items || [];
+      } catch (_) {
+        this.sourcesLite = [];
+      }
     },
     async doExtend() {
       const m = this.keyEditModal;
