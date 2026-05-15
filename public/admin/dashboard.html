@@ -478,6 +478,118 @@
         </div>
       </section>
 
+      <!-- 数据清理（去重 + 格式过滤） -->
+      <section x-show="tab === 'cleanup'" x-transition>
+        <div class="bg-gradient-to-br from-rose-600 via-pink-600 to-fuchsia-600 rounded-2xl p-6 mb-6 text-white shadow-xl">
+          <h2 class="text-2xl font-bold">数据清理</h2>
+          <p class="text-sm text-rose-100 mt-2">扫盘后跑这里：按规则去重、按扩展名过滤。所有操作都是软删除（is_deleted=1），可一键撤销。</p>
+        </div>
+
+        <div class="bg-white rounded-xl border border-slate-100 p-5 mb-6">
+          <div class="grid lg:grid-cols-3 gap-4">
+            <label class="block">
+              <span class="text-sm text-slate-600">选择规则</span>
+              <select x-model.number="cleanup.runForm.ruleId" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 bg-white">
+                <option :value="0">— 选择 —</option>
+                <template x-for="r in cleanup.rules" :key="r.id"><option :value="r.id" x-text="(r.enabled ? '' : '(禁用) ') + r.name"></option></template>
+              </select>
+            </label>
+            <div>
+              <span class="text-sm text-slate-600">范围</span>
+              <div class="mt-1 border border-slate-200 rounded-lg p-2 max-h-32 overflow-y-auto">
+                <label class="flex items-center gap-2 px-2 py-1 text-xs text-slate-500"><input type="checkbox" :checked="!cleanup.runForm.scopeSourceIds.length" @change="cleanup.runForm.scopeSourceIds = []"><span>所有库</span></label>
+                <template x-for="s in sourcesLite" :key="s.id">
+                  <label class="flex items-center gap-2 px-2 py-1 hover:bg-slate-50 rounded"><input type="checkbox" :value="s.id" x-model="cleanup.runForm.scopeSourceIds" class="rounded"><span class="text-xs text-slate-400" x-text="'#' + s.id"></span><span class="text-sm" x-text="s.title"></span></label>
+                </template>
+              </div>
+            </div>
+            <div class="space-y-3">
+              <label class="flex items-center gap-2 text-sm"><input type="checkbox" x-model="cleanup.runForm.crossSource" class="rounded"><span>跨库去重 <span class="text-xs text-slate-400">（合并不同网盘的同一份资源）</span></span></label>
+              <div class="flex gap-2">
+                <button @click="runCleanupDry" :disabled="!cleanup.runForm.ruleId || cleanup.busy" class="flex-1 px-3 py-2 rounded-lg bg-amber-500 hover:bg-amber-600 text-white text-sm disabled:opacity-50">试运行（不删）</button>
+                <button @click="runCleanupApply" :disabled="!cleanup.runForm.ruleId || cleanup.busy" class="flex-1 px-3 py-2 rounded-lg bg-rose-600 hover:bg-rose-700 text-white text-sm disabled:opacity-50">立即执行</button>
+              </div>
+              <p class="text-xs text-slate-400">建议先试运行看样例，确认无误再执行</p>
+            </div>
+          </div>
+
+          <template x-if="cleanup.lastResult">
+            <div class="mt-5 border-t border-slate-100 pt-4">
+              <div class="flex flex-wrap gap-4 text-sm">
+                <span><span class="text-slate-500">扫描：</span><b x-text="cleanup.lastResult.total_examined"></b></span>
+                <span><span class="text-slate-500">格式过滤：</span><b class="text-rose-600" x-text="cleanup.lastResult.removed_by_format"></b></span>
+                <span><span class="text-slate-500">去重删除：</span><b class="text-rose-600" x-text="cleanup.lastResult.removed_by_dedupe"></b></span>
+                <span><span class="text-slate-500">合计：</span><b class="text-rose-700" x-text="cleanup.lastResult.total_removed"></b></span>
+                <span class="px-2 py-0.5 rounded text-xs" :class="cleanup.lastResult.dry_run ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700'" x-text="cleanup.lastResult.dry_run ? '试运行' : '已执行'"></span>
+              </div>
+              <template x-if="cleanup.lastResult.samples && cleanup.lastResult.samples.length">
+                <div class="mt-3">
+                  <div class="text-xs text-slate-500 mb-1">样例（最多 50 条）：</div>
+                  <div class="border border-slate-100 rounded-lg max-h-72 overflow-y-auto bg-slate-50">
+                    <table class="w-full text-xs">
+                      <tr class="bg-slate-100 text-slate-500"><th class="px-2 py-1 text-left">原因</th><th class="px-2 py-1">来源</th><th class="px-2 py-1 text-left">文件名</th><th class="px-2 py-1">分组键 / 分</th></tr>
+                      <template x-for="s in cleanup.lastResult.samples" :key="s.id">
+                        <tr class="border-t border-slate-100">
+                          <td class="px-2 py-1"><span class="px-1.5 py-0.5 rounded text-xs" :class="s.reason === 'format' ? 'bg-orange-100 text-orange-700' : 'bg-purple-100 text-purple-700'" x-text="s.reason === 'format' ? '格式' : '去重'"></span></td>
+                          <td class="px-2 py-1 text-center text-slate-400" x-text="'#' + s.source_id"></td>
+                          <td class="px-2 py-1 text-slate-700" x-text="s.file_name"></td>
+                          <td class="px-2 py-1 text-slate-400 truncate max-w-xs" :title="s.group_key || s.ext" x-text="s.reason === 'dedupe' ? (s.group_key + ' · ' + s.score + '分') : ('.' + s.ext)"></td>
+                        </tr>
+                      </template>
+                    </table>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
+
+        <div class="bg-white rounded-xl border border-slate-100 p-5 mb-6">
+          <div class="flex items-center justify-between mb-3"><h3 class="font-semibold">清理规则</h3><button @click="openCleanupRuleModal()" class="px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-700 text-white text-sm">+ 新建规则</button></div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="px-3 py-2 text-left">名称</th><th class="px-3 py-2 text-left">说明</th><th class="px-3 py-2">类型</th><th class="px-3 py-2">状态</th><th class="px-3 py-2 text-right">操作</th></tr></thead>
+              <tbody class="divide-y divide-slate-100">
+                <template x-for="r in cleanup.rules" :key="r.id">
+                  <tr>
+                    <td class="px-3 py-2 font-medium" x-text="r.name"></td>
+                    <td class="px-3 py-2 text-slate-500 text-xs" x-text="r.description || '-'"></td>
+                    <td class="px-3 py-2 text-center text-xs"><span class="text-slate-500" x-text="ruleTypeOf(r)"></span></td>
+                    <td class="px-3 py-2 text-center"><span class="px-2 py-0.5 rounded-full text-xs" :class="r.enabled ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-200 text-slate-500'" x-text="r.enabled ? '启用' : '禁用'"></span></td>
+                    <td class="px-3 py-2 text-right"><button @click="openCleanupRuleModal(r)" class="text-blue-600 hover:underline text-xs mr-2">编辑</button><button @click="duplicateCleanupRule(r)" class="text-slate-500 hover:underline text-xs mr-2">复制</button><button @click="deleteCleanupRule(r)" class="text-rose-500 hover:underline text-xs">删除</button></td>
+                  </tr>
+                </template>
+                <template x-if="!cleanup.rules.length"><tr><td colspan="5" class="px-3 py-8 text-center text-slate-400 text-sm">还没有规则，点右上角新建</td></tr></template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="bg-white rounded-xl border border-slate-100 p-5">
+          <div class="flex items-center justify-between mb-3"><h3 class="font-semibold">运行历史</h3><button @click="loadCleanupRuns" class="px-3 py-1 rounded border border-slate-200 text-xs">刷新</button></div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="px-3 py-2 text-left">规则</th><th class="px-3 py-2">范围</th><th class="px-3 py-2">模式</th><th class="px-3 py-2">扫描</th><th class="px-3 py-2">删除</th><th class="px-3 py-2">耗时</th><th class="px-3 py-2">状态</th><th class="px-3 py-2 text-right">操作</th></tr></thead>
+              <tbody class="divide-y divide-slate-100">
+                <template x-for="run in cleanup.runs" :key="run.id">
+                  <tr>
+                    <td class="px-3 py-2" x-text="run.rule_name_snapshot"></td>
+                    <td class="px-3 py-2 text-center text-xs text-slate-500" x-text="run.scope_source_ids ? (run.scope_source_ids.split(',').length + ' 个库') : '全部'"></td>
+                    <td class="px-3 py-2 text-center text-xs"><span class="px-1.5 py-0.5 rounded" :class="run.dry_run ? 'bg-amber-100 text-amber-700' : 'bg-rose-100 text-rose-700'" x-text="run.dry_run ? '试运行' : '执行'"></span><span x-show="run.cross_source" class="ml-1 px-1.5 py-0.5 rounded bg-purple-100 text-purple-700">跨库</span></td>
+                    <td class="px-3 py-2 text-center text-slate-500" x-text="run.total_examined"></td>
+                    <td class="px-3 py-2 text-center text-rose-600" x-text="(run.removed_by_format + run.removed_by_dedupe)"></td>
+                    <td class="px-3 py-2 text-center text-xs text-slate-500" x-text="durationOf(run)"></td>
+                    <td class="px-3 py-2 text-center text-xs"><span class="px-1.5 py-0.5 rounded" :class="{'bg-emerald-100 text-emerald-700': run.status==='completed', 'bg-rose-100 text-rose-700': run.status==='failed', 'bg-slate-200 text-slate-500': run.status==='undone', 'bg-blue-100 text-blue-700': run.status==='running'}" x-text="run.status"></span></td>
+                    <td class="px-3 py-2 text-right"><button x-show="run.status==='completed' && !run.dry_run" @click="undoCleanupRun(run.id)" class="text-rose-500 hover:underline text-xs">撤销</button></td>
+                  </tr>
+                </template>
+                <template x-if="!cleanup.runs.length"><tr><td colspan="8" class="px-3 py-8 text-center text-slate-400 text-sm">还没有运行历史</td></tr></template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
       <!-- 使用文档 -->
       <section x-show="tab === 'docs'" x-transition>
         <div class="bg-gradient-to-br from-blue-600 via-indigo-600 to-purple-600 rounded-2xl p-6 mb-6 text-white shadow-xl">
@@ -842,6 +954,40 @@
         <button @click="linkModal.open = false" class="px-4 py-2 rounded-lg border border-slate-200 text-sm">关闭</button>
         <a x-show="!linkModal.loading && !linkModal.error" :href="linkModal.url" target="_blank" rel="noopener" class="px-4 py-2 rounded-lg border border-slate-200 hover:bg-slate-50 text-sm">新窗打开</a>
         <button x-show="!linkModal.loading && !linkModal.error" @click="copyDirectLink" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm">复制链接</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 清理规则编辑弹窗 -->
+  <div x-show="cleanupRuleModal.open" x-transition class="fixed inset-0 bg-black/50 flex items-center justify-center z-40 p-4" @click.self="cleanupRuleModal.open = false">
+    <div class="bg-white rounded-xl w-full max-w-2xl p-6 max-h-[90vh] overflow-y-auto">
+      <h3 class="font-bold text-lg mb-4" x-text="cleanupRuleModal.id ? '编辑规则' : '新建规则'"></h3>
+      <div class="space-y-3 text-sm">
+        <div class="grid grid-cols-2 gap-3">
+          <label class="block"><span class="text-slate-600">名称 *</span><input x-model="cleanupRuleModal.name" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200" placeholder="如: 小说去重"></label>
+          <label class="flex items-end gap-2"><input type="checkbox" x-model="cleanupRuleModal.enabled" class="rounded mb-2.5"><span class="text-slate-600 mb-2">启用</span></label>
+        </div>
+        <label class="block"><span class="text-slate-600">说明</span><input x-model="cleanupRuleModal.description" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200" placeholder="一句话描述这条规则"></label>
+        <div>
+          <div class="text-slate-600 mb-1">规则模板</div>
+          <div class="flex flex-wrap gap-2">
+            <button type="button" @click="loadCleanupTemplate('novel')" class="px-2 py-1 rounded border border-slate-200 hover:bg-slate-50 text-xs">小说去重</button>
+            <button type="button" @click="loadCleanupTemplate('exact')" class="px-2 py-1 rounded border border-slate-200 hover:bg-slate-50 text-xs">同名去重（精确）</button>
+            <button type="button" @click="loadCleanupTemplate('whitelist')" class="px-2 py-1 rounded border border-slate-200 hover:bg-slate-50 text-xs">仅保留常见格式</button>
+            <button type="button" @click="loadCleanupTemplate('blacklist')" class="px-2 py-1 rounded border border-slate-200 hover:bg-slate-50 text-xs">删除垃圾扩展名</button>
+            <button type="button" @click="loadCleanupTemplate('empty')" class="px-2 py-1 rounded border border-slate-200 hover:bg-slate-50 text-xs">清空</button>
+          </div>
+        </div>
+        <label class="block">
+          <span class="text-slate-600">配置 JSON *</span>
+          <textarea x-model="cleanupRuleModal.configText" rows="14" spellcheck="false" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 font-mono text-xs"></textarea>
+          <span class="text-xs text-rose-500" x-show="cleanupRuleModal.parseError" x-text="cleanupRuleModal.parseError"></span>
+          <span class="text-xs text-slate-400 block">字段参考见 docs/cleanup-rules.md</span>
+        </label>
+      </div>
+      <div class="mt-5 flex justify-end gap-2">
+        <button @click="cleanupRuleModal.open = false" class="px-4 py-2 rounded-lg border border-slate-200 text-sm">取消</button>
+        <button @click="saveCleanupRule" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm">保存</button>
       </div>
     </div>
   </div>

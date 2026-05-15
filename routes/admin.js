@@ -16,6 +16,7 @@ const {
 const {
   createApiKey, updateApiKey, extendExpire, listApiKeys, disableApiKey, enableApiKey, deleteApiKey
 } = require('../services/apiKeyService');
+const cleanupService = require('../services/cleanupService');
 
 const router = express.Router();
 
@@ -270,6 +271,56 @@ router.get('/call-logs', asyncHandler(async (req, res) => {
     [limit]
   );
   res.json({ code: 200, items: rows });
+}));
+
+// ---------- 数据清理（去重 + 格式过滤） ----------
+router.get('/cleanup/rules', asyncHandler(async (req, res) => {
+  const items = await cleanupService.listRules();
+  res.json({ code: 200, items });
+}));
+router.get('/cleanup/rules/:id', asyncHandler(async (req, res) => {
+  const item = await cleanupService.getRule(Number(req.params.id));
+  if (!item) return res.status(404).json({ code: 404, message: '规则不存在' });
+  res.json({ code: 200, item });
+}));
+router.post('/cleanup/rules', adminRequired, asyncHandler(async (req, res) => {
+  const { name, description, config, enabled } = req.body || {};
+  const item = await cleanupService.createRule({ name, description, config, enabled });
+  res.json({ code: 200, message: '已创建', item });
+}));
+router.patch('/cleanup/rules/:id', adminRequired, asyncHandler(async (req, res) => {
+  const item = await cleanupService.updateRule(Number(req.params.id), req.body || {});
+  res.json({ code: 200, message: '已保存', item });
+}));
+router.delete('/cleanup/rules/:id', adminRequired, asyncHandler(async (req, res) => {
+  await cleanupService.deleteRule(Number(req.params.id));
+  res.json({ code: 200, message: '已删除' });
+}));
+
+// 试运行 / 立即执行：dry_run 字段控制
+router.post('/cleanup/run', adminRequired, asyncHandler(async (req, res) => {
+  const { ruleId, scopeSourceIds, crossSource, dryRun } = req.body || {};
+  if (!ruleId) return res.status(400).json({ code: 400, message: 'ruleId 必填' });
+  const result = await cleanupService.runCleanup({
+    ruleId: Number(ruleId),
+    scopeSourceIds: Array.isArray(scopeSourceIds) ? scopeSourceIds : [],
+    crossSource: !!crossSource,
+    dryRun: dryRun !== false  // 默认 dry-run，明确传 false 才真删
+  });
+  res.json({ code: 200, message: dryRun === false ? '已执行' : '试运行完成', ...result });
+}));
+
+router.get('/cleanup/runs', asyncHandler(async (req, res) => {
+  const items = await cleanupService.listRuns({ limit: req.query.limit });
+  res.json({ code: 200, items });
+}));
+router.get('/cleanup/runs/:id/samples', asyncHandler(async (req, res) => {
+  const items = await cleanupService.getRunSamples(Number(req.params.id), req.query.limit);
+  res.json({ code: 200, items });
+}));
+router.post('/cleanup/runs/:id/undo', adminRequired, asyncHandler(async (req, res) => {
+  await cleanupService.undoRun(Number(req.params.id));
+  res.json({ code: 200, message: '已撤销，被删行已恢复' });
 }));
 
 module.exports = router;
