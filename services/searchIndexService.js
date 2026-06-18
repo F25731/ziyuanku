@@ -15,6 +15,14 @@ let ensured = false;
 let disabledUntil = 0;
 let lastError = '';
 
+const INDEX_SETTINGS = {
+  displayedAttributes: ['id', 'file_name', 'source_id', 'file_type'],
+  searchableAttributes: ['file_name'],
+  filterableAttributes: ['source_id', 'file_type'],
+  sortableAttributes: ['id'],
+  pagination: { maxTotalHits: Math.max(1000, Number(process.env.MEILI_MAX_TOTAL_HITS || 20000)) }
+};
+
 function isEnabled() {
   return ENGINE === 'meilisearch' && !!BASE_URL;
 }
@@ -172,7 +180,7 @@ async function waitTask(taskUid) {
     if (data.status === 'failed' || data.status === 'canceled') {
       throw new Error(data.error && data.error.message || `Meilisearch task ${data.status}`);
     }
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    await new Promise((resolve) => setTimeout(resolve, 1000));
   }
   throw new Error(`Meilisearch task ${taskUid} timed out after ${TASK_TIMEOUT_MS}ms`);
 }
@@ -206,14 +214,10 @@ async function ensureIndex() {
       const { data } = await c.post('/indexes', { uid: INDEX, primaryKey: 'id' });
       await waitTask(data.taskUid);
     }
-    const settingsTask = await c.patch(`/indexes/${encodeURIComponent(INDEX)}/settings`, {
-      displayedAttributes: ['id', 'file_name', 'source_id', 'file_type'],
-      searchableAttributes: ['file_name'],
-      filterableAttributes: ['source_id', 'file_type'],
-      sortableAttributes: ['id'],
-      pagination: { maxTotalHits: Math.max(1000, Number(process.env.MEILI_MAX_TOTAL_HITS || 20000)) }
-    });
-    await waitTask(settingsTask.data && settingsTask.data.taskUid);
+    if (!exists || String(process.env.MEILI_ENSURE_SETTINGS || '0') === '1') {
+      const settingsTask = await c.patch(`/indexes/${encodeURIComponent(INDEX)}/settings`, INDEX_SETTINGS);
+      await waitTask(settingsTask.data && settingsTask.data.taskUid);
+    }
     ensured = true;
     return true;
   } catch (err) {
