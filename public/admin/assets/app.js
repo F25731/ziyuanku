@@ -882,6 +882,28 @@ function dashboard() {
         this.showError('重试失败队列失败', e);
       }
     },
+    async deleteSearchIndexJob(job) {
+      if (!job || !job.id) return;
+      if (['queued', 'running'].includes(job.status)) return;
+      if (!confirm('删除这条索引任务历史？')) return;
+      try {
+        const d = await api('/search/jobs/' + job.id, { method: 'DELETE' });
+        this.notify(d.message || '已删除');
+        await this.loadSearchIndexStatus(true);
+      } catch (e) {
+        this.showError('删除索引任务历史失败', e);
+      }
+    },
+    async clearSearchIndexJobs() {
+      if (!confirm('清空已完成、失败、暂停的索引任务历史？运行中的任务会保留。')) return;
+      try {
+        const d = await api('/search/jobs', { method: 'DELETE' });
+        this.notify((d.message || '已清空') + '：' + (d.deleted || 0) + ' 条');
+        await this.loadSearchIndexStatus(true);
+      } catch (e) {
+        this.showError('清空索引任务历史失败', e);
+      }
+    },
 
     // ---------- 数据清理 ----------
     async loadCleanupRules() {

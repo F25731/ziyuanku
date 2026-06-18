@@ -347,9 +347,12 @@
         </div>
 
         <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
-          <div class="p-4 border-b border-slate-100 flex items-center justify-between">
-            <h3 class="font-semibold text-slate-700">任务历史</h3>
-            <span class="text-xs text-slate-400">失败或暂停的任务可断点继续</span>
+          <div class="p-4 border-b border-slate-100 flex items-center justify-between gap-3">
+            <div>
+              <h3 class="font-semibold text-slate-700">任务历史</h3>
+              <span class="text-xs text-slate-400">失败或暂停的任务可断点继续；运行中的任务不会被清空</span>
+            </div>
+            <button @click="clearSearchIndexJobs()" class="px-3 py-1.5 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 text-xs">清空历史</button>
           </div>
           <div class="overflow-x-auto">
             <table class="w-full text-sm min-w-[760px]">
@@ -367,8 +370,9 @@
                     <td class="px-4 py-3 text-center" x-text="j.total_indexed"></td>
                     <td class="px-4 py-3 max-w-xs truncate text-rose-600" :title="j.last_error || ''" x-text="j.last_error || '-'"></td>
                     <td class="px-4 py-3 text-right">
-                      <button x-show="['paused','failed'].includes(j.status)" @click="resumeSearchIndexJob(j)" class="text-emerald-600 hover:text-emerald-700 text-xs">继续</button>
-                      <span x-show="!['paused','failed'].includes(j.status)" class="text-slate-300 text-xs">-</span>
+                      <button x-show="['paused','failed'].includes(j.status)" @click="resumeSearchIndexJob(j)" class="text-emerald-600 hover:text-emerald-700 text-xs mr-3">继续</button>
+                      <button x-show="!['queued','running'].includes(j.status)" @click="deleteSearchIndexJob(j)" class="text-rose-500 hover:text-rose-600 text-xs">删除</button>
+                      <span x-show="['queued','running'].includes(j.status)" class="text-slate-300 text-xs">-</span>
                     </td>
                   </tr>
                 </template>

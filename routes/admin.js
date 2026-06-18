@@ -127,6 +127,16 @@ router.post('/search/jobs/:id/resume', adminRequired, asyncHandler(async (req, r
   });
 }));
 
+router.delete('/search/jobs/:id', adminRequired, asyncHandler(async (req, res) => {
+  const result = await searchIndexJobService.deleteJob(Number(req.params.id));
+  res.json({ code: 200, message: '索引任务历史已删除', ...result });
+}));
+
+router.delete('/search/jobs', adminRequired, asyncHandler(async (req, res) => {
+  const result = await searchIndexJobService.clearJobs();
+  res.json({ code: 200, message: '索引任务历史已清空', ...result });
+}));
+
 router.post('/search/outbox/retry-failed', adminRequired, asyncHandler(async (req, res) => {
   const result = await searchIndexJobService.retryFailedOutbox();
   res.json({ code: 200, message: '已重置失败队列', ...result });

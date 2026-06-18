@@ -130,6 +130,26 @@ async function pauseJob(id) {
   return getJob(id);
 }
 
+async function deleteJob(id) {
+  const job = await getJob(id);
+  if (!job) return { deleted: 0 };
+  if (['queued', 'running'].includes(job.status) || running.has(Number(id))) {
+    throw new Error('running search index job cannot be deleted; pause it first');
+  }
+  const [r] = await pool.query(
+    "DELETE FROM search_index_jobs WHERE id=? AND status NOT IN ('queued','running')",
+    [Number(id)]
+  );
+  return { deleted: r.affectedRows || 0 };
+}
+
+async function clearJobs() {
+  const [r] = await pool.query(
+    "DELETE FROM search_index_jobs WHERE status NOT IN ('queued','running')"
+  );
+  return { deleted: r.affectedRows || 0 };
+}
+
 async function runJob(id) {
   id = Number(id);
   if (running.has(id)) return;
@@ -303,6 +323,8 @@ module.exports = {
   createJob,
   resumeJob,
   pauseJob,
+  deleteJob,
+  clearJobs,
   getJob,
   listJobs,
   getStatus,
