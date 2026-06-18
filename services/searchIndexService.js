@@ -101,8 +101,27 @@ function toDoc(row) {
 }
 
 async function sql(query) {
-  const { data } = await client().post('/sql', { query });
-  return data;
+  const c = client();
+  try {
+    const body = new URLSearchParams({ query }).toString();
+    const { data } = await c.post('/sql', body, {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+    });
+    return data;
+  } catch (firstErr) {
+    try {
+      const { data } = await c.get('/sql', { params: { query } });
+      return data;
+    } catch (_) {
+      try {
+        const { data } = await c.post('/sql', { query });
+        return data;
+      } catch (lastErr) {
+        if (!lastErr.message && firstErr.message) lastErr.message = firstErr.message;
+        throw lastErr;
+      }
+    }
+  }
 }
 
 async function waitUntilReady(timeoutMs = 60000) {
