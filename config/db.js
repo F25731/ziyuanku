@@ -7,7 +7,7 @@ const pool = mysql.createPool({
   password: process.env.DB_PASSWORD || '',
   database: process.env.DB_NAME || 'lanzou_hub',
   waitForConnections: true,
-  connectionLimit: 15,
+  connectionLimit: Math.max(5, Number(process.env.DB_POOL_LIMIT || 30)),
   queueLimit: 0,
   charset: 'utf8mb4',
   timezone: '+08:00',

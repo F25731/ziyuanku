@@ -9,6 +9,7 @@ const morgan = require('morgan');
 const { testDbConnection } = require('./config/db');
 const { runMigrations } = require('./scripts/run_migrations');
 const { ensureAdminUser } = require('./services/userService');
+const { flushCallLogs } = require('./services/apiKeyService');
 
 const v1Router = require('./routes/v1');
 const adminRouter = require('./routes/admin');
@@ -51,3 +52,16 @@ start().catch((err) => {
   console.error('[FATAL] Startup failed:', err);
   process.exit(1);
 });
+
+async function shutdown(signal) {
+  try {
+    await flushCallLogs();
+  } catch (err) {
+    console.warn('[shutdown] flushCallLogs failed:', err.message);
+  } finally {
+    process.exit(0);
+  }
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

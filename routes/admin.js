@@ -17,6 +17,7 @@ const {
   createApiKey, updateApiKey, extendExpire, listApiKeys, disableApiKey, enableApiKey, deleteApiKey
 } = require('../services/apiKeyService');
 const cleanupService = require('../services/cleanupService');
+const statsService = require('../services/statsService');
 
 const router = express.Router();
 
@@ -40,35 +41,12 @@ router.post('/change-password', asyncHandler(async (req, res) => {
 
 // ---------- 仪表盘 ----------
 router.get('/stats', asyncHandler(async (req, res) => {
-  const [[u]] = await pool.query("SELECT COUNT(*) AS total FROM users WHERE status=1");
-  const [[s]] = await pool.query("SELECT COUNT(*) AS total FROM sources WHERE status=1");
-  const [[r]] = await pool.query("SELECT COUNT(*) AS total FROM resources WHERE is_deleted=0");
-  const [[k]] = await pool.query("SELECT COUNT(*) AS total FROM api_keys WHERE status=1");
-  const [[c24]] = await pool.query(
-    "SELECT COUNT(*) AS total FROM api_call_logs WHERE created_at >= DATE_SUB(NOW(), INTERVAL 1 DAY)"
-  );
-  const [[cToday]] = await pool.query(
-    "SELECT COUNT(*) AS total FROM api_call_logs WHERE created_at >= CURDATE()"
-  );
-  res.json({
-    code: 200,
-    users: Number(u.total),
-    sources: Number(s.total),
-    resources: Number(r.total),
-    api_keys: Number(k.total),
-    calls_24h: Number(c24.total),
-    calls_today: Number(cToday.total)
-  });
+  const stats = await statsService.getDashboardStats();
+  res.json({ code: 200, ...stats });
 }));
 
 router.get('/stats/call-trend', asyncHandler(async (req, res) => {
-  const [rows] = await pool.query(
-    `SELECT DATE_FORMAT(created_at, '%Y-%m-%d') AS day, COUNT(*) AS total
-       FROM api_call_logs
-      WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 14 DAY)
-      GROUP BY day
-      ORDER BY day ASC`
-  );
+  const rows = await statsService.getCallTrend();
   res.json({ code: 200, items: rows });
 }));
 

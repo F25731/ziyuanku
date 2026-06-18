@@ -14,10 +14,12 @@ function buildBooleanQuery(q) {
   return safe.map((t) => `+${t}*`).join(' '); // 每个词必须出现，前缀通配
 }
 
-async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = null, allowedSourceIds = null, cap = 0 }) {
+async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = null, allowedSourceIds = null, cap = 0, cursor = null }) {
   page = Math.max(1, Number(page) || 1);
   pageSize = Math.min(100, Math.max(1, Number(pageSize) || 20));
-  const offset = (page - 1) * pageSize;
+  const cursorId = Number(cursor) > 0 ? Number(cursor) : null;
+  const useCursor = !!cursorId;
+  const offset = useCursor ? 0 : (page - 1) * pageSize;
   q = String(q || '').trim();
 
   const where = ['r.is_deleted = 0'];
@@ -48,11 +50,16 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
       return {
         total: 0, page, pageSize, items: [],
         capped: false, cap_limit: Number(cap) || 0,
-        processing_ms: 0, engine: 'mysql_scope_block'
+        processing_ms: 0, engine: 'mysql_scope_block',
+        next_cursor: null, has_more: false
       };
     }
     where.push(`r.source_id IN (${allowedSourceIds.map(() => '?').join(',')})`);
     params.push(...allowedSourceIds);
+  }
+  if (useCursor) {
+    where.push('r.id < ?');
+    params.push(cursorId);
   }
   const whereSql = 'WHERE ' + where.join(' AND ');
 
@@ -62,7 +69,9 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
   const capN = Math.max(0, Number(cap) || 0);
   let total;
   let capped = false;
-  if (capN > 0) {
+  if (useCursor) {
+    total = null;
+  } else if (capN > 0) {
     const [[countRow]] = await pool.query(
       `SELECT COUNT(*) AS total FROM (
          SELECT 1 FROM resources r ${whereSql} LIMIT ?
@@ -81,16 +90,17 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
 
   // 排序：有关键词时按 FULLTEXT 相关度，没关键词按 id DESC
   const orderSql = useFulltext
-    ? 'ORDER BY MATCH(r.file_name) AGAINST(? IN BOOLEAN MODE) DESC, r.id DESC'
+    ? (useCursor ? 'ORDER BY r.id DESC' : 'ORDER BY MATCH(r.file_name) AGAINST(? IN BOOLEAN MODE) DESC, r.id DESC')
     : 'ORDER BY r.id DESC';
-  const orderParams = useFulltext ? [params[0]] : [];
+  const orderParams = useFulltext && !useCursor ? [params[0]] : [];
 
   // 分页超过 cap 时直接返回空（前端不该翻到那里，也别让 OFFSET 浪费 IO）
-  if (capN > 0 && offset >= capN) {
+  if (!useCursor && capN > 0 && offset >= capN) {
     return {
       total, page, pageSize, items: [],
       capped, cap_limit: capN,
-      processing_ms: 0, engine: useFulltext ? 'mysql_fulltext' : 'mysql_like'
+      processing_ms: 0, engine: useFulltext ? 'mysql_fulltext' : 'mysql_like',
+      next_cursor: null, has_more: false
     };
   }
   // pageSize 不能跨过 cap 边界
@@ -109,6 +119,7 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
     [...params, ...orderParams, effectiveLimit, offset]
   );
   const tookMs = Date.now() - t0;
+  const nextCursor = rows.length === effectiveLimit ? rows[rows.length - 1].id : null;
 
   return {
     total,
@@ -118,7 +129,9 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
     capped,
     cap_limit: capN,
     processing_ms: tookMs,
-    engine: useFulltext ? 'mysql_fulltext' : 'mysql_like'
+    engine: useFulltext ? (useCursor ? 'mysql_fulltext_cursor' : 'mysql_fulltext') : (useCursor ? 'mysql_cursor' : 'mysql_like'),
+    next_cursor: nextCursor,
+    has_more: !!nextCursor
   };
 }
 

@@ -11,11 +11,11 @@ const router = express.Router();
 router.use(apiKeyRequired);
 
 router.get('/search', asyncHandler(async (req, res) => {
-  const { q = '', page = 1, pageSize = 20, source_id } = req.query;
+  const { q = '', page = 1, pageSize = 20, source_id, cursor } = req.query;
   const allowed = getAllowedSourceIdsOf(req.apiKey);
   const cap = Math.max(1, Math.min(10000, Number(req.apiKey.max_results) || 1000));
   const data = await searchResources({
-    q, page, pageSize,
+    q, page, pageSize, cursor,
     sourceId: source_id || null,
     allowedSourceIds: allowed,
     cap
@@ -28,6 +28,8 @@ router.get('/search', asyncHandler(async (req, res) => {
     page_size: data.pageSize,
     capped: !!data.capped,
     cap_limit: data.cap_limit || cap,
+    next_cursor: data.next_cursor || null,
+    has_more: !!data.has_more,
     items: data.items.map((r) => ({
       id: r.id,
       source_id: r.source_id,
