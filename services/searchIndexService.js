@@ -95,7 +95,8 @@ async function waitTask(taskUid) {
 }
 
 async function ensureIndex() {
-  if (ensured || shouldSkip()) return false;
+  if (ensured) return true;
+  if (shouldSkip()) return false;
   const c = client();
   try {
     const exists = await c.get(`/indexes/${encodeURIComponent(INDEX)}`).then(() => true).catch((err) => {

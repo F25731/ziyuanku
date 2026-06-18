@@ -30,7 +30,11 @@ async function main() {
   if (!searchIndex.isEnabled()) {
     throw new Error('Meilisearch is not configured; set SEARCH_ENGINE=meilisearch and MEILI_URL first');
   }
-  await searchIndex.ensureIndex();
+  const ready = await searchIndex.ensureIndex();
+  if (!ready) {
+    const reason = typeof searchIndex.getLastError === 'function' ? searchIndex.getLastError() : '';
+    throw new Error(`Meilisearch index is not ready${reason ? `: ${reason}` : ''}`);
+  }
 
   if (process.argv.includes('--reset')) {
     try { fs.unlinkSync(checkpointFile); } catch (_) {}
