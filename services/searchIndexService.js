@@ -10,6 +10,7 @@ const BULK_BATCH = Math.max(100, Number(process.env.MEILI_BATCH_SIZE || 1000));
 
 let ensured = false;
 let disabledUntil = 0;
+let lastError = '';
 
 function isEnabled() {
   return ENGINE === 'meilisearch' && !!BASE_URL;
@@ -25,9 +26,31 @@ function client() {
   return axios.create({ baseURL: BASE_URL, timeout: TIMEOUT, headers });
 }
 
-function coolDown(err) {
+function trimMessage(value, max = 1200) {
+  const s = typeof value === 'string' ? value : JSON.stringify(value);
+  return s.length > max ? `${s.slice(0, max)}...` : s;
+}
+
+function formatError(err) {
+  if (!err) return 'unknown error';
+  const parts = [];
+  if (err.message) parts.push(err.message);
+  if (err.code) parts.push(`code=${err.code}`);
+  if (err.response) {
+    parts.push(`status=${err.response.status}`);
+    if (err.response.data) parts.push(`body=${trimMessage(err.response.data)}`);
+  }
+  return parts.join(' ');
+}
+
+function coolDown(err, context = '') {
   disabledUntil = Date.now() + 15000;
-  console.warn('[meili] temporarily disabled:', err && err.message || err);
+  lastError = formatError(err);
+  console.warn(`[meili] temporarily disabled${context ? ` ${context}` : ''}: ${lastError}`);
+}
+
+function getLastError() {
+  return lastError;
 }
 
 function encodeCursor(offset) {
@@ -94,7 +117,7 @@ async function ensureIndex() {
     ensured = true;
     return true;
   } catch (err) {
-    coolDown(err);
+    coolDown(err, 'while ensuring index');
     return false;
   }
 }
@@ -114,7 +137,9 @@ async function bulkIndexRows(rows) {
       const { data } = await c.post(`/indexes/${encodeURIComponent(INDEX)}/documents`, docs);
       if (String(process.env.MEILI_WAIT_TASKS || '0') === '1') await waitTask(data.taskUid);
     } catch (err) {
-      coolDown(err);
+      const firstId = docs[0] && docs[0].id;
+      const lastId = docs[docs.length - 1] && docs[docs.length - 1].id;
+      coolDown(err, `while indexing docs=${docs.length} first_id=${firstId} last_id=${lastId}`);
       return false;
     }
   }
@@ -143,7 +168,7 @@ async function deleteResource(id) {
     return true;
   } catch (err) {
     if (err.response && err.response.status === 404) return true;
-    coolDown(err);
+    coolDown(err, `while deleting id=${id}`);
     return false;
   }
 }
@@ -250,7 +275,7 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
       has_more: hasMore
     };
   } catch (err) {
-    coolDown(err);
+    coolDown(err, 'while searching');
     return null;
   }
 }
@@ -261,5 +286,6 @@ module.exports = {
   bulkIndexRows,
   bulkIndexBySourceFileIds,
   deleteResource,
-  searchResources
+  searchResources,
+  getLastError
 };

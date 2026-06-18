@@ -53,7 +53,14 @@ async function main() {
     );
     if (!rows.length) break;
     const ok = await searchIndex.bulkIndexRows(rows);
-    if (!ok) throw new Error('bulk index returned false');
+    if (!ok) {
+      const firstId = rows[0] && rows[0].id;
+      const batchLastId = rows[rows.length - 1] && rows[rows.length - 1].id;
+      const reason = typeof searchIndex.getLastError === 'function' ? searchIndex.getLastError() : '';
+      throw new Error(
+        `bulk index returned false first_id=${firstId} last_id=${batchLastId} rows=${rows.length}${reason ? `: ${reason}` : ''}`
+      );
+    }
     lastId = rows[rows.length - 1].id;
     total += rows.length;
     writeCheckpoint({ last_id: lastId, total, updated_at: new Date().toISOString() });

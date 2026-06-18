@@ -135,7 +135,8 @@ async function processBatch(limit = BATCH) {
       let ok = true;
       if (resourceRows.length) ok = await searchIndex.bulkIndexRows(resourceRows);
       if (!ok) {
-        await markFailed(upserts, 'bulk index returned false');
+        const reason = typeof searchIndex.getLastError === 'function' ? searchIndex.getLastError() : '';
+        await markFailed(upserts, reason || 'bulk index returned false');
         failed += upserts.length;
       } else {
         for (const id of missing) {
