@@ -1,4 +1,5 @@
 const { pool } = require('../config/db');
+const searchIndex = require('./searchIndexService');
 
 // 把用户输入的关键词转成 MySQL FULLTEXT BOOLEAN MODE 表达式
 // 多个空白分隔的词都用 + 前缀强制 AND，并按 ngram 拆词后的"短语"包起来更稳
@@ -21,6 +22,24 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
   const useCursor = !!cursorId;
   const offset = useCursor ? 0 : (page - 1) * pageSize;
   q = String(q || '').trim();
+
+  if (q && searchIndex.isEnabled()) {
+    const indexed = await searchIndex.searchResources({ q, pageSize, sourceId, allowedSourceIds, cap, cursor });
+    if (indexed) {
+      return {
+        total: indexed.total,
+        page,
+        pageSize,
+        items: indexed.items,
+        capped: indexed.capped,
+        cap_limit: indexed.cap_limit,
+        processing_ms: indexed.processing_ms,
+        engine: indexed.engine,
+        next_cursor: indexed.next_cursor,
+        has_more: indexed.has_more
+      };
+    }
+  }
 
   const where = ['r.is_deleted = 0'];
   const params = [];
@@ -208,6 +227,10 @@ async function upsertResources(sourceId, files) {
 
     // 阶段5 之后：搜索完全靠 MySQL FULLTEXT 索引（005 migration 建好），
     // upsert 写完就能搜——不再需要异步双写到 Meilisearch
+    const fileIds = files.map((f) => f.file_id).filter(Boolean);
+    searchIndex.bulkIndexBySourceFileIds(sourceId, fileIds).catch((e) => {
+      console.warn('[searchIndex] async index failed:', e.message);
+    });
     return { total, inserted, updated };
   } catch (err) {
     await conn.rollback();
@@ -238,6 +261,9 @@ async function listResources({ page = 1, pageSize = 50, sourceId = null, allowed
 
 async function deleteResource(id) {
   await pool.query('DELETE FROM resources WHERE id = ?', [id]);
+  searchIndex.deleteResource(id).catch((e) => {
+    console.warn('[searchIndex] async delete failed:', e.message);
+  });
 }
 
 module.exports = { searchResources, getResource, upsertResources, reconcileDeletedAfterRun, listResources, deleteResource };

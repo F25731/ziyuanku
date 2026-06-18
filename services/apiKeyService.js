@@ -8,6 +8,7 @@ const AUTH_CACHE_TTL = Math.max(30, Number(process.env.API_KEY_CACHE_TTL || 300)
 const LOG_FLUSH_INTERVAL_MS = Math.max(500, Number(process.env.API_LOG_FLUSH_INTERVAL_MS || 2000));
 const LOG_FLUSH_BATCH = Math.max(50, Number(process.env.API_LOG_FLUSH_BATCH || 500));
 const LOG_QUEUE_MAX = Math.max(LOG_FLUSH_BATCH, Number(process.env.API_LOG_QUEUE_MAX || 20000));
+const RAW_LOG_ENABLED = String(process.env.API_LOG_RAW_ENABLED || '1') !== '0';
 
 const logQueue = [];
 let logFlushTimer = null;
@@ -54,6 +55,13 @@ function secondsUntilTomorrow() {
   const tomorrow = new Date(now);
   tomorrow.setHours(24, 0, 0, 0);
   return Math.max(60, Math.ceil((tomorrow.getTime() - now.getTime()) / 1000) + 3600);
+}
+
+function currentHourSql() {
+  const d = new Date();
+  d.setMinutes(0, 0, 0);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:00:00`;
 }
 
 async function hashKey(plain) {
@@ -266,20 +274,21 @@ async function flushCallLogs() {
   flushingLogs = true;
   const batch = logQueue.splice(0, LOG_FLUSH_BATCH);
   try {
-    const values = batch.map((x) => [
-      x.apiKeyId || null,
-      String(x.path || '').slice(0, 255),
-      String(x.ip || '').slice(0, 64),
-      Number(x.statusCode) || 0,
-      Number(x.ms) || 0,
-      x.isQuota ? 1 : 0
-    ]);
-    if (values.length) {
+    if (RAW_LOG_ENABLED) {
+      const values = batch.map((x) => [
+        x.apiKeyId || null,
+        String(x.path || '').slice(0, 255),
+        String(x.ip || '').slice(0, 64),
+        Number(x.statusCode) || 0,
+        Number(x.ms) || 0,
+        x.isQuota ? 1 : 0
+      ]);
       await pool.query(
         'INSERT INTO api_call_logs (api_key_id, path, ip, status_code, ms, is_quota) VALUES ?',
         [values]
       );
     }
+    await upsertHourlyStats(batch);
 
     const quotaCounts = new Map();
     const touched = new Set();
@@ -313,6 +322,47 @@ async function flushCallLogs() {
       scheduleLogFlush();
     }
   }
+}
+
+async function upsertHourlyStats(batch) {
+  const buckets = new Map();
+  const hour = currentHourSql();
+  for (const x of batch) {
+    const ids = [0];
+    if (x.apiKeyId) ids.push(Number(x.apiKeyId));
+    for (const id of ids) {
+      const key = `${hour}:${id}`;
+      const cur = buckets.get(key) || {
+        hour,
+        apiKeyId: id,
+        total: 0,
+        quota: 0,
+        ok: 0,
+        error: 0,
+        ms: 0
+      };
+      cur.total++;
+      if (x.isQuota) cur.quota++;
+      if (Number(x.statusCode) >= 200 && Number(x.statusCode) < 400) cur.ok++;
+      else cur.error++;
+      cur.ms += Math.max(0, Number(x.ms) || 0);
+      buckets.set(key, cur);
+    }
+  }
+  const rows = Array.from(buckets.values());
+  if (!rows.length) return;
+  await pool.query(
+    `INSERT INTO api_call_hourly_stats
+       (hour_at, api_key_id, total_calls, quota_calls, ok_calls, error_calls, total_ms)
+     VALUES ?
+     ON DUPLICATE KEY UPDATE
+       total_calls = total_calls + VALUES(total_calls),
+       quota_calls = quota_calls + VALUES(quota_calls),
+       ok_calls = ok_calls + VALUES(ok_calls),
+       error_calls = error_calls + VALUES(error_calls),
+       total_ms = total_ms + VALUES(total_ms)`,
+    [rows.map((r) => [r.hour, r.apiKeyId, r.total, r.quota, r.ok, r.error, r.ms])]
+  );
 }
 
 async function recordCall(apiKeyId, path, ip, statusCode, ms, isQuota = 0) {

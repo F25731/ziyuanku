@@ -11,7 +11,7 @@ const {
   getRun, requestPause, getSyncStatus
 } = require('../services/lanzouSyncService');
 const {
-  searchResources, listResources, deleteResource
+  searchResources, deleteResource
 } = require('../services/resourceService');
 const {
   createApiKey, updateApiKey, extendExpire, listApiKeys, disableApiKey, enableApiKey, deleteApiKey
@@ -52,10 +52,10 @@ router.get('/stats/call-trend', asyncHandler(async (req, res) => {
 
 // ---------- 资源管理 ----------
 router.get('/resources', asyncHandler(async (req, res) => {
-  const { q = '', page = 1, pageSize = 30, source_id } = req.query;
+  const { q = '', page = 1, pageSize = 30, source_id, cursor } = req.query;
   const data = q
-    ? await searchResources({ q, page, pageSize, sourceId: source_id || null })
-    : await listResources({ page, pageSize, sourceId: source_id || null });
+    ? await searchResources({ q, page, pageSize, sourceId: source_id || null, cursor })
+    : await searchResources({ q: '', page, pageSize, sourceId: source_id || null, cursor });
   res.json({ code: 200, ...data });
 }));
 

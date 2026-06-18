@@ -8,7 +8,9 @@
     "dev": "node app.js",
     "migrate": "node scripts/run_migrations.js",
     "seed-admin": "node scripts/seed_admin.js",
-    "check": "node --check app.js"
+    "check": "node --check app.js",
+    "reindex:search": "node scripts/reindex_search.js",
+    "backfill:call-stats": "node scripts/backfill_call_stats.js"
   },
   "engines": {
     "node": ">=18"
