@@ -7,6 +7,9 @@ const MASTER_KEY = process.env.MEILI_MASTER_KEY || '';
 const INDEX = process.env.MEILI_INDEX || 'lrh_resources';
 const TIMEOUT = Math.max(1000, Number(process.env.SEARCH_TIMEOUT_MS || 5000));
 const BULK_BATCH = Math.max(100, Number(process.env.MEILI_BATCH_SIZE || 1000));
+const RETRY_ATTEMPTS = Math.max(1, Number(process.env.MEILI_RETRY_ATTEMPTS || 5));
+const RETRY_BASE_MS = Math.max(100, Number(process.env.MEILI_RETRY_BASE_MS || 500));
+const TASK_TIMEOUT_MS = Math.max(10000, Number(process.env.MEILI_TASK_TIMEOUT_MS || 120000));
 
 let ensured = false;
 let disabledUntil = 0;
@@ -41,6 +44,17 @@ function formatError(err) {
     if (err.response.data) parts.push(`body=${trimMessage(err.response.data)}`);
   }
   return parts.join(' ');
+}
+
+function isRetryableError(err) {
+  if (!err) return false;
+  if (['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'EAI_AGAIN'].includes(err.code)) return true;
+  const status = err.response && Number(err.response.status);
+  return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function coolDown(err, context = '') {
@@ -83,7 +97,7 @@ function toDoc(row) {
 async function waitTask(taskUid) {
   if (taskUid == null) return;
   const c = client();
-  const deadline = Date.now() + 30000;
+  const deadline = Date.now() + TASK_TIMEOUT_MS;
   while (Date.now() < deadline) {
     const { data } = await c.get(`/tasks/${encodeURIComponent(String(taskUid))}`);
     if (data.status === 'succeeded') return;
@@ -92,6 +106,23 @@ async function waitTask(taskUid) {
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
+  throw new Error(`Meilisearch task ${taskUid} timed out after ${TASK_TIMEOUT_MS}ms`);
+}
+
+async function postDocumentsWithRetry(c, docs) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= RETRY_ATTEMPTS; attempt++) {
+    try {
+      return await c.post(`/indexes/${encodeURIComponent(INDEX)}/documents`, docs);
+    } catch (err) {
+      lastErr = err;
+      if (attempt >= RETRY_ATTEMPTS || !isRetryableError(err)) throw err;
+      const delay = RETRY_BASE_MS * attempt * attempt;
+      console.warn(`[meili] retrying bulk index attempt=${attempt + 1}/${RETRY_ATTEMPTS} delay_ms=${delay}: ${formatError(err)}`);
+      await sleep(delay);
+    }
+  }
+  throw lastErr;
 }
 
 async function ensureIndex() {
@@ -135,7 +166,7 @@ async function bulkIndexRows(rows) {
       .filter((doc) => doc.id && doc.file_name);
     if (!docs.length) continue;
     try {
-      const { data } = await c.post(`/indexes/${encodeURIComponent(INDEX)}/documents`, docs);
+      const { data } = await postDocumentsWithRetry(c, docs);
       if (String(process.env.MEILI_WAIT_TASKS || '0') === '1') await waitTask(data.taskUid);
     } catch (err) {
       const firstId = docs[0] && docs[0].id;

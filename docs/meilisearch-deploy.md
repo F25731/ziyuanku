@@ -40,6 +40,8 @@ docker compose -f docker-compose.yml -f docker-compose.search.yml logs --tail=80
 docker compose -f docker-compose.yml -f docker-compose.search.yml exec app npm run reindex:search
 ```
 
+Full reindex waits for each Meilisearch task by default and retries transient write failures such as connection resets. This is slower than fire-and-forget writes, but safer for million-level and larger imports.
+
 Resume after interruption:
 
 ```bash

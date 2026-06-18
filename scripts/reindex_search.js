@@ -3,6 +3,11 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const { pool } = require('../config/db');
+
+if (!process.env.MEILI_WAIT_TASKS) {
+  process.env.MEILI_WAIT_TASKS = process.env.MEILI_REINDEX_WAIT_TASKS || '1';
+}
+
 const searchIndex = require('../services/searchIndexService');
 
 const checkpointFile = process.env.SEARCH_REINDEX_CHECKPOINT_FILE
