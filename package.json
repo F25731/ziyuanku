@@ -10,7 +10,9 @@
     "seed-admin": "node scripts/seed_admin.js",
     "check": "node --check app.js",
     "reindex:search": "node scripts/reindex_search.js",
-    "backfill:call-stats": "node scripts/backfill_call_stats.js"
+    "backfill:call-stats": "node scripts/backfill_call_stats.js",
+    "search:outbox": "node scripts/process_search_outbox.js",
+    "backfill:resource-meta": "node scripts/backfill_resource_meta.js"
   },
   "engines": {
     "node": ">=18"

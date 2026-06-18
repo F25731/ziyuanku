@@ -10,6 +10,7 @@ const { testDbConnection } = require('./config/db');
 const { runMigrations } = require('./scripts/run_migrations');
 const { ensureAdminUser } = require('./services/userService');
 const { flushCallLogs } = require('./services/apiKeyService');
+const { startWorker: startSearchOutboxWorker, stopWorker: stopSearchOutboxWorker } = require('./services/searchIndexOutboxService');
 
 const v1Router = require('./routes/v1');
 const adminRouter = require('./routes/admin');
@@ -40,6 +41,7 @@ async function start() {
   await testDbConnection();
   await runMigrations();
   await ensureAdminUser();
+  startSearchOutboxWorker();
 
   app.listen(PORT, () => {
     console.log(`[OK] lanzou-resource-hub listening on :${PORT}`);
@@ -55,6 +57,7 @@ start().catch((err) => {
 
 async function shutdown(signal) {
   try {
+    stopSearchOutboxWorker();
     await flushCallLogs();
   } catch (err) {
     console.warn('[shutdown] flushCallLogs failed:', err.message);

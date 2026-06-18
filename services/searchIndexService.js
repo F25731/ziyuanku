@@ -55,7 +55,9 @@ function toDoc(row) {
     file_id: row.file_id || '',
     file_name: row.file_name || '',
     file_size: row.file_size || '',
+    file_size_bytes: row.file_size_bytes == null ? null : Number(row.file_size_bytes),
     file_type: row.file_type || '',
+    file_ext: row.file_ext || '',
     file_time: row.file_time || '',
     share_url: row.share_url || '',
     is_deleted: Number(row.is_deleted || 0) ? true : false,
@@ -108,7 +110,9 @@ async function ensureIndex() {
               fields: { keyword: { type: 'keyword', ignore_above: 512 } }
             },
             file_size: { type: 'keyword' },
+            file_size_bytes: { type: 'long' },
             file_type: { type: 'keyword' },
+            file_ext: { type: 'keyword' },
             file_time: { type: 'keyword' },
             share_url: { type: 'keyword', index: false },
             is_deleted: { type: 'boolean' },
@@ -157,7 +161,7 @@ async function bulkIndexBySourceFileIds(sourceId, fileIds) {
   const ids = Array.from(new Set(fileIds.map((x) => String(x || '').trim()).filter(Boolean)));
   if (!ids.length) return false;
   const [rows] = await pool.query(
-    `SELECT id, source_id, file_id, file_name, file_size, file_type, file_time, share_url, is_deleted, created_at, updated_at
+    `SELECT id, source_id, file_id, file_name, file_size, file_size_bytes, file_type, file_ext, file_time, share_url, is_deleted, created_at, updated_at
        FROM resources
       WHERE source_id = ? AND file_id IN (?)`,
     [sourceId, ids]

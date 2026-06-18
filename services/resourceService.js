@@ -1,5 +1,10 @@
 const { pool } = require('../config/db');
 const searchIndex = require('./searchIndexService');
+const searchOutbox = require('./searchIndexOutboxService');
+const HttpError = require('../utils/httpError');
+const { parseFileSizeToBytes, getFileExt } = require('../utils/resourceMeta');
+
+const SEARCH_REQUIRE_EXTERNAL = String(process.env.SEARCH_REQUIRE_EXTERNAL || '0') === '1';
 
 // 把用户输入的关键词转成 MySQL FULLTEXT BOOLEAN MODE 表达式
 // 多个空白分隔的词都用 + 前缀强制 AND，并按 ngram 拆词后的"短语"包起来更稳
@@ -39,6 +44,9 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
         has_more: indexed.has_more
       };
     }
+  }
+  if (q && SEARCH_REQUIRE_EXTERNAL) {
+    throw new HttpError(503, '搜索服务不可用，请稍后重试');
   }
 
   const where = ['r.is_deleted = 0'];
@@ -182,7 +190,9 @@ async function upsertResources(sourceId, files) {
       f.file_id || null,
       (f.file_name || '').slice(0, 500),
       f.file_size || '',
+      parseFileSizeToBytes(f.file_size),
       f.file_type || '',
+      getFileExt(f.file_name || ''),
       f.file_time || '',
       f.share_url || null,
       f.share_pwd || null,
@@ -192,14 +202,16 @@ async function upsertResources(sourceId, files) {
 
     const [result] = await conn.query(
       `INSERT INTO resources
-         (source_id, parent_folder_id, file_id, file_name, file_size, file_type, file_time,
+         (source_id, parent_folder_id, file_id, file_name, file_size, file_size_bytes, file_type, file_ext, file_time,
           share_url, share_pwd, sync_hash, is_deleted)
        VALUES ?
        ON DUPLICATE KEY UPDATE
          parent_folder_id = VALUES(parent_folder_id),
          file_name = VALUES(file_name),
          file_size = VALUES(file_size),
+         file_size_bytes = VALUES(file_size_bytes),
          file_type = VALUES(file_type),
+         file_ext = VALUES(file_ext),
          file_time = VALUES(file_time),
          share_url = VALUES(share_url),
          share_pwd = VALUES(share_pwd),
@@ -228,8 +240,8 @@ async function upsertResources(sourceId, files) {
     // 阶段5 之后：搜索完全靠 MySQL FULLTEXT 索引（005 migration 建好），
     // upsert 写完就能搜——不再需要异步双写到 Meilisearch
     const fileIds = files.map((f) => f.file_id).filter(Boolean);
-    searchIndex.bulkIndexBySourceFileIds(sourceId, fileIds).catch((e) => {
-      console.warn('[searchIndex] async index failed:', e.message);
+    searchOutbox.enqueueUpsertsBySourceFileIds(sourceId, fileIds).catch((e) => {
+      console.warn('[searchOutbox] enqueue failed:', e.message);
     });
     return { total, inserted, updated };
   } catch (err) {
@@ -245,14 +257,33 @@ async function upsertResources(sourceId, files) {
 // 比基于 sync_hash 或 file_id NOT IN 都更便宜：单条 UPDATE，靠时间戳索引
 async function reconcileDeletedAfterRun(sourceId, runStartedAt) {
   if (!runStartedAt) return { marked: 0 };
-  const [r] = await pool.query(
-    `UPDATE resources
-        SET is_deleted = 1
-      WHERE source_id = ? AND is_deleted = 0
-        AND (updated_at IS NULL OR updated_at < ?)`,
-    [sourceId, runStartedAt]
-  );
-  return { marked: r.affectedRows || 0 };
+  let marked = 0;
+  const batchSize = Math.max(100, Number(process.env.RECONCILE_DELETE_BATCH || 5000));
+  while (true) {
+    const [rows] = await pool.query(
+      `SELECT id
+         FROM resources
+        WHERE source_id = ? AND is_deleted = 0
+          AND (updated_at IS NULL OR updated_at < ?)
+        ORDER BY id ASC
+        LIMIT ?`,
+      [sourceId, runStartedAt, batchSize]
+    );
+    if (!rows.length) break;
+    const ids = rows.map((r) => r.id);
+    const [r] = await pool.query(
+      `UPDATE resources
+          SET is_deleted = 1
+        WHERE id IN (?) AND is_deleted = 0`,
+      [ids]
+    );
+    marked += r.affectedRows || 0;
+    searchOutbox.enqueueDeletes(ids).catch((e) => {
+      console.warn('[searchOutbox] enqueue delete failed:', e.message);
+    });
+    if (rows.length < batchSize) break;
+  }
+  return { marked };
 }
 
 async function listResources({ page = 1, pageSize = 50, sourceId = null, allowedSourceIds = null, cap = 0 } = {}) {
@@ -260,10 +291,8 @@ async function listResources({ page = 1, pageSize = 50, sourceId = null, allowed
 }
 
 async function deleteResource(id) {
+  await searchOutbox.enqueueDelete(id);
   await pool.query('DELETE FROM resources WHERE id = ?', [id]);
-  searchIndex.deleteResource(id).catch((e) => {
-    console.warn('[searchIndex] async delete failed:', e.message);
-  });
 }
 
 module.exports = { searchResources, getResource, upsertResources, reconcileDeletedAfterRun, listResources, deleteResource };
