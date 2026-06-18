@@ -2,18 +2,17 @@ const axios = require('axios');
 const { pool } = require('../config/db');
 
 const ENGINE = String(process.env.SEARCH_ENGINE || 'mysql').toLowerCase();
-const BASE_URL = String(process.env.SEARCH_URL || '').replace(/\/+$/, '');
-const INDEX = process.env.SEARCH_INDEX || 'lrh_resources';
-const USERNAME = process.env.SEARCH_USERNAME || '';
-const PASSWORD = process.env.SEARCH_PASSWORD || '';
+const BASE_URL = String(process.env.MEILI_URL || '').replace(/\/+$/, '');
+const MASTER_KEY = process.env.MEILI_MASTER_KEY || '';
+const INDEX = process.env.MEILI_INDEX || 'lrh_resources';
 const TIMEOUT = Math.max(1000, Number(process.env.SEARCH_TIMEOUT_MS || 5000));
-const BULK_BATCH = Math.max(100, Number(process.env.SEARCH_BULK_BATCH || 1000));
+const BULK_BATCH = Math.max(100, Number(process.env.MEILI_BATCH_SIZE || 1000));
 
 let ensured = false;
 let disabledUntil = 0;
 
 function isEnabled() {
-  return !!BASE_URL && ['opensearch', 'elasticsearch', 'elastic'].includes(ENGINE);
+  return ENGINE === 'meilisearch' && !!BASE_URL;
 }
 
 function shouldSkip() {
@@ -21,28 +20,29 @@ function shouldSkip() {
 }
 
 function client() {
-  const cfg = { baseURL: BASE_URL, timeout: TIMEOUT };
-  if (USERNAME || PASSWORD) cfg.auth = { username: USERNAME, password: PASSWORD };
-  return axios.create(cfg);
+  const headers = {};
+  if (MASTER_KEY) headers.Authorization = `Bearer ${MASTER_KEY}`;
+  return axios.create({ baseURL: BASE_URL, timeout: TIMEOUT, headers });
 }
 
 function coolDown(err) {
-  disabledUntil = Date.now() + 30000;
-  console.warn('[searchIndex] temporarily disabled:', err && err.message || err);
+  disabledUntil = Date.now() + 15000;
+  console.warn('[meili] temporarily disabled:', err && err.message || err);
 }
 
-function encodeCursor(sort) {
-  if (!Array.isArray(sort)) return null;
-  return Buffer.from(JSON.stringify(sort)).toString('base64url');
+function encodeCursor(offset) {
+  const n = Math.max(0, Number(offset) || 0);
+  return Buffer.from(JSON.stringify({ offset: n })).toString('base64url');
 }
 
 function decodeCursor(cursor) {
   if (!cursor) return null;
   const s = String(cursor);
-  if (/^\d+$/.test(s)) return null;
+  if (/^\d+$/.test(s)) return Number(s);
   try {
     const parsed = JSON.parse(Buffer.from(s, 'base64url').toString('utf8'));
-    return Array.isArray(parsed) ? parsed : null;
+    const n = Number(parsed && parsed.offset);
+    return Number.isFinite(n) && n >= 0 ? n : null;
   } catch (_) {
     return null;
   }
@@ -51,76 +51,46 @@ function decodeCursor(cursor) {
 function toDoc(row) {
   return {
     id: Number(row.id),
-    source_id: Number(row.source_id),
-    file_id: row.file_id || '',
     file_name: row.file_name || '',
-    file_size: row.file_size || '',
-    file_size_bytes: row.file_size_bytes == null ? null : Number(row.file_size_bytes),
-    file_type: row.file_type || '',
-    file_ext: row.file_ext || '',
-    file_time: row.file_time || '',
-    share_url: row.share_url || '',
-    is_deleted: Number(row.is_deleted || 0) ? true : false,
-    updated_at: row.updated_at || row.created_at || new Date().toISOString()
+    source_id: Number(row.source_id),
+    file_type: row.file_type || ''
   };
+}
+
+async function waitTask(taskUid) {
+  if (taskUid == null) return;
+  const c = client();
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    const { data } = await c.get(`/tasks/${encodeURIComponent(String(taskUid))}`);
+    if (data.status === 'succeeded') return;
+    if (data.status === 'failed' || data.status === 'canceled') {
+      throw new Error(data.error && data.error.message || `Meilisearch task ${data.status}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
 }
 
 async function ensureIndex() {
   if (ensured || shouldSkip()) return false;
   const c = client();
   try {
-    const exists = await c.head(`/${encodeURIComponent(INDEX)}`).then(() => true).catch((err) => {
+    const exists = await c.get(`/indexes/${encodeURIComponent(INDEX)}`).then(() => true).catch((err) => {
       if (err.response && err.response.status === 404) return false;
       throw err;
     });
     if (!exists) {
-      await c.put(`/${encodeURIComponent(INDEX)}`, {
-        settings: {
-          index: {
-            number_of_shards: Math.max(1, Number(process.env.SEARCH_SHARDS || 3)),
-            number_of_replicas: Math.max(0, Number(process.env.SEARCH_REPLICAS || 0))
-          },
-          analysis: {
-            tokenizer: {
-              lrh_ngram_tokenizer: {
-                type: 'ngram',
-                min_gram: 2,
-                max_gram: 3,
-                token_chars: ['letter', 'digit']
-              }
-            },
-            analyzer: {
-              lrh_ngram: {
-                type: 'custom',
-                tokenizer: 'lrh_ngram_tokenizer',
-                filter: ['lowercase']
-              }
-            }
-          }
-        },
-        mappings: {
-          properties: {
-            id: { type: 'long' },
-            source_id: { type: 'long' },
-            file_id: { type: 'keyword' },
-            file_name: {
-              type: 'text',
-              analyzer: 'lrh_ngram',
-              search_analyzer: 'standard',
-              fields: { keyword: { type: 'keyword', ignore_above: 512 } }
-            },
-            file_size: { type: 'keyword' },
-            file_size_bytes: { type: 'long' },
-            file_type: { type: 'keyword' },
-            file_ext: { type: 'keyword' },
-            file_time: { type: 'keyword' },
-            share_url: { type: 'keyword', index: false },
-            is_deleted: { type: 'boolean' },
-            updated_at: { type: 'date', ignore_malformed: true }
-          }
-        }
-      });
+      const { data } = await c.post('/indexes', { uid: INDEX, primaryKey: 'id' });
+      await waitTask(data.taskUid);
     }
+    const settingsTask = await c.patch(`/indexes/${encodeURIComponent(INDEX)}/settings`, {
+      displayedAttributes: ['id', 'file_name', 'source_id', 'file_type'],
+      searchableAttributes: ['file_name'],
+      filterableAttributes: ['source_id', 'file_type'],
+      sortableAttributes: ['id'],
+      pagination: { maxTotalHits: Math.max(1000, Number(process.env.MEILI_MAX_TOTAL_HITS || 20000)) }
+    });
+    await waitTask(settingsTask.data && settingsTask.data.taskUid);
     ensured = true;
     return true;
   } catch (err) {
@@ -135,19 +105,14 @@ async function bulkIndexRows(rows) {
   if (!ok) return false;
   const c = client();
   for (let i = 0; i < rows.length; i += BULK_BATCH) {
-    const part = rows.slice(i, i + BULK_BATCH);
-    const lines = [];
-    for (const row of part) {
-      lines.push(JSON.stringify({ index: { _index: INDEX, _id: String(row.id) } }));
-      lines.push(JSON.stringify(toDoc(row)));
-    }
+    const docs = rows.slice(i, i + BULK_BATCH)
+      .filter((row) => !Number(row.is_deleted || 0))
+      .map(toDoc)
+      .filter((doc) => doc.id && doc.file_name);
+    if (!docs.length) continue;
     try {
-      const resp = await c.post('/_bulk', lines.join('\n') + '\n', {
-        headers: { 'Content-Type': 'application/x-ndjson' }
-      });
-      if (resp.data && resp.data.errors) {
-        console.warn('[searchIndex] bulk completed with item errors');
-      }
+      const { data } = await c.post(`/indexes/${encodeURIComponent(INDEX)}/documents`, docs);
+      if (String(process.env.MEILI_WAIT_TASKS || '0') === '1') await waitTask(data.taskUid);
     } catch (err) {
       coolDown(err);
       return false;
@@ -161,7 +126,7 @@ async function bulkIndexBySourceFileIds(sourceId, fileIds) {
   const ids = Array.from(new Set(fileIds.map((x) => String(x || '').trim()).filter(Boolean)));
   if (!ids.length) return false;
   const [rows] = await pool.query(
-    `SELECT id, source_id, file_id, file_name, file_size, file_type, file_time, share_url, is_deleted, created_at, updated_at
+    `SELECT id, source_id, file_name, file_type, is_deleted
        FROM resources
       WHERE source_id = ? AND file_id IN (?)`,
     [sourceId, ids]
@@ -174,11 +139,10 @@ async function deleteResource(id) {
   const ok = await ensureIndex();
   if (!ok) return false;
   try {
-    await client().delete(`/${encodeURIComponent(INDEX)}/_doc/${encodeURIComponent(String(id))}`, {
-      validateStatus: (s) => (s >= 200 && s < 300) || s === 404
-    });
+    await client().delete(`/indexes/${encodeURIComponent(INDEX)}/documents/${encodeURIComponent(String(id))}`);
     return true;
   } catch (err) {
+    if (err.response && err.response.status === 404) return true;
     coolDown(err);
     return false;
   }
@@ -200,81 +164,89 @@ async function fetchResourcesByIds(ids) {
   return uniq.map((id) => byId.get(id)).filter(Boolean);
 }
 
-async function searchResources({ q = '', pageSize = 20, sourceId = null, allowedSourceIds = null, cap = 0, cursor = null, skipTotal = false }) {
+function buildFilter({ sourceId, allowedSourceIds }) {
+  const parts = [];
+  if (sourceId) {
+    const sid = Number(sourceId);
+    if (Array.isArray(allowedSourceIds) && allowedSourceIds.length > 0 && !allowedSourceIds.includes(sid)) {
+      return { blocked: true, filter: '' };
+    }
+    parts.push(`source_id = ${sid}`);
+  } else if (Array.isArray(allowedSourceIds) && allowedSourceIds.length > 0) {
+    parts.push(`source_id IN [${allowedSourceIds.map(Number).filter(Boolean).join(',')}]`);
+  }
+  return { blocked: false, filter: parts.join(' AND ') };
+}
+
+async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = null, allowedSourceIds = null, cap = 0, cursor = null, skipTotal = false }) {
   if (shouldSkip()) return null;
   q = String(q || '').trim();
   if (!q) return null;
   const ok = await ensureIndex();
   if (!ok) return null;
 
-  const filter = [{ term: { is_deleted: false } }];
-  if (sourceId) filter.push({ term: { source_id: Number(sourceId) } });
-  if (Array.isArray(allowedSourceIds) && allowedSourceIds.length > 0) {
-    if (sourceId && !allowedSourceIds.includes(Number(sourceId))) {
-      return {
-        total: 0,
-        items: [],
-        capped: false,
-        cap_limit: Number(cap) || 0,
-        processing_ms: 0,
-        engine: 'opensearch_scope_block',
-        next_cursor: null,
-        has_more: false
-      };
-    }
-    filter.push({ terms: { source_id: allowedSourceIds.map(Number) } });
+  const { blocked, filter } = buildFilter({ sourceId, allowedSourceIds });
+  const capN = Math.max(0, Number(cap) || 0);
+  if (blocked) {
+    return {
+      total: 0,
+      items: [],
+      capped: false,
+      cap_limit: capN,
+      processing_ms: 0,
+      engine: 'meilisearch_scope_block',
+      next_cursor: null,
+      has_more: false
+    };
   }
 
-  const searchAfter = decodeCursor(cursor);
   const requestedSize = Math.min(100, Math.max(1, Number(pageSize) || 20));
-  const trackTotalHits = (searchAfter || skipTotal) ? false : Math.max(1, Math.min(10000, Number(cap) || 1000)) + 1;
+  const decodedOffset = decodeCursor(cursor);
+  const offset = decodedOffset == null ? (Math.max(1, Number(page) || 1) - 1) * requestedSize : decodedOffset;
+  if (capN > 0 && offset >= capN) {
+    return {
+      total: skipTotal ? null : capN,
+      items: [],
+      capped: true,
+      cap_limit: capN,
+      processing_ms: 0,
+      engine: 'meilisearch',
+      next_cursor: null,
+      has_more: false
+    };
+  }
+
+  const limit = capN > 0 ? Math.min(requestedSize + 1, capN - offset + 1) : requestedSize + 1;
   const body = {
-    size: requestedSize + 1,
-    track_total_hits: trackTotalHits,
-    query: {
-      bool: {
-        filter,
-        must: [{
-          match: {
-            file_name: {
-              query: q,
-              operator: 'and'
-            }
-          }
-        }]
-      }
-    },
-    sort: [{ _score: 'desc' }, { id: 'desc' }]
+    q,
+    limit,
+    offset,
+    attributesToRetrieve: ['id'],
+    showMatchesPosition: false
   };
-  if (searchAfter) body.search_after = searchAfter;
+  if (filter) body.filter = filter;
 
   const t0 = Date.now();
   try {
-    const resp = await client().post(`/${encodeURIComponent(INDEX)}/_search`, body);
-    const hits = resp.data && resp.data.hits ? resp.data.hits : {};
-    const hitList = hits.hits || [];
-    const hasMore = hitList.length > requestedSize;
-    const visibleHits = hasMore ? hitList.slice(0, requestedSize) : hitList;
-    const ids = visibleHits.map((h) => Number(h._source && h._source.id)).filter(Boolean);
+    const { data } = await client().post(`/indexes/${encodeURIComponent(INDEX)}/search`, body);
+    const hits = Array.isArray(data.hits) ? data.hits : [];
+    const hasMore = hits.length > requestedSize;
+    const visibleHits = hasMore ? hits.slice(0, requestedSize) : hits;
+    const ids = visibleHits.map((h) => Number(h.id)).filter(Boolean);
     const items = await fetchResourcesByIds(ids);
-    let total = null;
-    let capped = false;
-    const totalObj = hits.total;
-    if (!searchAfter && !skipTotal && totalObj) {
-      const raw = typeof totalObj === 'number' ? totalObj : Number(totalObj.value || 0);
-      const capN = Math.max(0, Number(cap) || 0);
-      total = capN > 0 ? Math.min(raw, capN) : raw;
-      capped = !!(capN > 0 && raw > capN);
-    }
-    const last = visibleHits[visibleHits.length - 1];
+    const rawTotal = Number(data.estimatedTotalHits || data.totalHits || 0);
+    const total = skipTotal ? null : (capN > 0 ? Math.min(rawTotal, capN) : rawTotal);
+    const capped = !!(capN > 0 && rawTotal > capN);
+    const nextOffset = offset + visibleHits.length;
+
     return {
       total,
       items,
       capped,
-      cap_limit: Number(cap) || 0,
+      cap_limit: capN,
       processing_ms: Date.now() - t0,
-      engine: 'opensearch',
-      next_cursor: hasMore && last ? encodeCursor(last.sort) : null,
+      engine: 'meilisearch',
+      next_cursor: hasMore ? encodeCursor(nextOffset) : null,
       has_more: hasMore
     };
   } catch (err) {

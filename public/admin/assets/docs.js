@@ -29,7 +29,7 @@ data: {"code":200,"message":"ok","count":20,"next_cursor":"...","has_more":true}
       method: 'GET',
       path: '/api/v1/search',
       title: '搜索资源（仅元数据，不消耗配额）',
-      desc: '基于 MySQL FULLTEXT(ngram) 全文索引，百万级库内一般 30-300ms 返回。返回字段不含直链，下游拿到 id 后再按需调 link 接口换直链。本接口不消耗 Key 的日/总配额。',
+      desc: '启用 Meilisearch 时走轻量搜索索引（只存 id/file_name/source_id/file_type），否则回落 MySQL FULLTEXT。返回字段不含直链，下游拿到 id 后再按需调 link 接口换直链。本接口不消耗 Key 的日/总配额。',
       params: [
         ['q', 'string', '关键词。空字符串或不传 = 返回全部，按 id 倒序'],
         ['page', 'int', '页码，默认 1'],
@@ -245,7 +245,7 @@ echo '直链: ' . $link['url'] . PHP_EOL;`
     '搜索结果会受 Key 的 max_results 截顶（默认 1000）；如果 capped=true，说明命中数超过该上限，建议下游加更精确的关键词。',
     '一个 Key 可以绑定指定的几个库（allowed_source_ids）。访问授权外的资源会得到 403——这是接入方按数据来源分隔账号的方式。',
     '文件大小优先展示 file_size_human（已带单位）；file_size 是蓝奏原始值，ilanzou 是纯 KB 数字（"4260" 表示 4260 KB），老版蓝奏可能带单位（如 "12.3 M"）。',
-    '搜索使用 MySQL FULLTEXT(ngram) 中文双字切词。两个汉字以上的查询走 FULLTEXT；单字查询走 LIKE 兜底。建议下游做 200-300ms 输入防抖。',
+    '搜索优先使用 Meilisearch 轻量索引；外部搜索未启用或短暂不可用时可回落 MySQL FULLTEXT。默认禁止单字搜索，建议下游做 200-300ms 输入防抖。',
     '直链有时效（约 30 分钟），不要在数据库长期保存，每次用户点击下载时即时调用。',
     'Key 泄露请立即在后台「API Key」页停用并重新签发，旧 Key 立即失效。',
     '建议下游在多用户并发场景下做 200~500ms 的随机延迟，防止本地 IP 触发蓝奏侧 IP 限流。'

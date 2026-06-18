@@ -1,15 +1,19 @@
 services:
-  opensearch:
-    image: opensearchproject/opensearch:2.17.1
-    container_name: lrh-opensearch
+  meilisearch:
+    image: getmeili/meilisearch:v1.11
+    container_name: lrh-meilisearch
     restart: unless-stopped
     environment:
-      discovery.type: single-node
-      OPENSEARCH_JAVA_OPTS: ${OPENSEARCH_JAVA_OPTS:--Xms512m -Xmx512m}
-      DISABLE_INSTALL_DEMO_CONFIG: "true"
-      DISABLE_SECURITY_PLUGIN: "true"
+      MEILI_ENV: production
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      MEILI_NO_ANALYTICS: "true"
+      MEILI_DB_PATH: /meili_data
+      MEILI_DUMP_DIR: /meili_dumps
+      MEILI_SNAPSHOT_DIR: /meili_snapshots
     volumes:
-      - opensearch_data:/usr/share/opensearch/data
+      - meili_data:/meili_data
+      - meili_dumps:/meili_dumps
+      - meili_snapshots:/meili_snapshots
     deploy:
       resources:
         limits:
@@ -22,13 +26,57 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      opensearch:
+      meilisearch:
         condition: service_started
     environment:
-      SEARCH_ENGINE: opensearch
-      SEARCH_URL: http://opensearch:9200
-      SEARCH_SHARDS: ${SEARCH_SHARDS:-1}
-      SEARCH_REPLICAS: ${SEARCH_REPLICAS:-0}
+      SEARCH_ENGINE: meilisearch
+      MEILI_URL: http://meilisearch:7700
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      MEILI_INDEX: ${MEILI_INDEX:-lrh_resources}
+      SEARCH_OUTBOX_WORKER_ENABLED: "0"
+
+  search-worker:
+    image: lanzou-resource-hub:latest
+    container_name: lrh-search-worker
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      meilisearch:
+        condition: service_started
+      app:
+        condition: service_started
+    command: ["npm", "run", "search:outbox"]
+    environment:
+      NODE_ENV: production
+      TZ: Asia/Shanghai
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: lanzou_hub
+      DB_USER: lanzou_hub
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_POOL_LIMIT: ${DB_POOL_LIMIT:-10}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ""
+      SEARCH_ENGINE: meilisearch
+      MEILI_URL: http://meilisearch:7700
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      MEILI_INDEX: ${MEILI_INDEX:-lrh_resources}
+      MEILI_BATCH_SIZE: ${MEILI_BATCH_SIZE:-1000}
+      SEARCH_TIMEOUT_MS: ${SEARCH_TIMEOUT_MS:-5000}
+      SEARCH_OUTBOX_BATCH: ${SEARCH_OUTBOX_BATCH:-500}
+      SEARCH_OUTBOX_INTERVAL_MS: ${SEARCH_OUTBOX_INTERVAL_MS:-5000}
+      SEARCH_OUTBOX_MAX_ATTEMPTS: ${SEARCH_OUTBOX_MAX_ATTEMPTS:-10}
+    volumes:
+      - ./logs:/app/logs
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    networks: [internal]
 
 volumes:
-  opensearch_data:
+  meili_data:
+  meili_dumps:
+  meili_snapshots:

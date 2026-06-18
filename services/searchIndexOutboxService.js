@@ -125,8 +125,7 @@ async function processBatch(limit = BATCH) {
   if (upserts.length) {
     try {
       const [resourceRows] = await pool.query(
-        `SELECT id, source_id, file_id, file_name, file_size, file_type,
-                file_time, share_url, is_deleted, created_at, updated_at
+        `SELECT id, source_id, file_name, file_type, is_deleted
            FROM resources
           WHERE id IN (?)`,
         [upserts]
