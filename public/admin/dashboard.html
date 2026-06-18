@@ -263,6 +263,11 @@
               <div class="mt-1 font-bold text-slate-800" x-text="searchIndex.outbox.total ?? '-'"></div>
             </div>
           </div>
+          <div x-show="searchIndex.meili.task_summary && (searchIndex.meili.task_summary.processing || searchIndex.meili.task_summary.enqueued)" class="mb-5 rounded-lg border border-amber-100 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+            Meilisearch 仍在处理后台任务：
+            <b x-text="searchIndex.meili.task_summary.processing || 0"></b> 个处理中，
+            <b x-text="searchIndex.meili.task_summary.enqueued || 0"></b> 个排队中。索引文档数会在任务完成后继续上涨。
+          </div>
 
           <div class="grid lg:grid-cols-3 gap-4">
             <div class="rounded-lg border border-slate-100 p-4">
@@ -335,7 +340,7 @@
           <div class="mt-3 grid grid-cols-2 md:grid-cols-5 gap-3 text-xs text-slate-600">
             <div>进度：<b x-text="searchJobPct(searchIndex.activeJob) + '%'"></b></div>
             <div>已扫：<b x-text="searchIndex.activeJob?.total_seen || 0"></b></div>
-            <div>已写：<b x-text="searchIndex.activeJob?.total_indexed || 0"></b></div>
+            <div>已确认：<b x-text="searchIndex.activeJob?.total_indexed || 0"></b></div>
             <div>断点 ID：<b x-text="searchIndex.activeJob?.last_id || 0"></b></div>
             <div>尝试：<b x-text="searchIndex.activeJob?.attempts || 0"></b></div>
           </div>
@@ -350,7 +355,7 @@
           <div class="overflow-x-auto">
             <table class="w-full text-sm min-w-[760px]">
               <thead class="bg-slate-50 text-slate-500 text-xs uppercase">
-                <tr><th class="px-4 py-3 text-left">ID</th><th class="px-4 py-3">模式</th><th class="px-4 py-3">状态</th><th class="px-4 py-3">进度</th><th class="px-4 py-3">断点</th><th class="px-4 py-3">已写</th><th class="px-4 py-3">错误</th><th class="px-4 py-3 text-right">操作</th></tr>
+                <tr><th class="px-4 py-3 text-left">ID</th><th class="px-4 py-3">模式</th><th class="px-4 py-3">状态</th><th class="px-4 py-3">进度</th><th class="px-4 py-3">断点</th><th class="px-4 py-3">已确认</th><th class="px-4 py-3">错误</th><th class="px-4 py-3 text-right">操作</th></tr>
               </thead>
               <tbody class="divide-y divide-slate-100">
                 <template x-for="j in searchIndex.jobs" :key="j.id">

@@ -186,7 +186,7 @@ async function runJob(id) {
           await sleep(Math.min(60000, 10000 + attempt * attempt * 1000));
           continue;
         }
-        ok = await searchIndex.bulkIndexRows(rows);
+        ok = await searchIndex.bulkIndexRows(rows, { waitTasks: true });
         if (ok) break;
         lastErr = searchIndex.getLastError() || 'bulk index returned false';
         await pool.query(
@@ -266,7 +266,8 @@ async function getStatus() {
     meili: {
       health: overview.health,
       index: overview.index,
-      tasks: overview.tasks
+      tasks: overview.tasks,
+      task_summary: overview.task_summary
     },
     mysql: { resources: Number(resourceRow.total || 0) },
     outbox,

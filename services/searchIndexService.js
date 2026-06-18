@@ -119,6 +119,19 @@ async function getOverview() {
   } catch (err) {
     overview.tasks = { error: formatError(err) };
   }
+  try {
+    const [processing, enqueued] = await Promise.all([
+      c.get('/tasks?statuses=processing&limit=1').then((r) => r.data).catch((err) => ({ error: formatError(err) })),
+      c.get('/tasks?statuses=enqueued&limit=1').then((r) => r.data).catch((err) => ({ error: formatError(err) }))
+    ]);
+    overview.task_summary = {
+      processing: Number(processing.total || 0),
+      enqueued: Number(enqueued.total || 0),
+      error: processing.error || enqueued.error || null
+    };
+  } catch (err) {
+    overview.task_summary = { processing: 0, enqueued: 0, error: formatError(err) };
+  }
   return overview;
 }
 
@@ -226,10 +239,11 @@ async function ensureIndex() {
   }
 }
 
-async function bulkIndexRows(rows) {
+async function bulkIndexRows(rows, options = {}) {
   if (!Array.isArray(rows) || !rows.length || shouldSkip()) return false;
   const ok = await ensureIndex();
   if (!ok) return false;
+  const waitTasks = options.waitTasks === true || String(process.env.MEILI_WAIT_TASKS || '0') === '1';
   const c = client();
   for (let i = 0; i < rows.length; i += BULK_BATCH) {
     const docs = rows.slice(i, i + BULK_BATCH)
@@ -239,7 +253,7 @@ async function bulkIndexRows(rows) {
     if (!docs.length) continue;
     try {
       const { data } = await postDocumentsWithRetry(c, docs);
-      if (String(process.env.MEILI_WAIT_TASKS || '0') === '1') await waitTask(data.taskUid);
+      if (waitTasks) await waitTask(data.taskUid);
     } catch (err) {
       const firstId = docs[0] && docs[0].id;
       const lastId = docs[docs.length - 1] && docs[docs.length - 1].id;
