@@ -52,7 +52,7 @@ services:
         condition: service_started
       app:
         condition: service_started
-    command: ["npm", "run", "search:outbox"]
+    command: ["npm", "run", "search:worker"]
     environment:
       NODE_ENV: production
       TZ: Asia/Shanghai
@@ -75,12 +75,53 @@ services:
       SEARCH_OUTBOX_BATCH: ${SEARCH_OUTBOX_BATCH:-500}
       SEARCH_OUTBOX_INTERVAL_MS: ${SEARCH_OUTBOX_INTERVAL_MS:-5000}
       SEARCH_OUTBOX_MAX_ATTEMPTS: ${SEARCH_OUTBOX_MAX_ATTEMPTS:-10}
+      SEARCH_JOB_INTERVAL_MS: ${SEARCH_JOB_INTERVAL_MS:-5000}
+      SEARCH_JOB_STALE_SECONDS: ${SEARCH_JOB_STALE_SECONDS:-600}
     volumes:
       - ./logs:/app/logs
     deploy:
       resources:
         limits:
           memory: 256M
+    networks: [internal]
+
+  cleanup-worker:
+    image: lanzou-resource-hub:latest
+    container_name: lrh-cleanup-worker
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      app:
+        condition: service_started
+    command: ["npm", "run", "cleanup:worker"]
+    environment:
+      NODE_ENV: production
+      TZ: Asia/Shanghai
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: lanzou_hub
+      DB_USER: lanzou_hub
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_POOL_LIMIT: ${DB_POOL_LIMIT:-10}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ""
+      SEARCH_ENGINE: manticore
+      MANTICORE_URL: http://manticore:9308
+      MANTICORE_INDEX: ${MANTICORE_INDEX:-lrh_resources}
+      CLEANUP_SCAN_BATCH: ${CLEANUP_SCAN_BATCH:-5000}
+      CLEANUP_WRITE_BATCH: ${CLEANUP_WRITE_BATCH:-5000}
+      CLEANUP_GROUP_BATCH: ${CLEANUP_GROUP_BATCH:-200}
+      CLEANUP_TEMP_DELETE_BATCH: ${CLEANUP_TEMP_DELETE_BATCH:-50000}
+      CLEANUP_WORKER_INTERVAL_MS: ${CLEANUP_WORKER_INTERVAL_MS:-5000}
+      CLEANUP_WORKER_STALE_SECONDS: ${CLEANUP_WORKER_STALE_SECONDS:-600}
+    volumes:
+      - ./logs:/app/logs
+    deploy:
+      resources:
+        limits:
+          memory: 512M
     networks: [internal]
 
 volumes:

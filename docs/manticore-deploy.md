@@ -55,6 +55,12 @@ Use the admin panel:
 
 The panel shows Manticore health, indexed documents, MySQL resource count, outbox queue size, current scan job, and job history. It can start full rebuilds, incremental scans, pause a running job, resume from the saved checkpoint, and retry failed outbox items.
 
+Full/incremental scan jobs are executed by the `search-worker` container, not by the web `app` container. The same worker also drains `search_index_outbox` in a separate loop so normal incremental upserts/deletes can continue while a rebuild is running.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.search.yml logs -f search-worker
+```
+
 You can also run the CLI reindexer:
 
 ```bash
@@ -74,3 +80,22 @@ docker compose -f docker-compose.yml -f docker-compose.search.yml exec app npm r
 - New or changed resources are written through `search_index_outbox`.
 - Empty searches and resource management pagination still use MySQL cursor queries.
 - Keep MySQL backups. Manticore can always be rebuilt from MySQL.
+
+## Cleanup Worker
+
+The search compose file also starts `cleanup-worker`. The admin cleanup page only creates queued cleanup runs; candidate generation and candidate application run in this worker.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.search.yml logs -f cleanup-worker
+```
+
+Cleanup runs now use these states:
+
+- `queued`: waiting for `cleanup-worker` to generate candidates.
+- `running`: generating candidates.
+- `review_ready`: candidates are ready for review.
+- `apply_queued`: waiting for `cleanup-worker` to apply candidates.
+- `applying`: soft-deleting candidates in batches.
+- `paused`, `failed`, `completed`, `undone`: terminal or operator-controlled states.
+
+If a worker disappears while a run is active, the next worker pass auto-pauses stale runs based on `CLEANUP_WORKER_STALE_SECONDS`.

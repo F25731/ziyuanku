@@ -832,7 +832,7 @@ function dashboard() {
       return Math.min(100, Math.round((Number(job.total_seen || 0) / Number(job.total_resources || 1)) * 100));
     },
     searchJobStatusText(status) {
-      return ({ queued: '排队中', running: '运行中', completed: '已完成', failed: '失败', paused: '已暂停' })[status] || status || '-';
+      return ({ queued: '排队中', running: '运行中', completed: '已完成', failed: '失败', paused: '已暂停', apply_queued: '应用排队中', applying: '应用中' })[status] || status || '-';
     },
     async startSearchIndexJob(mode) {
       if (mode === 'full' && !confirm('全量重建会从资源表头部重新扫描并覆盖写入 Manticore，继续？')) return;
@@ -1118,7 +1118,7 @@ function dashboard() {
       const c = this.cleanup.currentRun;
       if (!c || !c.target_total) return 0;
       if (c.status === 'review_ready' || c.status === 'completed') return 100;
-      if (c.status === 'applying') {
+      if (c.status === 'applying' || c.status === 'apply_queued') {
         const total = Number(c.total_removed || c.candidate_total || 0);
         return total > 0 ? Math.min(99, Math.floor((Number(c.applied_total || 0) / total) * 100)) : 0;
       }

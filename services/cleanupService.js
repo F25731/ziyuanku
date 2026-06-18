@@ -4,11 +4,14 @@ const HttpError = require('../utils/httpError');
 
 const BATCH_SCAN = Math.max(500, Number(process.env.CLEANUP_SCAN_BATCH || 5000));
 const BATCH_WRITE = Math.max(500, Number(process.env.CLEANUP_WRITE_BATCH || 5000));
+const GROUP_BATCH = Math.max(20, Number(process.env.CLEANUP_GROUP_BATCH || 200));
+const TEMP_DELETE_BATCH = Math.max(5000, Number(process.env.CLEANUP_TEMP_DELETE_BATCH || 50000));
+const STALE_SECONDS = Math.max(60, Number(process.env.CLEANUP_WORKER_STALE_SECONDS || 600));
 const SAMPLE_LIMIT = 50;
 const PROGRESS_FLUSH_MS = 2000;
+const WORKER_ID = `${process.env.HOSTNAME || 'cleanup-worker'}:${process.pid}`;
 
-// runId -> { pauseRequested: bool }
-const runningCleanups = new Map();
+const ACTIVE_STATUSES = ['queued', 'running', 'apply_queued', 'applying'];
 
 async function getSettings() {
   const [[row]] = await pool.query('SELECT * FROM cleanup_settings WHERE id = 1 LIMIT 1');
@@ -130,10 +133,11 @@ function compileRule(cfg) {
       return qualMatch.test(String(name || ''));
     },
     extractKey(name) {
-      let s = String(name || '');
+      let s = normalizeNameForCleanup(name);
       if (ke.strip_ext) s = s.replace(/\.[A-Za-z0-9]{1,8}$/i, '');
       if (ke.strip_brackets) {
-        s = s.replace(/[\[【(（][^\]】)）]{0,50}[\]】)）]/g, ' ');
+        s = s.replace(/[《〈「『](.*?)[》〉」』]/g, '$1');
+        s = s.replace(/[\[【(（][^\]】)）]{0,80}[\]】)）]/g, ' ');
       }
       let author = '';
       if (ke.strip_author || ke.include_author_in_key) {
@@ -163,6 +167,22 @@ function compileRule(cfg) {
     formatFilter: { mode: ff.mode || 'off', set: ffSet },
     sizeFilter: sfCompiled
   };
+}
+
+function normalizeNameForCleanup(name) {
+  return String(name || '')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&ldquo;|&rdquo;|&#8220;|&#8221;/gi, '"')
+    .replace(/&lsquo;|&rsquo;|&#8216;|&#8217;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&#(\d+);/g, (_, n) => {
+      const code = Number(n);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : ' ';
+    })
+    .normalize('NFKC');
 }
 
 function getExt(name) {
@@ -229,9 +249,71 @@ async function countLiveResources(scopeIds) {
   return Number(row.total || 0);
 }
 
-function shouldPause(runId) {
-  const e = runningCleanups.get(Number(runId));
-  return !!(e && e.pauseRequested);
+function activePlaceholders() {
+  return ACTIVE_STATUSES.map(() => '?').join(',');
+}
+
+async function getRunStatus(runId) {
+  const [[row]] = await pool.query('SELECT status FROM cleanup_runs WHERE id=? LIMIT 1', [Number(runId)]);
+  return row ? row.status : null;
+}
+
+async function shouldContinue(runId, status) {
+  return (await getRunStatus(runId)) === status;
+}
+
+async function heartbeat(runId, patch = {}) {
+  const fields = ['worker_id=?', 'worker_heartbeat_at=NOW()'];
+  const params = [WORKER_ID];
+  if (patch.error_message !== undefined) {
+    fields.push('error_message=?');
+    params.push(patch.error_message);
+  }
+  if (patch.total_examined !== undefined) {
+    fields.push('total_examined=?');
+    params.push(Number(patch.total_examined) || 0);
+  }
+  if (patch.last_scanned_id !== undefined) {
+    fields.push('last_scanned_id=?');
+    params.push(Number(patch.last_scanned_id) || 0);
+  }
+  if (patch.applied_total !== undefined) {
+    fields.push('applied_total=?');
+    params.push(Number(patch.applied_total) || 0);
+  }
+  params.push(Number(runId));
+  await pool.query(`UPDATE cleanup_runs SET ${fields.join(', ')} WHERE id=?`, params).catch(() => {});
+}
+
+async function markStaleWorkerRuns() {
+  const seconds = Math.max(60, Number(STALE_SECONDS) || 600);
+  await pool.query(
+    `UPDATE cleanup_runs
+        SET status='paused',
+            error_message=CONCAT(COALESCE(error_message, ''), IF(error_message IS NULL OR error_message='', '', '\n'), 'worker heartbeat stale; auto paused'),
+            paused_at=NOW(),
+            worker_id=NULL
+      WHERE status IN ('running','applying')
+        AND worker_heartbeat_at IS NOT NULL
+        AND worker_heartbeat_at < DATE_SUB(NOW(), INTERVAL ${seconds} SECOND)`
+  ).catch(() => {});
+}
+
+async function deleteRunRows(table, runId, { heartbeatMessage = null } = {}) {
+  const limit = Math.max(1, Number(TEMP_DELETE_BATCH) || 50000);
+  while (true) {
+    if (heartbeatMessage) await heartbeat(runId, { error_message: heartbeatMessage });
+    const [r] = await pool.query(`DELETE FROM ${table} WHERE run_id=? LIMIT ${limit}`, [Number(runId)]);
+    if (!r.affectedRows || r.affectedRows < limit) break;
+  }
+}
+
+async function clearRunWorkingData(runId, { includeCandidates = true, quiet = false } = {}) {
+  if (includeCandidates) await deleteRunRows('cleanup_candidates', runId, { heartbeatMessage: quiet ? null : '正在清理上次候选数据...' });
+  await deleteRunRows('cleanup_dedupe_keys', runId, { heartbeatMessage: quiet ? null : '正在清理去重临时数据...' });
+  await deleteRunRows('cleanup_dedupe_groups', runId, { heartbeatMessage: quiet ? null : '正在清理去重分组数据...' });
+  await pool.query('DELETE FROM cleanup_run_samples WHERE run_id=?', [Number(runId)]).catch(() => {});
+  await pool.query('DELETE FROM cleanup_deleted WHERE run_id=?', [Number(runId)]).catch(() => {});
 }
 
 async function startCleanup({ ruleId, scopeSourceIds = [], crossSource = false, dryRun = true } = {}) {
@@ -245,14 +327,15 @@ async function startCleanup({ ruleId, scopeSourceIds = [], crossSource = false, 
   if (liveTotal === 0) throw new HttpError(400, 'no live resources in this scope');
 
   const [[busy]] = await pool.query(
-    "SELECT id FROM cleanup_runs WHERE status IN ('running','applying') ORDER BY id DESC LIMIT 1"
+    `SELECT id FROM cleanup_runs WHERE status IN (${activePlaceholders()}) ORDER BY id DESC LIMIT 1`,
+    ACTIVE_STATUSES
   );
   if (busy && busy.id) return { run_id: busy.id, already_running: true, total_examined: liveTotal };
 
   const [r] = await pool.query(
     `INSERT INTO cleanup_runs
        (rule_id, rule_name_snapshot, config_snapshot, scope_source_ids, cross_source, dry_run, status, confirm_over, total_examined)
-     VALUES (?, ?, ?, ?, ?, ?, 'running', 0, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, ?)`,
     [
       rule.id,
       rule.name,
@@ -260,63 +343,47 @@ async function startCleanup({ ruleId, scopeSourceIds = [], crossSource = false, 
       scopeIds.length ? scopeIds.join(',') : null,
       crossSource ? 1 : 0,
       dryRun ? 1 : 0,
-      liveTotal
+      0
     ]
   );
   const runId = r.insertId;
-  runningCleanups.set(runId, { pauseRequested: false });
-
-  setImmediate(() => {
-    generateCandidates({ runId, config, scopeIds, crossSource, liveTotal })
-      .catch(async (err) => {
-        console.error(`[cleanup #${runId}] failed:`, err);
-        const msg = String(err && err.message || err).slice(0, 1000);
-        await pool.query(
-          "UPDATE cleanup_runs SET status='failed', error_message=?, finished_at=NOW() WHERE id=?",
-          [msg, runId]
-        ).catch(() => {});
-      })
-      .finally(() => runningCleanups.delete(runId));
-  });
 
   return { run_id: runId, total_examined: liveTotal };
 }
 
 async function generateCandidates({ runId, config, scopeIds, crossSource, liveTotal }) {
   const compiled = compileRule(config);
-  await pool.query('DELETE FROM cleanup_candidates WHERE run_id=?', [runId]);
-  await pool.query('DELETE FROM cleanup_dedupe_keys WHERE run_id=?', [runId]);
-  await pool.query('DELETE FROM cleanup_run_samples WHERE run_id=?', [runId]);
-  await pool.query('DELETE FROM cleanup_deleted WHERE run_id=?', [runId]);
+  await clearRunWorkingData(runId, { includeCandidates: true });
+  await heartbeat(runId, { error_message: '正在扫描资源并生成候选...' });
 
   let scanned = 0;
   if (compiled.sizeFilter && compiled.sizeFilter.mode !== 'off') {
     scanned = Math.max(scanned, await generateSizeCandidates({ runId, compiled, scopeIds }));
-    if (shouldPause(runId)) return pauseRun(runId);
+    if (!(await shouldContinue(runId, 'running'))) return pauseRun(runId);
   }
   if (config.format_filter && config.format_filter.mode && config.format_filter.mode !== 'off') {
     scanned = Math.max(scanned, await generateFormatCandidates({ runId, compiled, scopeIds }));
-    if (shouldPause(runId)) return pauseRun(runId);
+    if (!(await shouldContinue(runId, 'running'))) return pauseRun(runId);
   }
   const hasDedupe = (config.score_rules && config.score_rules.length) || config.key_extractor;
   if (hasDedupe) {
     scanned = Math.max(scanned, await generateDedupeCandidates({ runId, compiled, scopeIds, crossSource }));
-    if (shouldPause(runId)) return pauseRun(runId);
+    if (!(await shouldContinue(runId, 'running'))) return pauseRun(runId);
   }
 
   await refreshRunCounts(runId, liveTotal || scanned);
   await persistSamplesFromCandidates(runId);
   await pool.query(
-    "UPDATE cleanup_runs SET status='review_ready', total_examined=?, finished_at=NOW(), error_message=NULL WHERE id=?",
+    "UPDATE cleanup_runs SET status='review_ready', worker_id=NULL, worker_heartbeat_at=NULL, total_examined=?, finished_at=NOW(), error_message=NULL WHERE id=? AND status='running'",
     [liveTotal || scanned, runId]
   );
-  await pool.query('DELETE FROM cleanup_dedupe_keys WHERE run_id=?', [runId]).catch(() => {});
+  await clearRunWorkingData(runId, { includeCandidates: false, quiet: true });
 }
 
 async function pauseRun(runId) {
   await refreshRunCounts(runId);
   await persistSamplesFromCandidates(runId);
-  await pool.query("UPDATE cleanup_runs SET status='paused', paused_at=NOW() WHERE id=?", [runId]);
+  await pool.query("UPDATE cleanup_runs SET status='paused', paused_at=NOW(), worker_id=NULL, worker_heartbeat_at=NULL WHERE id=? AND status IN ('running','applying')", [runId]);
 }
 
 async function insertCandidates(rows) {
@@ -359,7 +426,7 @@ async function generateSizeCandidates({ runId, compiled, scopeIds }) {
   let lastReportAt = 0;
   const scope = scopeWhere(scopeIds, 'r');
   while (true) {
-    if (shouldPause(runId)) return examined;
+    if (!(await shouldContinue(runId, 'running'))) return examined;
     const [rows] = await pool.query(
       `SELECT r.id, r.source_id, r.file_name, r.file_size
          FROM resources r
@@ -411,7 +478,7 @@ async function generateFormatCandidates({ runId, compiled, scopeIds }) {
   let lastReportAt = 0;
   const scope = scopeWhere(scopeIds, 'r');
   while (true) {
-    if (shouldPause(runId)) return examined;
+    if (!(await shouldContinue(runId, 'running'))) return examined;
     const [rows] = await pool.query(
       `SELECT r.id, r.source_id, r.file_name
          FROM resources r
@@ -486,7 +553,7 @@ async function generateDedupeCandidates({ runId, compiled, scopeIds, crossSource
   let lastReportAt = 0;
   const scope = scopeWhere(scopeIds, 'r');
   while (true) {
-    if (shouldPause(runId)) return examined;
+    if (!(await shouldContinue(runId, 'running'))) return examined;
     const [rows] = await pool.query(
       `SELECT r.id, r.source_id, r.file_name, r.file_type
          FROM resources r
@@ -521,33 +588,82 @@ async function generateDedupeCandidates({ runId, compiled, scopeIds, crossSource
     }
   }
   await progress(runId, examined, lastId);
+  await refreshRunCounts(runId, examined);
+  await heartbeat(runId, { error_message: '正在生成去重分组...' });
   await insertDedupeLosers(runId, compiled.tieBreaker);
   return examined;
 }
 
 async function insertDedupeLosers(runId, tieBreaker) {
   const idOrder = tieBreaker === 'id_asc' ? 'ASC' : 'DESC';
+  await deleteRunRows('cleanup_dedupe_groups', runId, { heartbeatMessage: '正在重置去重分组...' });
   await pool.query(
-    `INSERT IGNORE INTO cleanup_candidates
-       (run_id, resource_id, reason, source_id, file_name, group_key, score, ext, winner_id, winner_file_name, status)
-     SELECT run_id, resource_id, 'dedupe', source_id, file_name, group_key, score, ext, winner_id, winner_file_name, 'candidate'
-       FROM (
-         SELECT k.*,
-                ROW_NUMBER() OVER (PARTITION BY k.group_key ORDER BY k.score DESC, k.resource_id ${idOrder}) AS rn,
-                FIRST_VALUE(k.resource_id) OVER (PARTITION BY k.group_key ORDER BY k.score DESC, k.resource_id ${idOrder}) AS winner_id,
-                FIRST_VALUE(k.file_name) OVER (PARTITION BY k.group_key ORDER BY k.score DESC, k.resource_id ${idOrder}) AS winner_file_name
-           FROM cleanup_dedupe_keys k
-          WHERE k.run_id = ?
-       ) ranked
-      WHERE rn > 1`,
+    `INSERT INTO cleanup_dedupe_groups (run_id, group_key, total, processed)
+     SELECT run_id, group_key, COUNT(*) AS total, 0
+       FROM cleanup_dedupe_keys
+      WHERE run_id=?
+      GROUP BY run_id, group_key
+     HAVING COUNT(*) > 1`,
     [runId]
   );
+
+  while (await shouldContinue(runId, 'running')) {
+    const [groups] = await pool.query(
+      `SELECT group_key
+         FROM cleanup_dedupe_groups
+        WHERE run_id=? AND processed=0
+        ORDER BY group_key ASC
+        LIMIT ?`,
+      [runId, GROUP_BATCH]
+    );
+    if (!groups.length) break;
+    const groupKeys = groups.map((g) => g.group_key);
+    const [rows] = await pool.query(
+      `SELECT resource_id, source_id, group_key, score, file_name, ext
+         FROM cleanup_dedupe_keys
+        WHERE run_id=? AND group_key IN (?)
+        ORDER BY group_key ASC, score DESC, resource_id ${idOrder}`,
+      [runId, groupKeys]
+    );
+
+    const candidates = [];
+    let currentKey = null;
+    let winner = null;
+    for (const row of rows) {
+      if (row.group_key !== currentKey) {
+        currentKey = row.group_key;
+        winner = row;
+        continue;
+      }
+      candidates.push({
+        run_id: runId,
+        resource_id: row.resource_id,
+        reason: 'dedupe',
+        source_id: row.source_id,
+        file_name: row.file_name,
+        group_key: row.group_key,
+        score: row.score,
+        ext: row.ext,
+        winner_id: winner.resource_id,
+        winner_file_name: winner.file_name
+      });
+    }
+    await insertCandidates(candidates);
+    await pool.query(
+      `UPDATE cleanup_dedupe_groups
+          SET processed=1, processed_at=NOW()
+        WHERE run_id=? AND group_key IN (?)`,
+      [runId, groupKeys]
+    );
+    await refreshRunCounts(runId);
+    await heartbeat(runId, { error_message: `正在生成去重候选：本批 ${candidates.length} 条` });
+  }
 }
 
 async function progress(runId, examined, lastId) {
   await pool.query(
-    'UPDATE cleanup_runs SET total_examined=?, last_scanned_id=? WHERE id=?',
-    [examined, lastId, runId]
+    'UPDATE cleanup_runs SET total_examined=?, last_scanned_id=?, worker_id=?, worker_heartbeat_at=NOW() WHERE id=?',
+    [examined, lastId, WORKER_ID, runId]
   ).catch(() => {});
 }
 
@@ -606,11 +722,14 @@ async function persistSamplesFromCandidates(runId) {
   );
 }
 
-function requestPause(runId) {
-  const e = runningCleanups.get(Number(runId));
-  if (!e) return false;
-  e.pauseRequested = true;
-  return true;
+async function requestPause(runId) {
+  const [r] = await pool.query(
+    `UPDATE cleanup_runs
+        SET status='paused', paused_at=NOW(), worker_id=NULL
+      WHERE id=? AND status IN (${activePlaceholders()})`,
+    [Number(runId), ...ACTIVE_STATUSES]
+  );
+  return (r.affectedRows || 0) > 0;
 }
 
 async function resumeRun(oldRunId) {
@@ -619,36 +738,18 @@ async function resumeRun(oldRunId) {
   if (!['paused', 'failed'].includes(row.status)) {
     throw new HttpError(400, 'only paused/failed cleanup runs can be resumed');
   }
-  const config = typeof row.config_snapshot === 'string' ? JSON.parse(row.config_snapshot) : row.config_snapshot;
   const scopeIds = row.scope_source_ids ? row.scope_source_ids.split(',').map(Number).filter(Boolean) : [];
   const liveTotal = await countLiveResources(scopeIds);
   await pool.query(
     `UPDATE cleanup_runs
-        SET status='running', total_examined=?, candidate_total=0, applied_total=0,
+        SET status='queued', total_examined=0, candidate_total=0, applied_total=0,
             removed_by_format=0, removed_by_dedupe=0, last_scanned_id=0,
-            error_message=NULL, finished_at=NULL, paused_at=NULL
+            error_message=NULL, finished_at=NULL, paused_at=NULL,
+            worker_id=NULL, worker_heartbeat_at=NULL
       WHERE id=?`,
-    [liveTotal, oldRunId]
+    [oldRunId]
   );
-  runningCleanups.set(Number(oldRunId), { pauseRequested: false });
-  setImmediate(() => {
-    generateCandidates({
-      runId: Number(oldRunId),
-      config,
-      scopeIds,
-      crossSource: !!row.cross_source,
-      liveTotal
-    })
-      .catch(async (err) => {
-        console.error(`[cleanup #${oldRunId}] resume failed:`, err);
-        await pool.query(
-          "UPDATE cleanup_runs SET status='failed', error_message=?, finished_at=NOW() WHERE id=?",
-          [String(err && err.message || err).slice(0, 1000), oldRunId]
-        ).catch(() => {});
-      })
-      .finally(() => runningCleanups.delete(Number(oldRunId)));
-  });
-  return { run_id: Number(oldRunId) };
+  return { run_id: Number(oldRunId), total_examined: liveTotal };
 }
 
 async function applyRun(runId, { confirmOver = false } = {}) {
@@ -677,13 +778,25 @@ async function applyRun(runId, { confirmOver = false } = {}) {
     throw new HttpError(422, msg);
   }
 
-  runningCleanups.set(Number(runId), { pauseRequested: false });
-  await pool.query("UPDATE cleanup_runs SET status='applying', dry_run=0, confirm_over=?, error_message=NULL WHERE id=?", [confirmOver ? 1 : 0, runId]);
+  await pool.query(
+    "UPDATE cleanup_runs SET status='apply_queued', dry_run=0, confirm_over=?, error_message=NULL, worker_id=NULL, worker_heartbeat_at=NULL WHERE id=?",
+    [confirmOver ? 1 : 0, runId]
+  );
+  return { applied: Number(run.applied_total || 0), queued: true };
+}
+
+async function applyRunNow(runId) {
+  const [[run]] = await pool.query('SELECT * FROM cleanup_runs WHERE id=? LIMIT 1', [runId]);
+  if (!run) throw new HttpError(404, 'cleanup run not found');
+  if (run.status !== 'applying') return { applied: Number(run.applied_total || 0), skipped: true };
+  const liveTotal = Number(run.total_examined || 0) || await countLiveResources(
+    run.scope_source_ids ? String(run.scope_source_ids).split(',').map(Number).filter(Boolean) : []
+  );
   let applied = Number(run.applied_total || 0);
   try {
     while (true) {
-      if (shouldPause(runId)) {
-        await pool.query("UPDATE cleanup_runs SET status='paused', applied_total=?, paused_at=NOW() WHERE id=?", [applied, runId]);
+      if (!(await shouldContinue(runId, 'applying'))) {
+        await pool.query("UPDATE cleanup_runs SET status='paused', applied_total=?, paused_at=NOW(), worker_id=NULL WHERE id=? AND status='paused'", [applied, runId]);
         return { applied, paused: true };
       }
       const [rows] = await pool.query(
@@ -710,16 +823,15 @@ async function applyRun(runId, { confirmOver = false } = {}) {
         console.warn('[cleanup] enqueue search deletes failed:', err.message);
       });
       applied += ids.length;
-      await pool.query('UPDATE cleanup_runs SET applied_total=? WHERE id=?', [applied, runId]).catch(() => {});
+      await heartbeat(runId, { applied_total: applied, error_message: null });
     }
     await refreshRunCounts(runId, liveTotal);
     await pool.query(
-      "UPDATE cleanup_runs SET status='completed', applied_total=?, finished_at=NOW() WHERE id=?",
+      "UPDATE cleanup_runs SET status='completed', applied_total=?, finished_at=NOW(), worker_id=NULL, worker_heartbeat_at=NULL WHERE id=?",
       [applied, runId]
     );
     return { applied };
   } finally {
-    runningCleanups.delete(Number(runId));
   }
 }
 
@@ -799,9 +911,7 @@ async function getRun(runId) {
   );
   if (!row) return null;
   const samples = await getRunSamples(runId, 100);
-  const aliveInProc = runningCleanups.has(Number(row.id));
-  let displayStatus = row.status;
-  if (['running', 'applying'].includes(row.status) && !aliveInProc) displayStatus = 'orphaned';
+  const displayStatus = row.status;
 
   let safetyBlocked = false;
   let errMsg = row.error_message || null;
@@ -819,7 +929,7 @@ async function getRun(runId) {
     dry_run: !!row.dry_run,
     confirm_over: !!row.confirm_over,
     status: displayStatus,
-    is_running: displayStatus === 'running' || displayStatus === 'applying',
+    is_running: ['queued', 'running', 'apply_queued', 'applying'].includes(displayStatus),
     is_review_ready: displayStatus === 'review_ready',
     safety_blocked: safetyBlocked,
     total_examined: Number(row.total_examined || 0),
@@ -861,6 +971,79 @@ async function getRunSamples(runId, limit = 50) {
   return fallback;
 }
 
+async function claimNextWorkerRun() {
+  await markStaleWorkerRuns();
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [applyRows] = await conn.query(
+      "SELECT id FROM cleanup_runs WHERE status='apply_queued' ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED"
+    );
+    if (applyRows.length) {
+      const id = Number(applyRows[0].id);
+      await conn.query(
+        "UPDATE cleanup_runs SET status='applying', worker_id=?, worker_heartbeat_at=NOW(), started_at=COALESCE(started_at, NOW()), finished_at=NULL, paused_at=NULL WHERE id=?",
+        [WORKER_ID, id]
+      );
+      await conn.commit();
+      return { id, type: 'apply' };
+    }
+
+    const [generateRows] = await conn.query(
+      "SELECT id FROM cleanup_runs WHERE status='queued' ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED"
+    );
+    if (generateRows.length) {
+      const id = Number(generateRows[0].id);
+      await conn.query(
+        "UPDATE cleanup_runs SET status='running', worker_id=?, worker_heartbeat_at=NOW(), started_at=COALESCE(started_at, NOW()), finished_at=NULL, paused_at=NULL WHERE id=?",
+        [WORKER_ID, id]
+      );
+      await conn.commit();
+      return { id, type: 'generate' };
+    }
+
+    await conn.commit();
+    return null;
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+async function processNextWorkerRun() {
+  const job = await claimNextWorkerRun();
+  if (!job) return { processed: 0 };
+  try {
+    if (job.type === 'apply') {
+      const r = await applyRunNow(job.id);
+      return { processed: 1, type: job.type, run_id: job.id, ...r };
+    }
+
+    const [[run]] = await pool.query('SELECT * FROM cleanup_runs WHERE id=? LIMIT 1', [job.id]);
+    if (!run) return { processed: 1, type: job.type, run_id: job.id, skipped: true };
+    const config = typeof run.config_snapshot === 'string' ? JSON.parse(run.config_snapshot) : run.config_snapshot;
+    const scopeIds = run.scope_source_ids ? String(run.scope_source_ids).split(',').map(Number).filter(Boolean) : [];
+    const liveTotal = Number(run.total_examined || 0) || await countLiveResources(scopeIds);
+    await generateCandidates({
+      runId: job.id,
+      config,
+      scopeIds,
+      crossSource: !!run.cross_source,
+      liveTotal
+    });
+    return { processed: 1, type: job.type, run_id: job.id };
+  } catch (err) {
+    console.error(`[cleanup-worker] run #${job.id} ${job.type} failed:`, err);
+    await pool.query(
+      "UPDATE cleanup_runs SET status='failed', error_message=?, finished_at=NOW(), worker_id=NULL, worker_heartbeat_at=NULL WHERE id=?",
+      [String(err && err.message || err).slice(0, 1000), job.id]
+    ).catch(() => {});
+    return { processed: 1, failed: 1, type: job.type, run_id: job.id };
+  }
+}
+
 module.exports = {
   listRules,
   getRule,
@@ -877,5 +1060,7 @@ module.exports = {
   listRuns,
   getRun,
   getLatestRun,
-  getRunSamples
+  getRunSamples,
+  processNextWorkerRun,
+  markStaleWorkerRuns
 };

@@ -368,8 +368,8 @@ router.get('/cleanup/runs/:id/samples', asyncHandler(async (req, res) => {
   res.json({ code: 200, items });
 }));
 router.post('/cleanup/runs/:id/pause', adminRequired, asyncHandler(async (req, res) => {
-  const ok = cleanupService.requestPause(Number(req.params.id));
-  if (!ok) return res.status(409).json({ code: 409, message: 'Run 不在运行中（可能已结束或不在本进程内）' });
+  const ok = await cleanupService.requestPause(Number(req.params.id));
+  if (!ok) return res.status(409).json({ code: 409, message: 'Run 不在运行中（可能已结束或已暂停）' });
   res.json({ code: 200, message: '已发送暂停信号' });
 }));
 router.post('/cleanup/runs/:id/resume', adminRequired, asyncHandler(async (req, res) => {
@@ -378,7 +378,7 @@ router.post('/cleanup/runs/:id/resume', adminRequired, asyncHandler(async (req, 
 }));
 router.post('/cleanup/runs/:id/apply', adminRequired, asyncHandler(async (req, res) => {
   const r = await cleanupService.applyRun(Number(req.params.id), { confirmOver: !!(req.body && req.body.confirmOver) });
-  res.json({ code: 200, message: r.paused ? '已暂停应用' : '候选已应用', ...r });
+  res.json({ code: 200, message: r.queued ? '已加入应用队列' : (r.paused ? '已暂停应用' : '候选已应用'), ...r });
 }));
 router.post('/cleanup/runs/:id/undo', adminRequired, asyncHandler(async (req, res) => {
   await cleanupService.undoRun(Number(req.params.id));

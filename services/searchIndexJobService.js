@@ -4,6 +4,7 @@ const searchIndex = require('./searchIndexService');
 const DEFAULT_BATCH = Math.max(50, Number(process.env.SEARCH_REINDEX_BATCH || 1000));
 const DEFAULT_ATTEMPTS = Math.max(1, Number(process.env.MANTICORE_RETRY_ATTEMPTS || 5));
 const OUTBOX_MAX_ATTEMPTS = Math.max(1, Number(process.env.SEARCH_OUTBOX_MAX_ATTEMPTS || 10));
+const STALE_SECONDS = Math.max(60, Number(process.env.SEARCH_JOB_STALE_SECONDS || 600));
 
 const running = new Map();
 
@@ -14,6 +15,10 @@ function currentEngine() {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function runInlineJobs() {
+  return String(process.env.SEARCH_INDEX_JOB_INLINE || '0') === '1';
 }
 
 function normalizeJob(row) {
@@ -84,7 +89,9 @@ async function createJob({ mode = 'full', sourceId = null, batchSize = DEFAULT_B
   }
   const active = await getActiveJob();
   if (active) {
-    if (!running.has(Number(active.id))) runJob(active.id).catch((err) => console.error('[searchJob] takeover failed:', err.message));
+    if (runInlineJobs() && !running.has(Number(active.id))) {
+      runJob(active.id).catch((err) => console.error('[searchJob] takeover failed:', err.message));
+    }
     return { already_running: true, job: active };
   }
 
@@ -102,7 +109,7 @@ async function createJob({ mode = 'full', sourceId = null, batchSize = DEFAULT_B
     [mode, currentEngine(), sourceId, bs, attempts, startId, startId, totalResources]
   );
   const id = r.insertId;
-  runJob(id).catch((err) => console.error('[searchJob] failed:', err.message));
+  if (runInlineJobs()) runJob(id).catch((err) => console.error('[searchJob] failed:', err.message));
   return { already_running: false, job: await getJob(id) };
 }
 
@@ -119,7 +126,7 @@ async function resumeJob(id) {
       WHERE id=?`,
     [currentEngine(), Number(job.total_seen || 0) + totalResources, Number(id)]
   );
-  runJob(Number(id)).catch((err) => console.error('[searchJob] resume failed:', err.message));
+  if (runInlineJobs()) runJob(Number(id)).catch((err) => console.error('[searchJob] resume failed:', err.message));
   return { already_running: false, job: await getJob(id) };
 }
 
@@ -266,6 +273,48 @@ async function runJob(id) {
   }
 }
 
+async function markStaleSearchJobs() {
+  const seconds = Math.max(60, Number(STALE_SECONDS) || 600);
+  await pool.query(
+    `UPDATE search_index_jobs
+        SET status='paused',
+            last_error=CONCAT(COALESCE(last_error, ''), IF(last_error IS NULL OR last_error='', '', '\n'), 'worker heartbeat stale; auto paused'),
+            finished_at=NOW()
+      WHERE status='running'
+        AND updated_at < DATE_SUB(NOW(), INTERVAL ${seconds} SECOND)`
+  ).catch(() => {});
+}
+
+async function processNextJob() {
+  await markStaleSearchJobs();
+  const conn = await pool.getConnection();
+  let id = null;
+  try {
+    await conn.beginTransaction();
+    const [rows] = await conn.query(
+      "SELECT id FROM search_index_jobs WHERE status='queued' AND engine=? ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED",
+      [currentEngine()]
+    );
+    if (!rows.length) {
+      await conn.commit();
+      return { processed: 0 };
+    }
+    id = Number(rows[0].id);
+    await conn.query(
+      "UPDATE search_index_jobs SET status='running', started_at=COALESCE(started_at, NOW()), finished_at=NULL WHERE id=? AND status='queued'",
+      [id]
+    );
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+  await runJob(id);
+  return { processed: 1, job_id: id };
+}
+
 async function getOutboxStats() {
   const [[row]] = await pool.query(
     `SELECT COUNT(*) AS total,
@@ -328,5 +377,7 @@ module.exports = {
   getJob,
   listJobs,
   getStatus,
-  retryFailedOutbox
+  retryFailedOutbox,
+  processNextJob,
+  markStaleSearchJobs
 };
