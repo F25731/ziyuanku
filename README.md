@@ -7,7 +7,7 @@ Headless 蓝奏云资源库。只做资源聚合、搜索、直链生成三件�
 - 后台账号密码登录（JWT），无注册/无会员/无卡密
 - 蓝奏账号（ilanzou 新版）一键同步 → 入库
 - `api.v1` 对外接口：搜索、取资源详情、换直链
-- 可选 Meilisearch 轻量搜索层：只索引 `id/file_name/source_id/file_type`，详情仍回 MySQL
+- 可选 Manticore 轻量搜索层：只索引 `id/file_name/source_id/file_type`，详情仍回 MySQL
 - 每个下游站点一枚 API Key，可配 日/总配额 + 每分钟限流
 - 直链 Redis 缓存，降低被风控概率
 - 精美 Tailwind 后台（仪表盘 / 资源 / 来源 / API Key / 同步日志 / 调用日志）
@@ -30,18 +30,17 @@ GET  /api/admin/stats
 
 ## 轻量搜索层
 
-默认部署可以继续使用 MySQL FULLTEXT。资源量变大后，推荐启用 Meilisearch：
+默认部署可以继续使用 MySQL FULLTEXT。资源量变大后，推荐启用 Manticore：
 
 ```bash
 cd /opt/lanzou-hub
-echo 'MEILI_MASTER_KEY=改成一串长随机密钥' >> .env
 docker compose -f docker-compose.yml -f docker-compose.search.yml up -d --build
 docker compose -f docker-compose.yml -f docker-compose.search.yml exec app npm run reindex:search
 ```
 
 启用后：
 
-- Meilisearch 只存 `id`、`file_name`、`source_id`、`file_type`
+- Manticore 只存 `id`、`file_name`、`source_id`、`file_type`
 - 搜索先返回 ID，再回 MySQL 批量取完整详情
 - `lrh-search-worker` 独立处理增量索引 outbox
 - 中断重建可用 `npm run reindex:search -- --resume`

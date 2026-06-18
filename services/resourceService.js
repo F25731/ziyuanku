@@ -288,7 +288,7 @@ async function upsertResources(sourceId, files) {
     await conn.commit();
 
     // 阶段5 之后：搜索完全靠 MySQL FULLTEXT 索引（005 migration 建好），
-    // upsert 写完就能搜——不再需要异步双写到 Meilisearch
+    // upsert 写完就能搜；外部索引通过 outbox 异步补齐。
     const fileIds = files.map((f) => f.file_id).filter(Boolean);
     searchOutbox.enqueueUpsertsBySourceFileIds(sourceId, fileIds).catch((e) => {
       console.warn('[searchOutbox] enqueue failed:', e.message);

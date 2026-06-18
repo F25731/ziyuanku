@@ -18,7 +18,7 @@ table th, table td { padding-top: 12px; padding-bottom: 12px; }
   aside.fixed { transform: translateX(-100%); }
 }
 
-/* Meilisearch 高亮词 */
+/* Search highlight */
 em {
   font-style: normal;
   background: linear-gradient(180deg, transparent 60%, #fde68a 60%);

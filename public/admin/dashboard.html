@@ -222,7 +222,7 @@
         </div>
       </section>
 
-      <!-- 搜索索引 / Meilisearch -->
+      <!-- 搜索索引 / Manticore -->
       <section x-show="tab === 'searchindex'" x-transition>
         <div class="bg-white rounded-xl shadow-sm border border-slate-100 p-5 mb-6 relative">
           <div x-show="tabLoading.searchindex" class="absolute inset-0 z-10 bg-white/70 backdrop-blur-sm flex items-center justify-center rounded-xl">
@@ -231,7 +231,7 @@
 
           <div class="flex flex-wrap items-start justify-between gap-4 mb-5">
             <div>
-              <h2 class="text-xl font-bold text-slate-800">Meilisearch 搜索索引</h2>
+              <h2 class="text-xl font-bold text-slate-800">Manticore 搜索索引</h2>
               <p class="text-xs text-slate-500 mt-1">只索引 id、file_name、source_id、file_type；详情仍回 MySQL 查询。</p>
             </div>
             <div class="flex flex-wrap gap-2">
@@ -244,15 +244,15 @@
           <div class="grid grid-cols-2 lg:grid-cols-5 gap-3 mb-5">
             <div class="rounded-lg border border-slate-100 bg-slate-50 p-4">
               <div class="text-xs text-slate-500">引擎</div>
-              <div class="mt-1 font-bold" :class="searchIndex.config.enabled ? 'text-emerald-600' : 'text-rose-600'" x-text="searchIndex.config.enabled ? 'Meilisearch' : '未启用'"></div>
+              <div class="mt-1 font-bold" :class="searchIndex.config.enabled ? 'text-emerald-600' : 'text-rose-600'" x-text="searchIndex.config.enabled ? 'Manticore' : '未启用'"></div>
             </div>
             <div class="rounded-lg border border-slate-100 bg-slate-50 p-4">
               <div class="text-xs text-slate-500">健康</div>
-              <div class="mt-1 font-bold" :class="searchIndex.meili.health && searchIndex.meili.health.ok ? 'text-emerald-600' : 'text-rose-600'" x-text="searchIndex.meili.health && searchIndex.meili.health.ok ? '在线' : '异常'"></div>
+              <div class="mt-1 font-bold" :class="searchIndex.engine.health && searchIndex.engine.health.ok ? 'text-emerald-600' : 'text-rose-600'" x-text="searchIndex.engine.health && searchIndex.engine.health.ok ? '在线' : '异常'"></div>
             </div>
             <div class="rounded-lg border border-slate-100 bg-slate-50 p-4">
               <div class="text-xs text-slate-500">索引文档</div>
-              <div class="mt-1 font-bold text-slate-800" x-text="searchIndex.meili.index && searchIndex.meili.index.numberOfDocuments != null ? searchIndex.meili.index.numberOfDocuments : '-'"></div>
+              <div class="mt-1 font-bold text-slate-800" x-text="searchIndex.engine.index && searchIndex.engine.index.numberOfDocuments != null ? searchIndex.engine.index.numberOfDocuments : '-'"></div>
             </div>
             <div class="rounded-lg border border-slate-100 bg-slate-50 p-4">
               <div class="text-xs text-slate-500">MySQL 资源</div>
@@ -263,10 +263,10 @@
               <div class="mt-1 font-bold text-slate-800" x-text="searchIndex.outbox.total ?? '-'"></div>
             </div>
           </div>
-          <div x-show="searchIndex.meili.task_summary && (searchIndex.meili.task_summary.processing || searchIndex.meili.task_summary.enqueued)" class="mb-5 rounded-lg border border-amber-100 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-            Meilisearch 仍在处理后台任务：
-            <b x-text="searchIndex.meili.task_summary.processing || 0"></b> 个处理中，
-            <b x-text="searchIndex.meili.task_summary.enqueued || 0"></b> 个排队中。索引文档数会在任务完成后继续上涨。
+          <div x-show="searchIndex.engine.task_summary && (searchIndex.engine.task_summary.processing || searchIndex.engine.task_summary.enqueued)" class="mb-5 rounded-lg border border-amber-100 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+            搜索引擎仍在处理后台任务：
+            <b x-text="searchIndex.engine.task_summary.processing || 0"></b> 个处理中，
+            <b x-text="searchIndex.engine.task_summary.enqueued || 0"></b> 个排队中。索引文档数会在任务完成后继续上涨。
           </div>
 
           <div class="grid lg:grid-cols-3 gap-4">
@@ -275,7 +275,6 @@
               <div class="space-y-2 text-xs text-slate-600">
                 <div class="flex justify-between gap-3"><span>URL</span><span class="font-mono text-right break-all" x-text="searchIndex.config.url || '-'"></span></div>
                 <div class="flex justify-between gap-3"><span>Index</span><span class="font-mono" x-text="searchIndex.config.index || '-'"></span></div>
-                <div class="flex justify-between gap-3"><span>Master Key</span><span x-text="searchIndex.config.has_master_key ? '已配置' : '未配置'"></span></div>
                 <div class="flex justify-between gap-3"><span>写入批量</span><span x-text="searchIndex.config.batch_size || '-'"></span></div>
                 <div class="flex justify-between gap-3"><span>重试次数</span><span x-text="searchIndex.config.retry_attempts || '-'"></span></div>
               </div>

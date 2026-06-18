@@ -4,10 +4,6 @@ const fs = require('fs');
 const path = require('path');
 const { pool } = require('../config/db');
 
-if (!process.env.MEILI_WAIT_TASKS) {
-  process.env.MEILI_WAIT_TASKS = process.env.MEILI_REINDEX_WAIT_TASKS || '1';
-}
-
 const searchIndex = require('../services/searchIndexService');
 
 const checkpointFile = process.env.SEARCH_REINDEX_CHECKPOINT_FILE
@@ -33,12 +29,12 @@ function writeCheckpoint(data) {
 
 async function main() {
   if (!searchIndex.isEnabled()) {
-    throw new Error('Meilisearch is not configured; set SEARCH_ENGINE=meilisearch and MEILI_URL first');
+    throw new Error('Manticore is not configured; set SEARCH_ENGINE=manticore and MANTICORE_URL first');
   }
   const ready = await searchIndex.ensureIndex();
   if (!ready) {
     const reason = typeof searchIndex.getLastError === 'function' ? searchIndex.getLastError() : '';
-    throw new Error(`Meilisearch index is not ready${reason ? `: ${reason}` : ''}`);
+    throw new Error(`Manticore index is not ready${reason ? `: ${reason}` : ''}`);
   }
 
   if (process.argv.includes('--reset')) {

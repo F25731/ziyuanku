@@ -149,7 +149,7 @@ function dashboard() {
     navs: [
       { key: 'dashboard', label: '仪表盘', desc: '资源库运行总览', icon: ICON.dashboard },
       { key: 'resources', label: '资源管理', desc: '库内所有资源的检索和维护', icon: ICON.resources },
-      { key: 'searchindex', label: '搜索索引', desc: 'Meilisearch 配置、状态、重建与增量补扫', icon: ICON.search },
+      { key: 'searchindex', label: '搜索索引', desc: 'Manticore 配置、状态、重建与增量补扫', icon: ICON.search },
       { key: 'sources',   label: '数据来源', desc: '蓝奏账号、分享链接来源配置', icon: ICON.sources },
       { key: 'apikeys',   label: 'API Key', desc: '对外开放的调用密钥，接入软件站时签发', icon: ICON.apikeys },
       { key: 'cleanup',   label: '数据清理', desc: '扫盘后去重、按格式过滤；可撤销', icon: ICON.cleanup || ICON.apikeys },
@@ -202,13 +202,13 @@ function dashboard() {
     searchIndex: {
       loading: false,
       config: {},
-      meili: {},
+      engine: {},
       mysql: {},
       outbox: {},
       activeJob: null,
       jobs: [],
       timer: null,
-      form: { batchSize: 200, maxAttempts: 5, sourceId: 0 }
+      form: { batchSize: 1000, maxAttempts: 5, sourceId: 0 }
     },
     linkModal: { open: false, fileName: '', url: '', expireText: '', cached: false, loading: false, error: '', detail: '' },
     errorModal: { open: false, title: '', message: '', detail: '' },
@@ -221,7 +221,7 @@ function dashboard() {
     tabLoading: { resources: false, searchindex: false, sources: false, apikeys: false, synclogs: false, calllogs: false, dashboard: false },
     // 搜索防抖计时器
     _searchDebounce: null,
-    searchEngine: '', // 'meili' / 'mysql'，搜完后显示
+    searchEngine: '', // 'manticore' / 'mysql'，搜完后显示
     searchMs: 0,
 
     docs: window.LRH_DOCS || { endpoints: [], examples: {}, errors: [], notes: [] },
@@ -800,13 +800,13 @@ function dashboard() {
       finally { this.tabLoading.calllogs = false; }
     },
 
-    // ---------- Meilisearch 搜索索引 ----------
+    // ---------- Manticore 搜索索引 ----------
     async loadSearchIndexStatus(silent = false) {
       if (!silent) this.tabLoading.searchindex = true;
       try {
         const d = await api('/search/status');
         this.searchIndex.config = d.config || {};
-        this.searchIndex.meili = d.meili || {};
+        this.searchIndex.engine = d.engine || {};
         this.searchIndex.mysql = d.mysql || {};
         this.searchIndex.outbox = d.outbox || {};
         this.searchIndex.activeJob = d.active_job || null;
@@ -835,7 +835,7 @@ function dashboard() {
       return ({ queued: '排队中', running: '运行中', completed: '已完成', failed: '失败', paused: '已暂停' })[status] || status || '-';
     },
     async startSearchIndexJob(mode) {
-      if (mode === 'full' && !confirm('全量重建会从资源表头部重新扫描并覆盖写入 Meilisearch，继续？')) return;
+      if (mode === 'full' && !confirm('全量重建会从资源表头部重新扫描并覆盖写入 Manticore，继续？')) return;
       const f = this.searchIndex.form;
       try {
         const d = await api('/search/jobs', {

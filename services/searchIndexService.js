@@ -2,29 +2,19 @@ const axios = require('axios');
 const { pool } = require('../config/db');
 
 const ENGINE = String(process.env.SEARCH_ENGINE || 'mysql').toLowerCase();
-const BASE_URL = String(process.env.MEILI_URL || '').replace(/\/+$/, '');
-const MASTER_KEY = process.env.MEILI_MASTER_KEY || '';
-const INDEX = process.env.MEILI_INDEX || 'lrh_resources';
-const TIMEOUT = Math.max(1000, Number(process.env.SEARCH_TIMEOUT_MS || 5000));
-const BULK_BATCH = Math.max(100, Number(process.env.MEILI_BATCH_SIZE || 1000));
-const RETRY_ATTEMPTS = Math.max(1, Number(process.env.MEILI_RETRY_ATTEMPTS || 5));
-const RETRY_BASE_MS = Math.max(100, Number(process.env.MEILI_RETRY_BASE_MS || 500));
-const TASK_TIMEOUT_MS = Math.max(10000, Number(process.env.MEILI_TASK_TIMEOUT_MS || 120000));
+const BASE_URL = String(process.env.MANTICORE_URL || '').replace(/\/+$/, '');
+const INDEX = process.env.MANTICORE_INDEX || process.env.SEARCH_INDEX || 'lrh_resources';
+const TIMEOUT = Math.max(1000, Number(process.env.SEARCH_TIMEOUT_MS || 30000));
+const BULK_BATCH = Math.max(50, Number(process.env.MANTICORE_BATCH_SIZE || 500));
+const RETRY_ATTEMPTS = Math.max(1, Number(process.env.MANTICORE_RETRY_ATTEMPTS || 5));
+const RETRY_BASE_MS = Math.max(100, Number(process.env.MANTICORE_RETRY_BASE_MS || 500));
 
 let ensured = false;
 let disabledUntil = 0;
 let lastError = '';
 
-const INDEX_SETTINGS = {
-  displayedAttributes: ['id', 'file_name', 'source_id', 'file_type'],
-  searchableAttributes: ['file_name'],
-  filterableAttributes: ['source_id', 'file_type'],
-  sortableAttributes: ['id'],
-  pagination: { maxTotalHits: Math.max(1000, Number(process.env.MEILI_MAX_TOTAL_HITS || 20000)) }
-};
-
 function isEnabled() {
-  return ENGINE === 'meilisearch' && !!BASE_URL;
+  return ENGINE === 'manticore' && !!BASE_URL;
 }
 
 function shouldSkip() {
@@ -32,9 +22,11 @@ function shouldSkip() {
 }
 
 function client() {
-  const headers = {};
-  if (MASTER_KEY) headers.Authorization = `Bearer ${MASTER_KEY}`;
-  return axios.create({ baseURL: BASE_URL, timeout: TIMEOUT, headers });
+  return axios.create({ baseURL: BASE_URL, timeout: TIMEOUT });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function trimMessage(value, max = 1200) {
@@ -61,99 +53,25 @@ function isRetryableError(err) {
   return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function coolDown(err, context = '') {
   disabledUntil = Date.now() + 15000;
   lastError = formatError(err);
   if (isRetryableError(err)) ensured = false;
-  console.warn(`[meili] temporarily disabled${context ? ` ${context}` : ''}: ${lastError}`);
+  console.warn(`[manticore] temporarily disabled${context ? ` ${context}` : ''}: ${lastError}`);
 }
 
 function getLastError() {
   return lastError;
 }
 
-function getConfig() {
-  return {
-    engine: ENGINE,
-    enabled: isEnabled(),
-    url: BASE_URL,
-    index: INDEX,
-    has_master_key: !!MASTER_KEY,
-    batch_size: BULK_BATCH,
-    retry_attempts: RETRY_ATTEMPTS,
-    retry_base_ms: RETRY_BASE_MS,
-    task_timeout_ms: TASK_TIMEOUT_MS,
-    wait_tasks: String(process.env.MEILI_WAIT_TASKS || '0') === '1',
-    disabled_until: disabledUntil,
-    last_error: lastError
-  };
+function safeIndexName(name = INDEX) {
+  const s = String(name || '').trim();
+  if (!/^[A-Za-z0-9_]+$/.test(s)) throw new Error('invalid Manticore index name');
+  return s;
 }
 
-async function getOverview() {
-  const config = getConfig();
-  if (!config.enabled) {
-    return { config, health: { ok: false, message: 'Meilisearch is not enabled' }, index: null };
-  }
-  const c = client();
-  const overview = { config, health: { ok: false }, index: null, tasks: null };
-  try {
-    const { data } = await c.get('/health');
-    overview.health = { ok: true, ...data };
-  } catch (err) {
-    overview.health = { ok: false, error: formatError(err) };
-    return overview;
-  }
-  try {
-    const { data } = await c.get(`/indexes/${encodeURIComponent(INDEX)}/stats`);
-    overview.index = data;
-  } catch (err) {
-    overview.index = { error: formatError(err) };
-  }
-  try {
-    const { data } = await c.get('/tasks?limit=5');
-    overview.tasks = data;
-  } catch (err) {
-    overview.tasks = { error: formatError(err) };
-  }
-  try {
-    const [processing, enqueued] = await Promise.all([
-      c.get('/tasks?statuses=processing&limit=1').then((r) => r.data).catch((err) => ({ error: formatError(err) })),
-      c.get('/tasks?statuses=enqueued&limit=1').then((r) => r.data).catch((err) => ({ error: formatError(err) }))
-    ]);
-    overview.task_summary = {
-      processing: Number(processing.total || 0),
-      enqueued: Number(enqueued.total || 0),
-      error: processing.error || enqueued.error || null
-    };
-  } catch (err) {
-    overview.task_summary = { processing: 0, enqueued: 0, error: formatError(err) };
-  }
-  return overview;
-}
-
-async function waitUntilReady(timeoutMs = 60000) {
-  if (!isEnabled()) return false;
-  const deadline = Date.now() + Math.max(1000, Number(timeoutMs) || 60000);
-  let errText = '';
-  while (Date.now() < deadline) {
-    try {
-      const { data } = await client().get('/health');
-      if (!data || data.status === 'available') {
-        lastError = '';
-        return true;
-      }
-      errText = data.status || 'not available';
-    } catch (err) {
-      errText = formatError(err);
-    }
-    await sleep(1000);
-  }
-  lastError = errText || 'Meilisearch is not ready';
-  return false;
+function sqlString(value) {
+  return `'${String(value == null ? '' : value).replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
 }
 
 function encodeCursor(offset) {
@@ -176,62 +94,49 @@ function decodeCursor(cursor) {
 
 function toDoc(row) {
   return {
-    id: Number(row.id),
     file_name: row.file_name || '',
-    source_id: Number(row.source_id),
+    source_id: Number(row.source_id) || 0,
     file_type: row.file_type || ''
   };
 }
 
-async function waitTask(taskUid) {
-  if (taskUid == null) return;
-  const c = client();
-  const deadline = Date.now() + TASK_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    const { data } = await c.get(`/tasks/${encodeURIComponent(String(taskUid))}`);
-    if (data.status === 'succeeded') return;
-    if (data.status === 'failed' || data.status === 'canceled') {
-      throw new Error(data.error && data.error.message || `Meilisearch task ${data.status}`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-  }
-  throw new Error(`Meilisearch task ${taskUid} timed out after ${TASK_TIMEOUT_MS}ms`);
+async function sql(query) {
+  const { data } = await client().post('/sql', { query });
+  return data;
 }
 
-async function postDocumentsWithRetry(c, docs) {
-  let lastErr = null;
-  for (let attempt = 1; attempt <= RETRY_ATTEMPTS; attempt++) {
+async function waitUntilReady(timeoutMs = 60000) {
+  if (!isEnabled()) return false;
+  const deadline = Date.now() + Math.max(1000, Number(timeoutMs) || 60000);
+  let errText = '';
+  while (Date.now() < deadline) {
     try {
-      return await c.post(`/indexes/${encodeURIComponent(INDEX)}/documents`, docs);
+      await sql('SHOW TABLES');
+      lastError = '';
+      return true;
     } catch (err) {
-      lastErr = err;
-      if (attempt >= RETRY_ATTEMPTS || !isRetryableError(err)) throw err;
-      const delay = RETRY_BASE_MS * attempt * attempt;
-      console.warn(`[meili] retrying bulk index attempt=${attempt + 1}/${RETRY_ATTEMPTS} delay_ms=${delay}: ${formatError(err)}`);
-      await sleep(delay);
+      errText = formatError(err);
+      await sleep(1000);
     }
   }
-  throw lastErr;
+  lastError = errText || 'Manticore is not ready';
+  return false;
 }
 
 async function ensureIndex() {
   if (ensured) return true;
   if (shouldSkip()) return false;
-  const c = client();
   try {
-    const exists = await c.get(`/indexes/${encodeURIComponent(INDEX)}`).then(() => true).catch((err) => {
-      if (err.response && err.response.status === 404) return false;
-      throw err;
-    });
-    if (!exists) {
-      const { data } = await c.post('/indexes', { uid: INDEX, primaryKey: 'id' });
-      await waitTask(data.taskUid);
-    }
-    if (!exists || String(process.env.MEILI_ENSURE_SETTINGS || '0') === '1') {
-      const settingsTask = await c.patch(`/indexes/${encodeURIComponent(INDEX)}/settings`, INDEX_SETTINGS);
-      await waitTask(settingsTask.data && settingsTask.data.taskUid);
-    }
+    const index = safeIndexName();
+    await sql(
+      `CREATE TABLE IF NOT EXISTS ${index} (` +
+      'file_name text, ' +
+      'source_id bigint, ' +
+      'file_type string' +
+      ') charset_table=\'non_cjk,cjk\' ngram_len=\'1\' min_infix_len=\'2\''
+    );
     ensured = true;
+    lastError = '';
     return true;
   } catch (err) {
     coolDown(err, 'while ensuring index');
@@ -239,21 +144,58 @@ async function ensureIndex() {
   }
 }
 
-async function bulkIndexRows(rows, options = {}) {
+async function resetIndex() {
+  if (shouldSkip()) return false;
+  try {
+    await sql(`DROP TABLE IF EXISTS ${safeIndexName()}`);
+    ensured = false;
+    return ensureIndex();
+  } catch (err) {
+    coolDown(err, 'while resetting index');
+    return false;
+  }
+}
+
+async function postBulkWithRetry(lines) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= RETRY_ATTEMPTS; attempt++) {
+    try {
+      return await client().post('/json/bulk', lines.join('\n') + '\n', {
+        headers: { 'Content-Type': 'application/x-ndjson' },
+        timeout: Math.max(TIMEOUT, 60000)
+      });
+    } catch (err) {
+      lastErr = err;
+      if (attempt >= RETRY_ATTEMPTS || !isRetryableError(err)) throw err;
+      const delay = RETRY_BASE_MS * attempt * attempt;
+      console.warn(`[manticore] retrying bulk index attempt=${attempt + 1}/${RETRY_ATTEMPTS} delay_ms=${delay}: ${formatError(err)}`);
+      await sleep(delay);
+    }
+  }
+  throw lastErr;
+}
+
+async function bulkIndexRows(rows) {
   if (!Array.isArray(rows) || !rows.length || shouldSkip()) return false;
   const ok = await ensureIndex();
   if (!ok) return false;
-  const waitTasks = options.waitTasks === true || String(process.env.MEILI_WAIT_TASKS || '0') === '1';
-  const c = client();
+  const index = safeIndexName();
+
   for (let i = 0; i < rows.length; i += BULK_BATCH) {
     const docs = rows.slice(i, i + BULK_BATCH)
       .filter((row) => !Number(row.is_deleted || 0))
-      .map(toDoc)
-      .filter((doc) => doc.id && doc.file_name);
+      .map((row) => ({ id: Number(row.id), doc: toDoc(row) }))
+      .filter((doc) => doc.id && doc.doc.file_name);
     if (!docs.length) continue;
+
+    const lines = docs.map((doc) => JSON.stringify({
+      replace: { index, id: doc.id, doc: doc.doc }
+    }));
     try {
-      const { data } = await postDocumentsWithRetry(c, docs);
-      if (waitTasks) await waitTask(data.taskUid);
+      const { data } = await postBulkWithRetry(lines);
+      if (Array.isArray(data && data.errors) && data.errors.length) {
+        throw new Error(`bulk errors: ${trimMessage(data.errors)}`);
+      }
     } catch (err) {
       const firstId = docs[0] && docs[0].id;
       const lastId = docs[docs.length - 1] && docs[docs.length - 1].id;
@@ -282,10 +224,9 @@ async function deleteResource(id) {
   const ok = await ensureIndex();
   if (!ok) return false;
   try {
-    await client().delete(`/indexes/${encodeURIComponent(INDEX)}/documents/${encodeURIComponent(String(id))}`);
+    await sql(`DELETE FROM ${safeIndexName()} WHERE id = ${Number(id)}`);
     return true;
   } catch (err) {
-    if (err.response && err.response.status === 404) return true;
     coolDown(err, `while deleting id=${id}`);
     return false;
   }
@@ -307,18 +248,19 @@ async function fetchResourcesByIds(ids) {
   return uniq.map((id) => byId.get(id)).filter(Boolean);
 }
 
-function buildFilter({ sourceId, allowedSourceIds }) {
-  const parts = [];
+function buildWhere({ q, sourceId, allowedSourceIds }) {
+  const parts = [`MATCH(${sqlString(q)})`];
   if (sourceId) {
     const sid = Number(sourceId);
     if (Array.isArray(allowedSourceIds) && allowedSourceIds.length > 0 && !allowedSourceIds.includes(sid)) {
-      return { blocked: true, filter: '' };
+      return { blocked: true, where: '' };
     }
     parts.push(`source_id = ${sid}`);
   } else if (Array.isArray(allowedSourceIds) && allowedSourceIds.length > 0) {
-    parts.push(`source_id IN [${allowedSourceIds.map(Number).filter(Boolean).join(',')}]`);
+    const ids = allowedSourceIds.map(Number).filter(Boolean);
+    if (ids.length) parts.push(`source_id IN (${ids.join(',')})`);
   }
-  return { blocked: false, filter: parts.join(' AND ') };
+  return { blocked: false, where: parts.join(' AND ') };
 }
 
 async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = null, allowedSourceIds = null, cap = 0, cursor = null, skipTotal = false }) {
@@ -328,7 +270,7 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
   const ok = await ensureIndex();
   if (!ok) return null;
 
-  const { blocked, filter } = buildFilter({ sourceId, allowedSourceIds });
+  const { blocked, where } = buildWhere({ q, sourceId, allowedSourceIds });
   const capN = Math.max(0, Number(cap) || 0);
   if (blocked) {
     return {
@@ -337,7 +279,7 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
       capped: false,
       cap_limit: capN,
       processing_ms: 0,
-      engine: 'meilisearch_scope_block',
+      engine: 'manticore_scope_block',
       next_cursor: null,
       has_more: false
     };
@@ -353,34 +295,28 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
       capped: true,
       cap_limit: capN,
       processing_ms: 0,
-      engine: 'meilisearch',
+      engine: 'manticore',
       next_cursor: null,
       has_more: false
     };
   }
 
   const limit = capN > 0 ? Math.min(requestedSize + 1, capN - offset + 1) : requestedSize + 1;
-  const body = {
-    q,
-    limit,
-    offset,
-    attributesToRetrieve: ['id'],
-    showMatchesPosition: false
-  };
-  if (filter) body.filter = filter;
-
+  const maxMatches = Math.max(1000, capN || Number(process.env.MANTICORE_MAX_MATCHES || 20000));
   const t0 = Date.now();
   try {
-    const { data } = await client().post(`/indexes/${encodeURIComponent(INDEX)}/search`, body);
-    const hits = Array.isArray(data.hits) ? data.hits : [];
-    const hasMore = hits.length > requestedSize;
-    const visibleHits = hasMore ? hits.slice(0, requestedSize) : hits;
-    const ids = visibleHits.map((h) => Number(h.id)).filter(Boolean);
+    const data = await sql(
+      `SELECT id FROM ${safeIndexName()} WHERE ${where} LIMIT ${offset}, ${limit} OPTION max_matches=${maxMatches}`
+    );
+    const rows = Array.isArray(data && data.data) ? data.data : [];
+    const hasMore = rows.length > requestedSize;
+    const visibleRows = hasMore ? rows.slice(0, requestedSize) : rows;
+    const ids = visibleRows.map((h) => Number(h.id)).filter(Boolean);
     const items = await fetchResourcesByIds(ids);
-    const rawTotal = Number(data.estimatedTotalHits || data.totalHits || 0);
+    const rawTotal = Number(data && data.total_found || data && data.total || 0);
     const total = skipTotal ? null : (capN > 0 ? Math.min(rawTotal, capN) : rawTotal);
     const capped = !!(capN > 0 && rawTotal > capN);
-    const nextOffset = offset + visibleHits.length;
+    const nextOffset = offset + visibleRows.length;
 
     return {
       total,
@@ -388,7 +324,7 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
       capped,
       cap_limit: capN,
       processing_ms: Date.now() - t0,
-      engine: 'meilisearch',
+      engine: 'manticore',
       next_cursor: hasMore ? encodeCursor(nextOffset) : null,
       has_more: hasMore
     };
@@ -398,9 +334,57 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
   }
 }
 
+async function getDocCount() {
+  try {
+    const data = await sql(`SELECT COUNT(*) AS total FROM ${safeIndexName()}`);
+    const rows = Array.isArray(data && data.data) ? data.data : [];
+    return Number(rows[0] && rows[0].total || 0);
+  } catch (err) {
+    return null;
+  }
+}
+
+async function getOverview() {
+  const config = getConfig();
+  if (!config.enabled) {
+    return { config, health: { ok: false, message: 'Manticore is not enabled' }, index: null };
+  }
+  const overview = { config, health: { ok: false }, index: null, tasks: null, task_summary: { processing: 0, enqueued: 0 } };
+  try {
+    await sql('SHOW TABLES');
+    overview.health = { ok: true, status: 'available' };
+  } catch (err) {
+    overview.health = { ok: false, error: formatError(err) };
+    return overview;
+  }
+  const count = await getDocCount();
+  overview.index = {
+    numberOfDocuments: count == null ? 0 : count,
+    isIndexing: false,
+    fieldDistribution: count == null ? {} : { id: count, file_name: count, source_id: count, file_type: count }
+  };
+  return overview;
+}
+
+function getConfig() {
+  return {
+    engine: ENGINE,
+    enabled: isEnabled(),
+    url: BASE_URL,
+    index: INDEX,
+    has_master_key: false,
+    batch_size: BULK_BATCH,
+    retry_attempts: RETRY_ATTEMPTS,
+    retry_base_ms: RETRY_BASE_MS,
+    disabled_until: disabledUntil,
+    last_error: lastError
+  };
+}
+
 module.exports = {
   isEnabled,
   ensureIndex,
+  resetIndex,
   bulkIndexRows,
   bulkIndexBySourceFileIds,
   deleteResource,

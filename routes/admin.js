@@ -92,7 +92,7 @@ router.get('/resources/:id/link', asyncHandler(async (req, res) => {
   }
 }));
 
-// ---------- Meilisearch search index ----------
+// ---------- Manticore search index ----------
 router.get('/search/status', asyncHandler(async (req, res) => {
   const data = await searchIndexJobService.getStatus();
   res.json({ code: 200, ...data });

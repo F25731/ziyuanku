@@ -1,4 +1,4 @@
--- Admin-managed Meilisearch scan/reindex jobs.
+-- Admin-managed external search scan/reindex jobs.
 
 CREATE TABLE IF NOT EXISTS `search_index_jobs` (
   `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,

@@ -1,11 +1,16 @@
 const { pool } = require('../config/db');
 const searchIndex = require('./searchIndexService');
 
-const DEFAULT_BATCH = Math.max(50, Number(process.env.SEARCH_REINDEX_BATCH || 200));
-const DEFAULT_ATTEMPTS = Math.max(1, Number(process.env.MEILI_RETRY_ATTEMPTS || 5));
+const DEFAULT_BATCH = Math.max(50, Number(process.env.SEARCH_REINDEX_BATCH || 1000));
+const DEFAULT_ATTEMPTS = Math.max(1, Number(process.env.MANTICORE_RETRY_ATTEMPTS || 5));
 const OUTBOX_MAX_ATTEMPTS = Math.max(1, Number(process.env.SEARCH_OUTBOX_MAX_ATTEMPTS || 10));
 
 const running = new Map();
+
+function currentEngine() {
+  const config = typeof searchIndex.getConfig === 'function' ? searchIndex.getConfig() : null;
+  return (config && config.engine) || String(process.env.SEARCH_ENGINE || 'mysql').toLowerCase();
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -37,22 +42,25 @@ async function countResources({ sourceId = null, startId = 0 }) {
 }
 
 async function getIncrementalStartId(sourceId = null) {
+  const engine = currentEngine();
   if (sourceId) {
     const [[scoped]] = await pool.query(
-      "SELECT MAX(last_id) AS last_id FROM search_index_jobs WHERE status='completed' AND source_id = ?",
-      [Number(sourceId)]
+      "SELECT MAX(last_id) AS last_id FROM search_index_jobs WHERE status='completed' AND engine = ? AND source_id = ?",
+      [engine, Number(sourceId)]
     );
     if (Number(scoped && scoped.last_id || 0) > 0) return Number(scoped.last_id);
   }
   const [[row]] = await pool.query(
-    "SELECT MAX(last_id) AS last_id FROM search_index_jobs WHERE status='completed' AND source_id IS NULL"
+    "SELECT MAX(last_id) AS last_id FROM search_index_jobs WHERE status='completed' AND engine = ? AND source_id IS NULL",
+    [engine]
   );
   return Number(row && row.last_id || 0);
 }
 
 async function getActiveJob() {
   const [rows] = await pool.query(
-    "SELECT * FROM search_index_jobs WHERE status IN ('queued','running') ORDER BY id DESC LIMIT 1"
+    "SELECT * FROM search_index_jobs WHERE status IN ('queued','running') AND engine = ? ORDER BY id DESC LIMIT 1",
+    [currentEngine()]
   );
   return normalizeJob(rows[0]);
 }
@@ -72,7 +80,7 @@ async function listJobs(limit = 20) {
 
 async function createJob({ mode = 'full', sourceId = null, batchSize = DEFAULT_BATCH, maxAttempts = DEFAULT_ATTEMPTS } = {}) {
   if (!searchIndex.isEnabled()) {
-    throw new Error('Meilisearch is not enabled; set SEARCH_ENGINE=meilisearch and MEILI_URL first');
+    throw new Error('Manticore is not enabled; set SEARCH_ENGINE=manticore and MANTICORE_URL first');
   }
   const active = await getActiveJob();
   if (active) {
@@ -89,9 +97,9 @@ async function createJob({ mode = 'full', sourceId = null, batchSize = DEFAULT_B
 
   const [r] = await pool.query(
     `INSERT INTO search_index_jobs
-       (mode, status, source_id, batch_size, max_attempts, start_id, last_id, total_resources)
-     VALUES (?, 'queued', ?, ?, ?, ?, ?, ?)`,
-    [mode, sourceId, bs, attempts, startId, startId, totalResources]
+       (mode, engine, status, source_id, batch_size, max_attempts, start_id, last_id, total_resources)
+     VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?)`,
+    [mode, currentEngine(), sourceId, bs, attempts, startId, startId, totalResources]
   );
   const id = r.insertId;
   runJob(id).catch((err) => console.error('[searchJob] failed:', err.message));
@@ -107,9 +115,9 @@ async function resumeJob(id) {
   const totalResources = await countResources({ sourceId: job.source_id, startId: job.last_id });
   await pool.query(
     `UPDATE search_index_jobs
-        SET status='queued', total_resources=?, last_error=NULL, finished_at=NULL
+        SET engine=?, status='queued', total_resources=?, last_error=NULL, finished_at=NULL
       WHERE id=?`,
-    [Number(job.total_seen || 0) + totalResources, Number(id)]
+    [currentEngine(), Number(job.total_seen || 0) + totalResources, Number(id)]
   );
   runJob(Number(id)).catch((err) => console.error('[searchJob] resume failed:', err.message));
   return { already_running: false, job: await getJob(id) };
@@ -136,7 +144,7 @@ async function runJob(id) {
     );
     const ready = await searchIndex.waitUntilReady(90000);
     if (!ready) {
-      const err = searchIndex.getLastError() || 'Meilisearch is not ready';
+      const err = searchIndex.getLastError() || 'Manticore is not ready';
       await pool.query(
         `UPDATE search_index_jobs
             SET status='failed', last_error=?, finished_at=NOW()
@@ -144,6 +152,20 @@ async function runJob(id) {
         [err.slice(0, 1000), id]
       );
       return;
+    }
+    job = await getJob(id);
+    if (job && job.mode === 'full' && Number(job.start_id || 0) === 0 && Number(job.last_id || 0) === 0 && Number(job.total_seen || 0) === 0) {
+      const resetOk = typeof searchIndex.resetIndex === 'function' ? await searchIndex.resetIndex() : true;
+      if (!resetOk) {
+        const err = searchIndex.getLastError() || 'Manticore index reset failed';
+        await pool.query(
+          `UPDATE search_index_jobs
+              SET status='failed', last_error=?, finished_at=NOW()
+            WHERE id=?`,
+          [err.slice(0, 1000), id]
+        );
+        return;
+      }
     }
 
     while (!ctx.pause) {
@@ -178,7 +200,7 @@ async function runJob(id) {
       let lastErr = '';
       for (let attempt = 1; attempt <= Number(job.max_attempts || DEFAULT_ATTEMPTS); attempt++) {
         if (!(await searchIndex.waitUntilReady(60000))) {
-          lastErr = searchIndex.getLastError() || 'Meilisearch is not ready';
+          lastErr = searchIndex.getLastError() || 'Manticore is not ready';
           await pool.query(
             'UPDATE search_index_jobs SET attempts=attempts+1, last_error=? WHERE id=?',
             [lastErr.slice(0, 1000), id]
@@ -261,9 +283,10 @@ async function getStatus() {
     getOutboxStats(),
     listJobs(20)
   ]);
+  const activeJob = jobs.find((j) => ['queued', 'running'].includes(j.status) && j.engine === currentEngine()) || null;
   return {
     config: overview.config,
-    meili: {
+    engine: {
       health: overview.health,
       index: overview.index,
       tasks: overview.tasks,
@@ -271,7 +294,7 @@ async function getStatus() {
     },
     mysql: { resources: Number(resourceRow.total || 0) },
     outbox,
-    active_job: jobs.find((j) => ['queued', 'running'].includes(j.status)) || null,
+    active_job: activeJob,
     jobs
   };
 }
