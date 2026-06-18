@@ -10,6 +10,28 @@ const router = express.Router();
 
 router.use(apiKeyRequired);
 
+function formatResourceItem(r) {
+  return {
+    id: r.id,
+    source_id: r.source_id,
+    source: r.source_title,
+    provider: r.source_provider,
+    file_id: r.file_id,
+    file_name: r.file_name,
+    file_size: r.file_size,
+    file_size_human: formatFileSize(r.file_size),
+    file_type: r.file_type,
+    file_time: r.file_time,
+    has_share_url: !!r.share_url
+  };
+}
+
+function writeSse(res, event, data) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+  if (typeof res.flush === 'function') res.flush();
+}
+
 router.get('/search', asyncHandler(async (req, res) => {
   const { q = '', page = 1, pageSize = 20, source_id, cursor } = req.query;
   const allowed = getAllowedSourceIdsOf(req.apiKey);
@@ -30,23 +52,91 @@ router.get('/search', asyncHandler(async (req, res) => {
     cap_limit: data.cap_limit || cap,
     next_cursor: data.next_cursor || null,
     has_more: !!data.has_more,
-    items: data.items.map((r) => ({
-      id: r.id,
-      source_id: r.source_id,
-      source: r.source_title,
-      provider: r.source_provider,
-      file_id: r.file_id,
-      file_name: r.file_name,
-      file_size: r.file_size,
-      file_size_human: formatFileSize(r.file_size),
-      file_type: r.file_type,
-      file_time: r.file_time,
-      has_share_url: !!r.share_url
-    }))
+    items: data.items.map(formatResourceItem)
   });
 }));
 
-// 把 source_id 是否在 key 白名单内的检查抽出来，多处复用
+router.get('/search/stream', asyncHandler(async (req, res) => {
+  const { q = '', source_id } = req.query;
+  const allowed = getAllowedSourceIdsOf(req.apiKey);
+  const cap = Math.max(1, Math.min(10000, Number(req.apiKey.max_results) || 1000));
+  const batchSize = Math.min(100, Math.max(1, Number(req.query.pageSize || 20)));
+  const limit = Math.min(cap, 1000, Math.max(1, Number(req.query.limit || batchSize)));
+  let cursor = req.query.cursor || null;
+  let sent = 0;
+  let page = 1;
+  let closed = false;
+
+  req.on('close', () => { closed = true; });
+  res.status(200);
+  res.set({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+  writeSse(res, 'meta', {
+    code: 200,
+    message: 'stream started',
+    page_size: batchSize,
+    limit,
+    cap_limit: cap
+  });
+
+  try {
+    while (!closed && sent < limit) {
+      const data = await searchResources({
+        q,
+        page,
+        pageSize: Math.min(batchSize, limit - sent),
+        cursor,
+        sourceId: source_id || null,
+        allowedSourceIds: allowed,
+        cap,
+        skipTotal: true
+      });
+
+      for (const r of data.items || []) {
+        if (closed || sent >= limit) break;
+        sent += 1;
+        writeSse(res, 'item', {
+          index: sent,
+          item: formatResourceItem(r)
+        });
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+
+      if (!data.has_more || !data.next_cursor || sent >= limit) {
+        cursor = data.next_cursor || null;
+        break;
+      }
+      cursor = data.next_cursor;
+      page += 1;
+    }
+
+    if (!closed) {
+      writeSse(res, 'done', {
+        code: 200,
+        message: 'ok',
+        count: sent,
+        next_cursor: cursor || null,
+        has_more: !!cursor && sent >= limit
+      });
+      res.end();
+    }
+  } catch (err) {
+    if (!closed) {
+      writeSse(res, 'error', {
+        code: err.status || 500,
+        message: err.message || String(err)
+      });
+      res.end();
+    }
+  }
+}));
+
 function checkSourceAllowed(req, sourceId) {
   const allowed = getAllowedSourceIdsOf(req.apiKey);
   if (!allowed) return true;
@@ -89,8 +179,6 @@ router.get('/resources/:id/link', asyncHandler(async (req, res) => {
     const { url, expire_at, cached } = await resolveLink(r);
     const quota = {};
     if (req.apiKey && req.apiKey.daily_limit > 0) {
-      // /link 这一路才计配额。req.apiKeyDailyUsed 是中间件已经查过的"调用前"used
-      // 真正写入 +1 在 res 'finish' 钩子里发生，所以这里给客户端一个最接近的预估
       const usedBefore = Number(req.apiKeyDailyUsed) || 0;
       const usedAfter = usedBefore + 1;
       quota.daily_limit = req.apiKey.daily_limit;
@@ -126,8 +214,8 @@ router.get('/me', asyncHandler(async (req, res) => {
     total_limit: key.total_limit,
     rate_per_min: key.rate_per_min,
     max_results: key.max_results || 1000,
-    allowed_source_ids: allowed, // null = 全部，数组 = 仅这几个
-    quota_only_counts: 'GET /resources/:id/link', // 提示语：哪些路径才算配额
+    allowed_source_ids: allowed,
+    quota_only_counts: 'GET /resources/:id/link',
     used_today: used,
     used_total: key.used_total,
     expire_at: key.expire_at

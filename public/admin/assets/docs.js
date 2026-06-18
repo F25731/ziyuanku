@@ -3,6 +3,28 @@ window.LRH_DOCS = {
   baseHint: '把下面所有出现的 https://YOUR_HOST 替换为你的资源库域名，例如 https://ku.hstudy.xyz；把 YOUR_API_KEY 替换为后台签发的 lhk_xxx Key。',
   endpoints: [
     {
+      key: 'search_stream',
+      method: 'GET',
+      path: '/api/v1/search/stream',
+      title: '流式搜索资源（SSE，一条条返回）',
+      desc: '适合下游网站做“结果逐条出现”的体验。服务端发送 text/event-stream，事件包括 meta、item、done、error。接口只返回元数据，不消耗 /link 配额。浏览器直连时推荐用 fetch + ReadableStream，这样可以继续放 X-Api-Key 请求头。',
+      params: [
+        ['q', 'string', '关键词。受 SEARCH_MIN_QUERY_LEN 保护，默认至少 2 个字符'],
+        ['pageSize', 'int', '每批查询大小，默认 20，上限 100'],
+        ['limit', 'int', '本次流最多推送多少条，默认等于 pageSize，上限 1000，并受 Key 的 max_results 限制'],
+        ['cursor', 'string', '可选，从上次 done.next_cursor 继续'],
+        ['source_id', 'int', '可选，限定某个来源']
+      ],
+      response: `event: meta
+data: {"code":200,"message":"stream started","page_size":20,"limit":100,"cap_limit":1000}
+
+event: item
+data: {"index":1,"item":{"id":17,"file_name":"Python入门.zip","file_size_human":"4.16 MB"}}
+
+event: done
+data: {"code":200,"message":"ok","count":20,"next_cursor":"...","has_more":true}`
+    },
+    {
       key: 'search',
       method: 'GET',
       path: '/api/v1/search',
@@ -216,6 +238,7 @@ echo '直链: ' . $link['url'] . PHP_EOL;`
     ['502', '蓝奏侧解析失败：账号被风控、文件被删、或网络异常']
   ],
   notes: [
+    '流式搜索接口 /search/stream 使用 SSE。下游网站想让用户“先看到前几条，再继续加载”，可以用 fetch + ReadableStream 读取 item 事件；普通分页接口 /search 仍然保留，适合兼容性优先的场景。',
     '推荐流程：先调 /search 拿元数据列表 → 用户在你的站点点击某条 → 再调 /resources/:id/link 换直链。这样既省配额（前两步免费），也降低被风控的概率。',
     '配额只在 /resources/:id/link 一处计算。/search / /resources/:id / /me 全部不消耗 daily_limit 和 total_limit，可放心高频调用。',
     '4xx / 5xx 响应不计配额。只有成功返回直链才扣 1。',

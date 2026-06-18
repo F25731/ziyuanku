@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>API 测试 · 云逸蓝奏</title>
+<title>API 测试 · 资源库</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
 <style>
@@ -17,8 +17,8 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
 
 <header class="bg-mesh text-white p-4 md:p-6">
   <div class="max-w-5xl mx-auto">
-    <h1 class="text-xl md:text-2xl font-bold">云逸蓝奏 · API 测试面板</h1>
-    <p class="text-slate-300 text-xs md:text-sm mt-1">本地测试工具 · Host / Key 浏览器本地记忆</p>
+    <h1 class="text-xl md:text-2xl font-bold">资源库 · API 测试面板</h1>
+    <p class="text-slate-300 text-xs md:text-sm mt-1">Host / Key 会保存在当前浏览器本地</p>
     <div class="mt-5 grid md:grid-cols-2 gap-3 text-sm">
       <label class="block">
         <span class="text-slate-300 text-xs">HOST</span>
@@ -28,7 +28,7 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
         <span class="text-slate-300 text-xs">API KEY</span>
         <div class="flex gap-2 mt-1">
           <input :type="showKey?'text':'password'" x-model.trim="apiKey" @change="saveConfig" @input.debounce.500ms="saveConfig" placeholder="lhk_xxx" class="flex-1 px-3 py-2 rounded-lg bg-white/10 border border-white/20 text-white placeholder:text-slate-400 font-mono text-xs">
-          <button @click="showKey=!showKey" class="px-3 rounded-lg bg-white/10 border border-white/20 text-xs"><span x-text="showKey?'隐藏':'显示'"></span></button>
+          <button @click="showKey=!showKey" class="px-3 rounded-lg bg-white/10 border border-white/20 text-xs" x-text="showKey?'隐藏':'显示'"></button>
         </div>
       </label>
     </div>
@@ -41,12 +41,8 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
 
 <div x-show="showCorsWarning" class="max-w-5xl mx-auto mt-4 px-4">
   <div class="p-4 rounded-lg bg-amber-50 border border-amber-200 text-amber-900 text-sm">
-    <div class="font-bold mb-1">⚠️ 检测到 file:// 协议，可能被 CORS 拦截</div>
-    <p class="text-xs leading-relaxed">如果"连通性测试"失败，说明浏览器拦了跨域。解决办法任选：</p>
-    <ol class="list-decimal list-inside mt-2 space-y-1 text-xs">
-      <li>把这个文件放到服务器 <code class="bg-white px-1 rounded">public/admin/test.html</code>，访问 <code class="bg-white px-1 rounded" x-text="host+'/admin/test.html'"></code></li>
-      <li>用 Chrome 禁用安全策略启动：<code class="bg-white px-1 rounded text-xs">chrome --disable-web-security --user-data-dir=C:/tmp/cors</code></li>
-    </ol>
+    <div class="font-bold mb-1">检测到 file:// 协议，可能被 CORS 拦截</div>
+    <p class="text-xs leading-relaxed">建议访问服务器上的 <code class="bg-white px-1 rounded" x-text="host+'/admin/test.html'"></code>。</p>
   </div>
 </div>
 
@@ -64,23 +60,23 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
   <div class="bg-white rounded-xl p-4 md:p-6 shadow-sm border border-slate-100">
     <h2 class="font-bold text-lg mb-1">查看 Key 配额</h2>
     <p class="text-xs text-slate-500 mb-4"><code>GET /api/v1/me</code></p>
-    <button @click="callMe" :disabled="busy" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm disabled:opacity-60"><span x-show="!busy">发起请求</span><span x-show="busy">请求中...</span></button>
+    <button @click="callMe" :disabled="busy" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm disabled:opacity-60" x-text="busy?'请求中...':'发起请求'"></button>
     <pre x-show="result.me" class="mt-4 p-4 bg-slate-900 text-slate-100 rounded-lg text-xs overflow-x-auto" x-text="pretty(result.me)"></pre>
   </div>
 </section>
 
 <section x-show="tab==='search'">
   <div class="bg-white rounded-xl p-4 md:p-6 shadow-sm border border-slate-100">
-    <h2 class="font-bold text-lg mb-1">搜索资源</h2>
+    <h2 class="font-bold text-lg mb-1">普通搜索</h2>
     <p class="text-xs text-slate-500 mb-4"><code>GET /api/v1/search</code></p>
     <div class="flex gap-2 mb-4">
-      <input x-model="searchQ" @keydown.enter="callSearch" placeholder="关键词（空=全部）" class="flex-1 px-3 py-2 rounded-lg border border-slate-200 text-sm focus:ring-2 focus:ring-blue-400 focus:border-transparent outline-none">
+      <input x-model="searchQ" @keydown.enter="callSearch" placeholder="关键词" class="flex-1 px-3 py-2 rounded-lg border border-slate-200 text-sm focus:ring-2 focus:ring-blue-400 focus:border-transparent outline-none">
       <input type="number" x-model.number="searchPageSize" min="1" max="100" class="w-20 px-3 py-2 rounded-lg border border-slate-200 text-sm" title="每页数量">
       <button @click="callSearch" :disabled="busy" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm disabled:opacity-60">搜索</button>
     </div>
     <template x-if="result.search">
       <div>
-        <div class="text-xs text-slate-500 mb-2" x-text="'共 '+(result.search.total||0)+' 条 · 本页 '+((result.search.items||[]).length)+' 条'"></div>
+        <div class="text-xs text-slate-500 mb-2" x-text="'共 '+(result.search.total ?? '-')+' 条 · 本页 '+((result.search.items||[]).length)+' 条'"></div>
         <div class="border border-slate-200 rounded-lg overflow-hidden">
           <div class="overflow-x-auto">
           <table class="w-full min-w-[500px] text-sm">
@@ -90,7 +86,7 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
                 <tr class="hover:bg-slate-50">
                   <td class="p-2 text-slate-500" x-text="r.id"></td>
                   <td class="p-2 font-medium max-w-xs truncate" :title="r.file_name" x-text="r.file_name"></td>
-                  <td class="p-2 text-center text-slate-500 text-xs" x-text="fmtSize(r.file_size)"></td>
+                  <td class="p-2 text-center text-slate-500 text-xs" x-text="r.file_size_human || fmtSize(r.file_size)"></td>
                   <td class="p-2 text-center text-slate-500 text-xs" x-text="r.source"></td>
                   <td class="p-2 text-right space-x-2">
                     <button @click="detailId=r.id;tab='detail';callDetail()" class="text-blue-600 text-xs">详情</button>
@@ -104,6 +100,50 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
         </div>
       </div>
     </template>
+  </div>
+</section>
+
+<section x-show="tab==='stream'">
+  <div class="bg-white rounded-xl p-4 md:p-6 shadow-sm border border-slate-100">
+    <h2 class="font-bold text-lg mb-1">流式搜索</h2>
+    <p class="text-xs text-slate-500 mb-4"><code>GET /api/v1/search/stream</code> · SSE，一条资源一个 <code>item</code> 事件</p>
+    <div class="flex flex-wrap gap-2 mb-4">
+      <input x-model="streamQ" @keydown.enter="callStreamSearch" placeholder="关键词" class="flex-1 min-w-[160px] px-3 py-2 rounded-lg border border-slate-200 text-sm focus:ring-2 focus:ring-blue-400 focus:border-transparent outline-none">
+      <input type="number" x-model.number="streamPageSize" min="1" max="100" class="w-24 px-3 py-2 rounded-lg border border-slate-200 text-sm" title="每批数量">
+      <input type="number" x-model.number="streamLimit" min="1" max="1000" class="w-24 px-3 py-2 rounded-lg border border-slate-200 text-sm" title="最多返回">
+      <button @click="callStreamSearch" :disabled="streamRunning" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm disabled:opacity-60">
+        <span x-show="!streamRunning">开始流式搜索</span>
+        <span x-show="streamRunning" x-text="'接收中 '+streamRows.length"></span>
+      </button>
+      <button x-show="streamRunning" @click="stopStreamSearch" class="px-3 py-2 rounded-lg border border-red-200 text-red-600 text-sm">停止</button>
+    </div>
+    <div class="text-xs text-slate-500 mb-2" x-text="streamStatus || '等待开始'"></div>
+    <div class="border border-slate-200 rounded-lg overflow-hidden">
+      <div class="overflow-x-auto">
+      <table class="w-full min-w-[560px] text-sm">
+        <thead class="bg-slate-50 text-xs text-slate-500"><tr><th class="p-2 text-left">#</th><th class="p-2 text-left">ID</th><th class="p-2 text-left">文件名</th><th class="p-2">大小</th><th class="p-2">来源</th><th class="p-2 text-right">操作</th></tr></thead>
+        <tbody class="divide-y divide-slate-100">
+          <template x-for="r in streamRows" :key="r.id">
+            <tr class="hover:bg-slate-50">
+              <td class="p-2 text-slate-400" x-text="r._index"></td>
+              <td class="p-2 text-slate-500" x-text="r.id"></td>
+              <td class="p-2 font-medium max-w-xs truncate" :title="r.file_name" x-text="r.file_name"></td>
+              <td class="p-2 text-center text-slate-500 text-xs" x-text="r.file_size_human || fmtSize(r.file_size)"></td>
+              <td class="p-2 text-center text-slate-500 text-xs" x-text="r.source"></td>
+              <td class="p-2 text-right space-x-2">
+                <button @click="detailId=r.id;tab='detail';callDetail()" class="text-blue-600 text-xs">详情</button>
+                <button @click="linkId=r.id;tab='link';callLink()" class="text-indigo-600 text-xs">取直链</button>
+              </td>
+            </tr>
+          </template>
+          <tr x-show="!streamRows.length">
+            <td colspan="6" class="p-6 text-center text-slate-400 text-sm">结果会在这里一条条出现</td>
+          </tr>
+        </tbody>
+      </table>
+      </div>
+    </div>
+    <pre x-show="streamRaw" class="mt-4 p-4 bg-slate-900 text-slate-100 rounded-lg text-xs overflow-x-auto" x-text="streamRaw"></pre>
   </div>
 </section>
 
@@ -125,7 +165,7 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
     <p class="text-xs text-slate-500 mb-4"><code>GET /api/v1/resources/:id/link</code></p>
     <div class="flex gap-2 mb-4">
       <input type="number" x-model.number="linkId" placeholder="资源 ID" class="w-40 px-3 py-2 rounded-lg border border-slate-200 text-sm">
-      <button @click="callLink" :disabled="busy" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm disabled:opacity-60"><span x-show="!busy">解析</span><span x-show="busy">解析中...</span></button>
+      <button @click="callLink" :disabled="busy" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm disabled:opacity-60" x-text="busy?'解析中...':'解析'"></button>
     </div>
     <template x-if="result.link && result.link.url">
       <div class="mb-3 space-y-3">
@@ -135,7 +175,7 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
         </div>
         <div class="flex gap-2">
           <button @click="copyLink" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm">复制</button>
-          <a :href="result.link.url" target="_blank" rel="noopener" class="px-4 py-2 rounded-lg border border-slate-200 text-sm">新窗打开</a>
+          <a :href="result.link.url" target="_blank" rel="noopener" class="px-4 py-2 rounded-lg border border-slate-200 text-sm">新窗口打开</a>
         </div>
       </div>
     </template>
@@ -149,8 +189,11 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
     <p class="text-xs text-slate-500 mb-4">先 search 再循环 link，每条间隔 500ms</p>
     <div class="flex flex-wrap gap-2 mb-4">
       <input type="number" x-model.number="batchN" min="1" max="30" class="w-20 px-3 py-2 rounded-lg border border-slate-200 text-sm" title="数量">
-      <input x-model="batchQ" placeholder="关键词（空=全部）" class="flex-1 min-w-[140px] px-3 py-2 rounded-lg border border-slate-200 text-sm">
-      <button @click="callBatch" :disabled="batchRunning" class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-sm disabled:opacity-60"><span x-show="!batchRunning">开始</span><span x-show="batchRunning" x-text="'解析中 '+batchDone+'/'+batchTotal"></span></button>
+      <input x-model="batchQ" placeholder="关键词" class="flex-1 min-w-[140px] px-3 py-2 rounded-lg border border-slate-200 text-sm">
+      <button @click="callBatch" :disabled="batchRunning" class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-sm disabled:opacity-60">
+        <span x-show="!batchRunning">开始</span>
+        <span x-show="batchRunning" x-text="'解析中 '+batchDone+'/'+batchTotal"></span>
+      </button>
       <button x-show="batchRunning" @click="batchCanceled=true" class="px-3 py-2 rounded-lg border border-red-200 text-red-600 text-sm">停止</button>
     </div>
     <div x-show="batchRunning || batchRows.length>0">
@@ -169,8 +212,8 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
                 <td class="p-2 max-w-sm truncate" x-text="r.name"></td>
                 <td class="p-2 text-center text-slate-500" x-text="r.ms+'ms'"></td>
                 <td class="p-2">
-                  <span x-show="r.ok===true" class="text-green-600">✓</span>
-                  <span x-show="r.ok===false" :title="r.err" class="text-red-500">✗ <span class="ml-1 text-slate-500" x-text="(r.err||'').slice(0,60)"></span></span>
+                  <span x-show="r.ok===true" class="text-green-600">OK</span>
+                  <span x-show="r.ok===false" :title="r.err" class="text-red-500">失败 <span class="ml-1 text-slate-500" x-text="(r.err||'').slice(0,60)"></span></span>
                   <span x-show="r.ok===undefined" class="text-slate-300">...</span>
                 </td>
               </tr>
@@ -194,8 +237,17 @@ function testApp(){
     host:'',
     showKey:false, showCorsWarning:false, tab:'me', busy:false, toast:'',
     connStatus:'', connOk:false,
-    tabs:[{key:'me',label:'配额'},{key:'search',label:'搜索'},{key:'detail',label:'详情'},{key:'link',label:'直链'},{key:'batch',label:'批量'}],
-    searchQ:'', searchPageSize:20, detailId:null, linkId:null,
+    tabs:[
+      {key:'me',label:'配额'},
+      {key:'search',label:'搜索'},
+      {key:'stream',label:'流式'},
+      {key:'detail',label:'详情'},
+      {key:'link',label:'直链'},
+      {key:'batch',label:'批量'}
+    ],
+    searchQ:'', searchPageSize:20,
+    streamQ:'', streamPageSize:20, streamLimit:100, streamRunning:false, streamRows:[], streamStatus:'', streamRaw:'', streamAbort:null,
+    detailId:null, linkId:null,
     batchQ:'', batchN:5, batchRunning:false, batchCanceled:false,
     batchRows:[], batchDone:0, batchTotal:0, batchSuccess:0, batchFailed:0,
     result:{me:null,search:null,detail:null,link:null},
@@ -236,9 +288,9 @@ function testApp(){
       this.connStatus='请求中...'; this.connOk=false;
       try{
         const r = await this.api('/api/v1/me');
-        if(r.ok){ this.connOk=true; this.connStatus='✓ 连接成功 ('+(r.body.name||'-')+')'; }
-        else{ this.connStatus='✗ HTTP '+r.status+' '+(r.body.message||''); }
-      }catch(e){ this.connStatus='✗ '+e.message+'（可能是 CORS）'; }
+        if(r.ok){ this.connOk=true; this.connStatus='连接成功 ('+(r.body.name||'-')+')'; }
+        else{ this.connStatus='HTTP '+r.status+' '+(r.body.message||''); }
+      }catch(e){ this.connStatus=e.message+'（可能是 CORS）'; }
     },
     async callMe(){
       this.busy=true;
@@ -251,6 +303,85 @@ function testApp(){
       try{ const r=await this.api('/api/v1/search',{q:this.searchQ,page:1,pageSize:this.searchPageSize}); this.result.search=r.body; }
       catch(e){ this.notify('失败: '+e.message); }
       finally{ this.busy=false; }
+    },
+    parseSseBlock(block){
+      const lines = block.split(/\r?\n/);
+      let event = 'message';
+      const data = [];
+      for(const line of lines){
+        if(line.startsWith('event:')) event = line.slice(6).trim();
+        else if(line.startsWith('data:')) data.push(line.slice(5).trimStart());
+      }
+      if(!data.length) return null;
+      let body;
+      try{ body = JSON.parse(data.join('\n')); }catch(e){ body = data.join('\n'); }
+      return { event, body };
+    },
+    handleStreamEvent(evt){
+      if(!evt) return;
+      if(evt.event === 'meta'){
+        this.streamStatus = '已连接，开始接收...';
+        this.streamRaw = JSON.stringify(evt.body, null, 2);
+      } else if(evt.event === 'item'){
+        const item = evt.body.item || {};
+        item._index = evt.body.index || (this.streamRows.length + 1);
+        this.streamRows.push(item);
+        this.streamStatus = '已接收 ' + this.streamRows.length + ' 条';
+      } else if(evt.event === 'done'){
+        this.streamStatus = '完成，共 ' + (evt.body.count || this.streamRows.length) + ' 条' + (evt.body.has_more ? '，还有更多' : '');
+        this.streamRaw = JSON.stringify(evt.body, null, 2);
+      } else if(evt.event === 'error'){
+        this.streamStatus = '错误：' + (evt.body.message || 'unknown');
+        this.streamRaw = JSON.stringify(evt.body, null, 2);
+      }
+    },
+    async callStreamSearch(){
+      if(!this.host){ this.notify('请先配置 HOST'); return; }
+      if(!this.apiKey){ this.notify('请先配置 API KEY'); return; }
+      this.stopStreamSearch();
+      this.streamRunning = true;
+      this.streamRows = [];
+      this.streamRaw = '';
+      this.streamStatus = '连接中...';
+      this.streamAbort = new AbortController();
+      try{
+        const qs = new URLSearchParams({
+          q: this.streamQ || '',
+          pageSize: String(this.streamPageSize || 20),
+          limit: String(this.streamLimit || 100)
+        });
+        const url = this.host.replace(/\/$/,'') + '/api/v1/search/stream?' + qs.toString();
+        const r = await fetch(url, {
+          headers:{'X-Api-Key':this.apiKey, 'Accept':'text/event-stream'},
+          signal:this.streamAbort.signal
+        });
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        if(!r.body) throw new Error('当前浏览器不支持流式读取');
+        const reader = r.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let buf = '';
+        while(true){
+          const { value, done } = await reader.read();
+          if(done) break;
+          buf += decoder.decode(value, { stream:true });
+          const parts = buf.split(/\n\n/);
+          buf = parts.pop() || '';
+          for(const part of parts) this.handleStreamEvent(this.parseSseBlock(part));
+        }
+        if(buf.trim()) this.handleStreamEvent(this.parseSseBlock(buf));
+      }catch(e){
+        if(e.name !== 'AbortError'){
+          this.streamStatus = '失败：' + e.message;
+          this.notify('流式搜索失败: '+e.message);
+        }
+      }finally{
+        this.streamRunning = false;
+        this.streamAbort = null;
+      }
+    },
+    stopStreamSearch(){
+      if(this.streamAbort) this.streamAbort.abort();
+      this.streamRunning = false;
     },
     async callDetail(){
       if(!this.detailId){ this.notify('先填资源 ID'); return; }

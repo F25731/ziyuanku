@@ -21,7 +21,12 @@ const PORT = Number(process.env.PORT || 3000);
 
 app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(compression());
+app.use(compression({
+  filter: (req, res) => {
+    if ((req.path || '').endsWith('/search/stream')) return false;
+    return compression.filter(req, res);
+  }
+}));
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan('tiny'));

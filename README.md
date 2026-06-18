@@ -16,6 +16,7 @@ Headless 蓝奏云资源库。只做资源聚合、搜索、直链生成三件�
 ```
 # 对外 v1（需 X-Api-Key）
 GET  /api/v1/search?q=xxx&page=1&pageSize=20
+GET  /api/v1/search/stream?q=xxx&pageSize=20&limit=100   # SSE stream, emits meta/item/done/error
 GET  /api/v1/resources/:id
 GET  /api/v1/resources/:id/link   → { url, expire_at, cached, remaining_today }
 GET  /api/v1/me
@@ -126,6 +127,26 @@ $data = json_decode(curl_exec($ch), true);
 foreach ($data['items'] as $r) {
     echo $r['file_name'] . "\n";
 }
+```
+
+流式搜索（SSE）：适合下游网站做“结果逐条出现”的体验。普通接口 `/api/v1/search` 仍然保留。
+
+```bash
+curl -N -H "X-Api-Key: lhk_xxxx" \
+  "https://hub.yourdomain.com/api/v1/search/stream?q=python&pageSize=20&limit=100"
+```
+
+事件格式：
+
+```text
+event: meta
+data: {"code":200,"message":"stream started","page_size":20,"limit":100}
+
+event: item
+data: {"index":1,"item":{"id":17,"file_name":"Python入门.zip"}}
+
+event: done
+data: {"code":200,"message":"ok","count":20,"next_cursor":"...","has_more":true}
 ```
 
 取直链：
