@@ -35,8 +35,9 @@ function getSqlConfig() {
   return {
     host,
     port: Number(process.env.MANTICORE_SQL_PORT || 9306),
-    user: process.env.MANTICORE_SQL_USER || '',
+    user: process.env.MANTICORE_SQL_USER || 'manticore',
     password: process.env.MANTICORE_SQL_PASSWORD || '',
+    database: process.env.MANTICORE_SQL_DATABASE || 'manticore',
     waitForConnections: true,
     connectionLimit: Math.max(1, Number(process.env.MANTICORE_SQL_POOL_LIMIT || 5)),
     queueLimit: 0,
@@ -125,8 +126,16 @@ function toDoc(row) {
 }
 
 async function sql(query) {
-  const [rows] = await manticoreSqlPool().query(query);
-  return Array.isArray(rows) ? { data: rows } : rows;
+  try {
+    const { data } = await client().post('/sql?mode=raw', query, {
+      headers: { 'Content-Type': 'text/plain' }
+    });
+    if (Array.isArray(data)) return data[0] || { data: [] };
+    return data;
+  } catch (httpErr) {
+    const [rows] = await manticoreSqlPool().query(query);
+    return Array.isArray(rows) ? { data: rows } : rows;
+  }
 }
 
 async function waitUntilReady(timeoutMs = 60000) {
