@@ -18,16 +18,16 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
 <header class="bg-mesh text-white p-4 md:p-6">
   <div class="max-w-5xl mx-auto">
     <h1 class="text-xl md:text-2xl font-bold">云逸蓝奏 · API 测试面板</h1>
-    <p class="text-slate-300 text-xs md:text-sm mt-1">本地测试工具 · Key 已写死</p>
+    <p class="text-slate-300 text-xs md:text-sm mt-1">本地测试工具 · Host / Key 浏览器本地记忆</p>
     <div class="mt-5 grid md:grid-cols-2 gap-3 text-sm">
       <label class="block">
         <span class="text-slate-300 text-xs">HOST</span>
-        <input x-model="host" @change="saveHost" class="mt-1 w-full px-3 py-2 rounded-lg bg-white/10 border border-white/20 text-white focus:outline-none focus:ring-2 focus:ring-blue-400">
+        <input x-model.trim="host" @change="saveConfig" @input.debounce.500ms="saveConfig" placeholder="https://example.com" class="mt-1 w-full px-3 py-2 rounded-lg bg-white/10 border border-white/20 text-white placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-400">
       </label>
       <label class="block">
         <span class="text-slate-300 text-xs">API KEY</span>
         <div class="flex gap-2 mt-1">
-          <input :type="showKey?'text':'password'" :value="apiKey" readonly class="flex-1 px-3 py-2 rounded-lg bg-white/10 border border-white/20 text-white font-mono text-xs">
+          <input :type="showKey?'text':'password'" x-model.trim="apiKey" @change="saveConfig" @input.debounce.500ms="saveConfig" placeholder="lhk_xxx" class="flex-1 px-3 py-2 rounded-lg bg-white/10 border border-white/20 text-white placeholder:text-slate-400 font-mono text-xs">
           <button @click="showKey=!showKey" class="px-3 rounded-lg bg-white/10 border border-white/20 text-xs"><span x-text="showKey?'隐藏':'显示'"></span></button>
         </div>
       </label>
@@ -190,8 +190,8 @@ pre{font-family:Consolas,Monaco,Menlo,monospace}
 <script>
 function testApp(){
   return {
-    apiKey:'lhk_uLv6kAaoPV8241jlyddWlsb12Qyqw0JwpfVSk4fK',
-    host:'https://ku.hstudy.xyz',
+    apiKey:'',
+    host:'',
     showKey:false, showCorsWarning:false, tab:'me', busy:false, toast:'',
     connStatus:'', connOk:false,
     tabs:[{key:'me',label:'配额'},{key:'search',label:'搜索'},{key:'detail',label:'详情'},{key:'link',label:'直链'},{key:'batch',label:'批量'}],
@@ -201,9 +201,15 @@ function testApp(){
     result:{me:null,search:null,detail:null,link:null},
     init(){
       this.showCorsWarning = location.protocol==='file:';
-      const s=localStorage.getItem('lrh_test_host'); if(s) this.host=s;
+      const savedHost=localStorage.getItem('lrh_test_host');
+      const savedKey=localStorage.getItem('lrh_test_api_key');
+      this.host=savedHost || (location.protocol==='file:' ? '' : location.origin);
+      this.apiKey=savedKey || '';
     },
-    saveHost(){ localStorage.setItem('lrh_test_host', this.host); },
+    saveConfig(){
+      localStorage.setItem('lrh_test_host', this.host);
+      localStorage.setItem('lrh_test_api_key', this.apiKey);
+    },
     notify(m){ this.toast=m; setTimeout(()=>this.toast='',2500); },
     pretty(o){ try{return JSON.stringify(o,null,2)}catch(e){return String(o)} },
     fmtSize(raw){
@@ -218,6 +224,8 @@ function testApp(){
       return v.toFixed(d)+' '+U[i];
     },
     async api(path, params){
+      if(!this.host) throw new Error('请先配置 HOST');
+      if(!this.apiKey) throw new Error('请先配置 API KEY');
       const qs = params ? '?'+new URLSearchParams(params) : '';
       const url = this.host.replace(/\/$/,'') + path + qs;
       const r = await fetch(url, { headers:{'X-Api-Key':this.apiKey} });
