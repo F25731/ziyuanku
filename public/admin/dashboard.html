@@ -122,7 +122,7 @@
               <span class="text-xs text-slate-500">
                 <span class="font-medium text-emerald-600" x-text="searchEngine === 'mysql_fulltext' ? '⚡ FULLTEXT' : (searchEngine === 'mysql_like' ? 'LIKE 兜底' : searchEngine)"></span>
                 · <span x-text="searchMs + 'ms'"></span>
-                · <span x-text="(resList.capped ? '截断 ' : '共 ') + (resList.total || 0) + ' 条'"></span>
+                · <span x-text="'本页 ' + (resList.items ? resList.items.length : 0) + ' 条' + (resList.has_more ? ' · 还有更多' : ' · 已到底')"></span>
               </span>
             </template>
             <button @click="batchResolveCurrentPage()" :disabled="batchResolve.running"
@@ -212,11 +212,11 @@
             </table>
           </div>
           <div class="p-4 flex items-center justify-between text-sm text-slate-500">
-            <span>共 <b class="text-slate-700" x-text="resList.total || 0"></b> 条</span>
+            <span x-text="'本页 ' + (resList.items ? resList.items.length : 0) + ' 条' + (resList.has_more ? ' · 还有更多' : ' · 已到底')"></span>
             <div class="flex gap-2">
               <button @click="loadResources(resPage - 1)" :disabled="resPage <= 1" class="px-3 py-1 rounded border border-slate-200 disabled:opacity-40">上一页</button>
               <span class="px-3 py-1" x-text="'第 ' + resPage + ' 页'"></span>
-              <button @click="loadResources(resPage + 1)" class="px-3 py-1 rounded border border-slate-200">下一页</button>
+              <button @click="loadResources(resPage + 1)" :disabled="!resList.has_more" class="px-3 py-1 rounded border border-slate-200 disabled:opacity-40">下一页</button>
             </div>
           </div>
         </div>

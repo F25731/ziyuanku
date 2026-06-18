@@ -1,10 +1,12 @@
 const { pool } = require('../config/db');
 const searchIndex = require('./searchIndexService');
 const searchOutbox = require('./searchIndexOutboxService');
+const searchCache = require('./searchCacheService');
 const HttpError = require('../utils/httpError');
 const { parseFileSizeToBytes, getFileExt } = require('../utils/resourceMeta');
 
 const SEARCH_REQUIRE_EXTERNAL = String(process.env.SEARCH_REQUIRE_EXTERNAL || '0') === '1';
+const SEARCH_MIN_QUERY_LEN = Math.max(1, Number(process.env.SEARCH_MIN_QUERY_LEN || 2));
 let resourceMetaColumnsPromise = null;
 
 async function hasResourceMetaColumns() {
@@ -37,7 +39,7 @@ function buildBooleanQuery(q) {
   return safe.map((t) => `+${t}*`).join(' '); // 每个词必须出现，前缀通配
 }
 
-async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = null, allowedSourceIds = null, cap = 0, cursor = null }) {
+async function searchResourcesRaw({ q = '', page = 1, pageSize = 20, sourceId = null, allowedSourceIds = null, cap = 0, cursor = null, skipTotal = false }) {
   page = Math.max(1, Number(page) || 1);
   pageSize = Math.min(100, Math.max(1, Number(pageSize) || 20));
   const cursorId = Number(cursor) > 0 ? Number(cursor) : null;
@@ -46,7 +48,7 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
   q = String(q || '').trim();
 
   if (q && searchIndex.isEnabled()) {
-    const indexed = await searchIndex.searchResources({ q, pageSize, sourceId, allowedSourceIds, cap, cursor });
+    const indexed = await searchIndex.searchResources({ q, pageSize, sourceId, allowedSourceIds, cap, cursor, skipTotal });
     if (indexed) {
       return {
         total: indexed.total,
@@ -113,7 +115,7 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
   const capN = Math.max(0, Number(cap) || 0);
   let total;
   let capped = false;
-  if (useCursor) {
+  if (skipTotal || useCursor) {
     total = null;
   } else if (capN > 0) {
     const [[countRow]] = await pool.query(
@@ -151,6 +153,7 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
   const effectiveLimit = capN > 0 ? Math.min(pageSize, capN - offset) : pageSize;
 
   const t0 = Date.now();
+  const fetchLimit = (skipTotal || useCursor) ? effectiveLimit + 1 : effectiveLimit;
   const [rows] = await pool.query(
     `SELECT r.id, r.source_id, r.file_id, r.file_name, r.file_size, r.file_type, r.file_time,
             r.share_url, r.share_pwd, r.created_at,
@@ -160,23 +163,40 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
        ${whereSql}
        ${orderSql}
       LIMIT ? OFFSET ?`,
-    [...params, ...orderParams, effectiveLimit, offset]
+    [...params, ...orderParams, fetchLimit, offset]
   );
   const tookMs = Date.now() - t0;
-  const nextCursor = rows.length === effectiveLimit ? rows[rows.length - 1].id : null;
+  const hasMore = rows.length > effectiveLimit;
+  const items = hasMore ? rows.slice(0, effectiveLimit) : rows;
+  const nextCursor = hasMore && items.length ? items[items.length - 1].id : null;
 
   return {
     total,
     page,
     pageSize,
-    items: rows,
+    items,
     capped,
     cap_limit: capN,
     processing_ms: tookMs,
     engine: useFulltext ? (useCursor ? 'mysql_fulltext_cursor' : 'mysql_fulltext') : (useCursor ? 'mysql_cursor' : 'mysql_like'),
     next_cursor: nextCursor,
-    has_more: !!nextCursor
+    has_more: hasMore
   };
+}
+
+async function searchResources(options = {}) {
+  const q = String(options.q || '').trim();
+  if (q && Array.from(q).length < SEARCH_MIN_QUERY_LEN) {
+    throw new HttpError(400, `关键词至少 ${SEARCH_MIN_QUERY_LEN} 个字符`);
+  }
+
+  const normalized = { ...options, q };
+  const cached = await searchCache.get(normalized);
+  if (cached) return cached;
+
+  const data = await searchResourcesRaw(normalized);
+  await searchCache.set(normalized, data);
+  return data;
 }
 
 async function getResource(id) {

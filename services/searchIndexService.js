@@ -200,7 +200,7 @@ async function fetchResourcesByIds(ids) {
   return uniq.map((id) => byId.get(id)).filter(Boolean);
 }
 
-async function searchResources({ q = '', pageSize = 20, sourceId = null, allowedSourceIds = null, cap = 0, cursor = null }) {
+async function searchResources({ q = '', pageSize = 20, sourceId = null, allowedSourceIds = null, cap = 0, cursor = null, skipTotal = false }) {
   if (shouldSkip()) return null;
   q = String(q || '').trim();
   if (!q) return null;
@@ -226,9 +226,10 @@ async function searchResources({ q = '', pageSize = 20, sourceId = null, allowed
   }
 
   const searchAfter = decodeCursor(cursor);
-  const trackTotalHits = searchAfter ? false : Math.max(1, Math.min(10000, Number(cap) || 1000)) + 1;
+  const requestedSize = Math.min(100, Math.max(1, Number(pageSize) || 20));
+  const trackTotalHits = (searchAfter || skipTotal) ? false : Math.max(1, Math.min(10000, Number(cap) || 1000)) + 1;
   const body = {
-    size: Math.min(100, Math.max(1, Number(pageSize) || 20)),
+    size: requestedSize + 1,
     track_total_hits: trackTotalHits,
     query: {
       bool: {
@@ -252,18 +253,20 @@ async function searchResources({ q = '', pageSize = 20, sourceId = null, allowed
     const resp = await client().post(`/${encodeURIComponent(INDEX)}/_search`, body);
     const hits = resp.data && resp.data.hits ? resp.data.hits : {};
     const hitList = hits.hits || [];
-    const ids = hitList.map((h) => Number(h._source && h._source.id)).filter(Boolean);
+    const hasMore = hitList.length > requestedSize;
+    const visibleHits = hasMore ? hitList.slice(0, requestedSize) : hitList;
+    const ids = visibleHits.map((h) => Number(h._source && h._source.id)).filter(Boolean);
     const items = await fetchResourcesByIds(ids);
     let total = null;
     let capped = false;
     const totalObj = hits.total;
-    if (!searchAfter && totalObj) {
+    if (!searchAfter && !skipTotal && totalObj) {
       const raw = typeof totalObj === 'number' ? totalObj : Number(totalObj.value || 0);
       const capN = Math.max(0, Number(cap) || 0);
       total = capN > 0 ? Math.min(raw, capN) : raw;
       capped = !!(capN > 0 && raw > capN);
     }
-    const last = hitList[hitList.length - 1];
+    const last = visibleHits[visibleHits.length - 1];
     return {
       total,
       items,
@@ -271,8 +274,8 @@ async function searchResources({ q = '', pageSize = 20, sourceId = null, allowed
       cap_limit: Number(cap) || 0,
       processing_ms: Date.now() - t0,
       engine: 'opensearch',
-      next_cursor: last ? encodeCursor(last.sort) : null,
-      has_more: !!last
+      next_cursor: hasMore && last ? encodeCursor(last.sort) : null,
+      has_more: hasMore
     };
   } catch (err) {
     coolDown(err);

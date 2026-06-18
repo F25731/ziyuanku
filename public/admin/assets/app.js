@@ -168,8 +168,8 @@ function dashboard() {
     ],
     trendDays: [],
 
-    resQuery: '', resPage: 1,
-    resList: { items: [], total: 0 },
+    resQuery: '', resPage: 1, resCursorStack: [],
+    resList: { items: [], total: null, next_cursor: null, has_more: false },
     sources: [],
     apiKeys: [],
     syncLogs: [],
@@ -293,12 +293,29 @@ function dashboard() {
     },
 
     async loadResources(page) {
+      page = Math.max(1, Number(page) || 1);
       if (page < 1) return;
-      this.resPage = page;
+      let cursor = '';
+      if (page === 1) {
+        this.resCursorStack = [];
+      } else if (page > this.resPage) {
+        if (!this.resList.next_cursor) return;
+        this.resCursorStack[page] = this.resList.next_cursor;
+        cursor = this.resList.next_cursor;
+      } else {
+        cursor = this.resCursorStack[page] || '';
+      }
       this.tabLoading.resources = true;
       try {
         const t0 = performance.now();
-        const d = await api('/resources?q=' + encodeURIComponent(this.resQuery) + '&page=' + page + '&pageSize=30');
+        const qs = new URLSearchParams({
+          q: this.resQuery || '',
+          page: String(page),
+          pageSize: '30',
+          cursor_mode: '1'
+        });
+        if (cursor) qs.set('cursor', cursor);
+        const d = await api('/resources?' + qs.toString());
         this.searchMs = Math.round(performance.now() - t0);
         this.searchEngine = d.engine || '';
         const items = (d.items || []).map((r) => ({
@@ -308,7 +325,14 @@ function dashboard() {
           _linkError: '',
           _linkMs: 0
         }));
-        this.resList = { items, total: d.total || 0, capped: !!d.capped };
+        this.resPage = page;
+        this.resList = {
+          items,
+          total: d.total == null ? null : Number(d.total || 0),
+          capped: !!d.capped,
+          next_cursor: d.next_cursor || null,
+          has_more: !!d.has_more
+        };
       } catch (e) { this.notify(e.message, 'error'); }
       finally { this.tabLoading.resources = false; }
     },

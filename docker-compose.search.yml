@@ -1,0 +1,35 @@
+services:
+  opensearch:
+    image: opensearchproject/opensearch:2.17.1
+    container_name: lrh-opensearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      plugins.security.disabled: "true"
+      OPENSEARCH_JAVA_OPTS: ${OPENSEARCH_JAVA_OPTS:--Xms512m -Xmx512m}
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      DISABLE_SECURITY_PLUGIN: "true"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+    networks: [internal]
+
+  app:
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      opensearch:
+        condition: service_started
+    environment:
+      SEARCH_ENGINE: opensearch
+      SEARCH_URL: http://opensearch:9200
+      SEARCH_SHARDS: ${SEARCH_SHARDS:-1}
+      SEARCH_REPLICAS: ${SEARCH_REPLICAS:-0}
+
+volumes:
+  opensearch_data:
