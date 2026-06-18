@@ -1,4 +1,5 @@
 const axios = require('axios');
+const mysql = require('mysql2/promise');
 const { pool } = require('../config/db');
 
 const ENGINE = String(process.env.SEARCH_ENGINE || 'mysql').toLowerCase();
@@ -12,6 +13,7 @@ const RETRY_BASE_MS = Math.max(100, Number(process.env.MANTICORE_RETRY_BASE_MS |
 let ensured = false;
 let disabledUntil = 0;
 let lastError = '';
+let sqlPool = null;
 
 function isEnabled() {
   return ENGINE === 'manticore' && !!BASE_URL;
@@ -23,6 +25,28 @@ function shouldSkip() {
 
 function client() {
   return axios.create({ baseURL: BASE_URL, timeout: TIMEOUT });
+}
+
+function getSqlConfig() {
+  let host = process.env.MANTICORE_SQL_HOST || 'manticore';
+  try {
+    if (!process.env.MANTICORE_SQL_HOST && BASE_URL) host = new URL(BASE_URL).hostname || host;
+  } catch (_) {}
+  return {
+    host,
+    port: Number(process.env.MANTICORE_SQL_PORT || 9306),
+    user: process.env.MANTICORE_SQL_USER || '',
+    password: process.env.MANTICORE_SQL_PASSWORD || '',
+    waitForConnections: true,
+    connectionLimit: Math.max(1, Number(process.env.MANTICORE_SQL_POOL_LIMIT || 5)),
+    queueLimit: 0,
+    enableKeepAlive: true
+  };
+}
+
+function manticoreSqlPool() {
+  if (!sqlPool) sqlPool = mysql.createPool(getSqlConfig());
+  return sqlPool;
 }
 
 function sleep(ms) {
@@ -101,27 +125,8 @@ function toDoc(row) {
 }
 
 async function sql(query) {
-  const c = client();
-  try {
-    const body = new URLSearchParams({ query }).toString();
-    const { data } = await c.post('/sql', body, {
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-    });
-    return data;
-  } catch (firstErr) {
-    try {
-      const { data } = await c.get('/sql', { params: { query } });
-      return data;
-    } catch (_) {
-      try {
-        const { data } = await c.post('/sql', { query });
-        return data;
-      } catch (lastErr) {
-        if (!lastErr.message && firstErr.message) lastErr.message = firstErr.message;
-        throw lastErr;
-      }
-    }
-  }
+  const [rows] = await manticoreSqlPool().query(query);
+  return Array.isArray(rows) ? { data: rows } : rows;
 }
 
 async function waitUntilReady(timeoutMs = 60000) {
