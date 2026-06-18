@@ -1,25 +1,15 @@
-// 阶段7（重写版）：清理 / 去重服务
-// 关键设计：
-//  - 规则 JSON DSL，不执行用户 JS
-//  - **完全不写 MySQL 中间表**：去重在 Node 内存里跑 Map<group_key, winner>，
-//    losers id 收集到数组，最后批量软删除——避免之前 _cleanup_temp 撑爆磁盘
-//  - 批次内每 N 行检查 pauseRequested，可中途暂停
-//  - 进度每 ~2 秒节流写 cleanup_runs，让前端轮询能看到数字跳
-//  - samples 写独立的 cleanup_run_samples 表（不再借用 error_message）
-//  - 安全阈值从 cleanup_settings 读，dry-run 永远过；apply 超阈值返 422 让前端确认
-
 const { pool } = require('../config/db');
+const searchOutbox = require('./searchIndexOutboxService');
 const HttpError = require('../utils/httpError');
 
-const BATCH_SCAN = 5000;       // 一次从 resources 拉多少行
-const BATCH_UPDATE = 20000;    // UPDATE / INSERT 一次最多动多少行
+const BATCH_SCAN = Math.max(500, Number(process.env.CLEANUP_SCAN_BATCH || 5000));
+const BATCH_WRITE = Math.max(500, Number(process.env.CLEANUP_WRITE_BATCH || 5000));
 const SAMPLE_LIMIT = 50;
 const PROGRESS_FLUSH_MS = 2000;
 
 // runId -> { pauseRequested: bool }
 const runningCleanups = new Map();
 
-// ---------- 全局设置（cleanup_settings 单行表） ----------
 async function getSettings() {
   const [[row]] = await pool.query('SELECT * FROM cleanup_settings WHERE id = 1 LIMIT 1');
   if (!row) {
@@ -28,9 +18,10 @@ async function getSettings() {
   }
   return { safe_ratio: Number(row.safe_ratio) || 0.3 };
 }
+
 async function updateSettings({ safeRatio }) {
   const r = Math.max(0.01, Math.min(1, Number(safeRatio)));
-  if (!Number.isFinite(r)) throw new HttpError(400, 'safeRatio 不合法');
+  if (!Number.isFinite(r)) throw new HttpError(400, 'safeRatio invalid');
   await pool.query(
     'INSERT INTO cleanup_settings (id, safe_ratio) VALUES (1, ?) ON DUPLICATE KEY UPDATE safe_ratio = VALUES(safe_ratio)',
     [r]
@@ -38,19 +29,20 @@ async function updateSettings({ safeRatio }) {
   return getSettings();
 }
 
-// ---------- 规则 CRUD ----------
 async function listRules() {
   const [rows] = await pool.query(
     'SELECT id, name, description, config, enabled, created_at, updated_at FROM cleanup_rules ORDER BY id ASC'
   );
   return rows;
 }
+
 async function getRule(id) {
   const [[row]] = await pool.query('SELECT * FROM cleanup_rules WHERE id = ?', [id]);
   return row || null;
 }
+
 async function createRule({ name, description, config, enabled = 1 }) {
-  if (!name || !config) throw new HttpError(400, '名称和配置必填');
+  if (!name || !config) throw new HttpError(400, 'name and config are required');
   validateConfig(config);
   const [r] = await pool.query(
     'INSERT INTO cleanup_rules (name, description, config, enabled) VALUES (?, ?, ?, ?)',
@@ -58,6 +50,7 @@ async function createRule({ name, description, config, enabled = 1 }) {
   );
   return getRule(r.insertId);
 }
+
 async function updateRule(id, { name, description, config, enabled }) {
   const fields = [];
   const values = [];
@@ -70,44 +63,43 @@ async function updateRule(id, { name, description, config, enabled }) {
   await pool.query(`UPDATE cleanup_rules SET ${fields.join(', ')} WHERE id = ?`, values);
   return getRule(id);
 }
+
 async function deleteRule(id) {
   await pool.query('DELETE FROM cleanup_rules WHERE id = ?', [id]);
 }
 
-// ---------- 配置校验 ----------
 function validateConfig(cfg) {
-  if (!cfg || typeof cfg !== 'object') throw new HttpError(400, 'config 必须是对象');
+  if (!cfg || typeof cfg !== 'object') throw new HttpError(400, 'config must be an object');
   if (cfg.qualifier && cfg.qualifier.name_must_match) {
     try { new RegExp(cfg.qualifier.name_must_match); }
-    catch (_) { throw new HttpError(400, 'qualifier.name_must_match 不是合法正则'); }
+    catch (_) { throw new HttpError(400, 'qualifier.name_must_match is not a valid regexp'); }
   }
   if (Array.isArray(cfg.score_rules)) {
     for (const r of cfg.score_rules) {
       try { new RegExp(r.pattern); }
-      catch (_) { throw new HttpError(400, `score_rules 里 ${r.pattern} 不是合法正则`); }
+      catch (_) { throw new HttpError(400, `score_rules pattern is invalid: ${r.pattern}`); }
     }
   }
   const ff = cfg.format_filter || {};
   if (ff.mode && !['off', 'whitelist', 'blacklist'].includes(ff.mode)) {
-    throw new HttpError(400, 'format_filter.mode 必须是 off/whitelist/blacklist');
+    throw new HttpError(400, 'format_filter.mode must be off/whitelist/blacklist');
   }
   const sf = cfg.size_filter || {};
   if (sf.mode && !['off', 'remove_smaller_than', 'remove_larger_than', 'keep_only_between'].includes(sf.mode)) {
-    throw new HttpError(400, 'size_filter.mode 必须是 off/remove_smaller_than/remove_larger_than/keep_only_between');
+    throw new HttpError(400, 'size_filter.mode is invalid');
   }
   if (sf.mode && sf.mode !== 'off') {
     if (sf.mode === 'keep_only_between') {
       const a = parseSizeExprToBytes(sf.min);
       const b = parseSizeExprToBytes(sf.max);
-      if (a == null || b == null) throw new HttpError(400, 'size_filter.min / size_filter.max 不合法（示例: "100KB" / "2MB"）');
+      if (a == null || b == null || a > b) throw new HttpError(400, 'size_filter min/max invalid');
     } else {
       const t = parseSizeExprToBytes(sf.threshold);
-      if (t == null) throw new HttpError(400, 'size_filter.threshold 不合法（示例: "1KB" / "500B" / "2MB"）');
+      if (t == null) throw new HttpError(400, 'size_filter threshold invalid');
     }
   }
 }
 
-// ---------- DSL 求值 ----------
 function compileRule(cfg) {
   const qualMatch = cfg.qualifier && cfg.qualifier.name_must_match
     ? new RegExp(cfg.qualifier.name_must_match, 'i') : null;
@@ -123,8 +115,6 @@ function compileRule(cfg) {
   const tie = cfg.tie_breaker === 'id_asc' ? 'id_asc' : 'id_desc';
   const ff = cfg.format_filter || { mode: 'off' };
   const ffSet = new Set((ff.extensions || []).map((s) => String(s).toLowerCase().trim()).filter(Boolean));
-
-  // size_filter 编译
   const sf = cfg.size_filter || { mode: 'off' };
   const sfCompiled = { mode: sf.mode || 'off' };
   if (sfCompiled.mode === 'keep_only_between') {
@@ -143,26 +133,28 @@ function compileRule(cfg) {
       let s = String(name || '');
       if (ke.strip_ext) s = s.replace(/\.[A-Za-z0-9]{1,8}$/i, '');
       if (ke.strip_brackets) {
-        s = s.replace(/[《》]/g, ' ');
-        s = s.replace(/[【\[\(（][^】\]\)）]{0,20}[】\]\)）]/g, ' ');
+        s = s.replace(/[\[【(（][^\]】)）]{0,50}[\]】)）]/g, ' ');
       }
       let author = '';
       if (ke.strip_author || ke.include_author_in_key) {
-        const m = s.match(/(?:作者|著)\s*[:：]?\s*([A-Za-z0-9_\-一-龥·・]+)/i);
+        const m = s.match(/(?:作者|著)\s*[:：]?\s*([A-Za-z0-9_\-\u4e00-\u9fa5·.]+)/i);
         if (m) author = String(m[1]).trim().toLowerCase();
-        if (ke.strip_author) s = s.replace(/(?:作者|著)\s*[:：]?\s*[A-Za-z0-9_\-一-龥·・]+/gi, ' ');
+        if (ke.strip_author) {
+          s = s.replace(/(?:作者|著)\s*[:：]?\s*[A-Za-z0-9_\-\u4e00-\u9fa5·.]+/gi, ' ');
+        }
       }
       for (const re of stripKws) s = s.replace(re, ' ');
-      if (ke.strip_separators) s = s.replace(/[·•・:_：\-—\s]+/g, '');
+      if (ke.strip_separators) s = s.replace(/[\s·•・_:：\-—–|,，.。]+/g, '');
       if (ke.lowercase !== false) s = s.toLowerCase();
+      s = s.trim();
       if (!s) return null;
-      return ke.include_author_in_key && author ? (s + '|' + author) : s;
+      return ke.include_author_in_key && author ? `${s}|${author}` : s;
     },
     score(name, fileType) {
       let n = 0;
       const text = String(name || '');
       for (const r of scoreRules) if (r.re.test(text)) n += r.score;
-      const ext = (text.match(/\.([A-Za-z0-9]{1,8})$/) || [null, ''])[1].toLowerCase();
+      const ext = getExt(text);
       const fmt = String(fileType || '').trim().toLowerCase() || ext;
       if (fmt && Object.prototype.hasOwnProperty.call(fmtScore, fmt)) n += Number(fmtScore[fmt]) || 0;
       return n;
@@ -178,8 +170,6 @@ function getExt(name) {
   return m ? m[1].toLowerCase() : '';
 }
 
-// 把蓝奏 file_size（"4260"=KB / "12.3 M" / "1.5GB"）转成字节数
-// ilanzou：纯数字 → KB；老蓝奏：带单位
 function parseFileSizeToBytes(raw) {
   if (raw == null) return null;
   const s = String(raw).trim();
@@ -190,17 +180,17 @@ function parseFileSizeToBytes(raw) {
   if (!Number.isFinite(num)) return null;
   let unit = (m[2] || '').toUpperCase();
   if (/^[KMGT]$/.test(unit)) unit += 'B';
-  if (!unit) return Math.round(num * 1024); // 纯数字按 KB
+  if (!unit) return Math.round(num * 1024);
   switch (unit) {
-    case 'B':  return Math.round(num);
+    case 'B': return Math.round(num);
     case 'KB': return Math.round(num * 1024);
     case 'MB': return Math.round(num * 1024 * 1024);
     case 'GB': return Math.round(num * 1024 * 1024 * 1024);
     case 'TB': return Math.round(num * 1024 * 1024 * 1024 * 1024);
-    default:   return null;
+    default: return null;
   }
 }
-// 把用户在 DSL 里写的 "1k" / "500B" / "2.5MB" / 数字（默认 B）转字节
+
 function parseSizeExprToBytes(v) {
   if (v == null || v === '') return null;
   if (typeof v === 'number') return Math.round(v);
@@ -211,167 +201,401 @@ function parseSizeExprToBytes(v) {
   if (!Number.isFinite(num)) return null;
   let unit = (m[2] || '').toUpperCase();
   if (/^[KMGT]$/.test(unit)) unit += 'B';
-  if (!unit) return Math.round(num); // 不带单位 = 字节
+  if (!unit) return Math.round(num);
   switch (unit) {
-    case 'B':  return Math.round(num);
+    case 'B': return Math.round(num);
     case 'KB': return Math.round(num * 1024);
     case 'MB': return Math.round(num * 1024 * 1024);
     case 'GB': return Math.round(num * 1024 * 1024 * 1024);
     case 'TB': return Math.round(num * 1024 * 1024 * 1024 * 1024);
-    default:   return null;
+    default: return null;
   }
 }
 
-// ---------- 启动一次清理 ----------
-// HTTP 立即返回 run_id；扫描通过 setImmediate 在后台跑
-// confirmOver 用于"超过安全阈值时前端二次确认"：第一次返 422，前端 confirm 后带 confirmOver=true 再 POST
-async function startCleanup({ ruleId, scopeSourceIds = [], crossSource = false, dryRun = true, confirmOver = false }) {
-  const rule = await getRule(ruleId);
-  if (!rule) throw new HttpError(404, '规则不存在');
+function scopeWhere(scopeIds, alias = 'r') {
+  const ids = (Array.isArray(scopeIds) ? scopeIds : []).map(Number).filter(Boolean);
+  return {
+    sql: ids.length ? `AND ${alias}.source_id IN (${ids.map(() => '?').join(',')})` : '',
+    params: ids
+  };
+}
 
+async function countLiveResources(scopeIds) {
+  const scope = scopeWhere(scopeIds, 'r');
+  const [[row]] = await pool.query(
+    `SELECT COUNT(*) AS total FROM resources r WHERE r.is_deleted = 0 ${scope.sql}`,
+    scope.params
+  );
+  return Number(row.total || 0);
+}
+
+function shouldPause(runId) {
+  const e = runningCleanups.get(Number(runId));
+  return !!(e && e.pauseRequested);
+}
+
+async function startCleanup({ ruleId, scopeSourceIds = [], crossSource = false, dryRun = true } = {}) {
+  const rule = await getRule(ruleId);
+  if (!rule) throw new HttpError(404, 'cleanup rule not found');
   const config = typeof rule.config === 'string' ? JSON.parse(rule.config) : rule.config;
   validateConfig(config);
 
   const scopeIds = (Array.isArray(scopeSourceIds) ? scopeSourceIds : []).map(Number).filter(Boolean);
-  const scopeWhere = scopeIds.length
-    ? `AND r.source_id IN (${scopeIds.map(() => '?').join(',')})`
-    : '';
-  const [[liveRow]] = await pool.query(
-    `SELECT COUNT(*) AS total FROM resources r WHERE r.is_deleted = 0 ${scopeWhere}`,
-    scopeIds
-  );
-  const liveTotal = Number(liveRow.total || 0);
-  if (liveTotal === 0) throw new HttpError(400, '当前范围内没有可清理的资源');
+  const liveTotal = await countLiveResources(scopeIds);
+  if (liveTotal === 0) throw new HttpError(400, 'no live resources in this scope');
 
   const [[busy]] = await pool.query(
-    `SELECT id FROM cleanup_runs WHERE status='running' ORDER BY id DESC LIMIT 1`
+    "SELECT id FROM cleanup_runs WHERE status IN ('running','applying') ORDER BY id DESC LIMIT 1"
   );
-  if (busy && busy.id) {
-    // 不再 throw 让前端弹错——直接把"正在跑"的 run_id 返回，前端无缝接管
-    return { run_id: busy.id, already_running: true, total_examined: liveTotal };
-  }
+  if (busy && busy.id) return { run_id: busy.id, already_running: true, total_examined: liveTotal };
 
   const [r] = await pool.query(
-    `INSERT INTO cleanup_runs (rule_id, rule_name_snapshot, config_snapshot, scope_source_ids, cross_source, dry_run, status, confirm_over)
-     VALUES (?, ?, ?, ?, ?, ?, 'running', ?)`,
-    [rule.id, rule.name, JSON.stringify(config), scopeIds.length ? scopeIds.join(',') : null,
-     crossSource ? 1 : 0, dryRun ? 1 : 0, confirmOver ? 1 : 0]
+    `INSERT INTO cleanup_runs
+       (rule_id, rule_name_snapshot, config_snapshot, scope_source_ids, cross_source, dry_run, status, confirm_over, total_examined)
+     VALUES (?, ?, ?, ?, ?, ?, 'running', 0, ?)`,
+    [
+      rule.id,
+      rule.name,
+      JSON.stringify(config),
+      scopeIds.length ? scopeIds.join(',') : null,
+      crossSource ? 1 : 0,
+      dryRun ? 1 : 0,
+      liveTotal
+    ]
   );
   const runId = r.insertId;
-
   runningCleanups.set(runId, { pauseRequested: false });
 
   setImmediate(() => {
-    executeCleanup({ runId, config, scopeIds, crossSource, dryRun, liveTotal, confirmOver })
+    generateCandidates({ runId, config, scopeIds, crossSource, liveTotal })
       .catch(async (err) => {
         console.error(`[cleanup #${runId}] failed:`, err);
         const msg = String(err && err.message || err).slice(0, 1000);
         await pool.query(
-          `UPDATE cleanup_runs SET status='failed', error_message=?, finished_at=NOW() WHERE id=?`,
+          "UPDATE cleanup_runs SET status='failed', error_message=?, finished_at=NOW() WHERE id=?",
           [msg, runId]
         ).catch(() => {});
       })
-      .finally(() => {
-        runningCleanups.delete(runId);
-      });
+      .finally(() => runningCleanups.delete(runId));
   });
 
   return { run_id: runId, total_examined: liveTotal };
 }
 
-async function executeCleanup({ runId, config, scopeIds, crossSource, dryRun, liveTotal, confirmOver }) {
+async function generateCandidates({ runId, config, scopeIds, crossSource, liveTotal }) {
   const compiled = compileRule(config);
-  const samples = [];
-  let removedSize = 0;
-  let removedFmt = 0;
-  let removedDedupe = 0;
+  await pool.query('DELETE FROM cleanup_candidates WHERE run_id=?', [runId]);
+  await pool.query('DELETE FROM cleanup_dedupe_keys WHERE run_id=?', [runId]);
+  await pool.query('DELETE FROM cleanup_run_samples WHERE run_id=?', [runId]);
+  await pool.query('DELETE FROM cleanup_deleted WHERE run_id=?', [runId]);
 
-  // 阶段 A0：大小筛选（独立于格式 / 去重，先跑）
+  let scanned = 0;
   if (compiled.sizeFilter && compiled.sizeFilter.mode !== 'off') {
-    const res = await runSizeFilter({ compiled, scopeIds, runId, dryRun, samples });
-    removedSize = res.removed;
-    if (res.paused) {
-      await pool.query(
-        `UPDATE cleanup_runs SET status='paused', removed_by_format=?, paused_at=NOW() WHERE id=?`,
-        [removedSize + removedFmt, runId]
-      );
-      await persistSamples(runId, samples);
-      return;
-    }
+    scanned = Math.max(scanned, await generateSizeCandidates({ runId, compiled, scopeIds }));
+    if (shouldPause(runId)) return pauseRun(runId);
   }
-
-  // 阶段 A：格式过滤
   if (config.format_filter && config.format_filter.mode && config.format_filter.mode !== 'off') {
-    const res = await runFormatFilter({ compiled, scopeIds, runId, dryRun, samples });
-    removedFmt = res.removed;
-    if (res.paused) {
-      await pool.query(
-        `UPDATE cleanup_runs SET status='paused', removed_by_format=?, paused_at=NOW() WHERE id=?`,
-        [removedSize + removedFmt, runId]
-      );
-      await persistSamples(runId, samples);
-      return;
-    }
+    scanned = Math.max(scanned, await generateFormatCandidates({ runId, compiled, scopeIds }));
+    if (shouldPause(runId)) return pauseRun(runId);
   }
-
-  // 阶段 B：去重（全内存 Map）
   const hasDedupe = (config.score_rules && config.score_rules.length) || config.key_extractor;
   if (hasDedupe) {
-    const res = await runDedupeInMemory({ compiled, scopeIds, crossSource, runId, dryRun, samples });
-    removedDedupe = res.removed;
-    if (res.paused) {
-      await pool.query(
-        `UPDATE cleanup_runs SET status='paused', removed_by_format=?, removed_by_dedupe=?, paused_at=NOW() WHERE id=?`,
-        [removedSize + removedFmt, removedDedupe, runId]
-      );
-      await persistSamples(runId, samples);
-      return;
-    }
+    scanned = Math.max(scanned, await generateDedupeCandidates({ runId, compiled, scopeIds, crossSource }));
+    if (shouldPause(runId)) return pauseRun(runId);
   }
 
-  // 安全阈值（仅 apply 模式 + 未确认时）
-  const totalRemove = removedSize + removedFmt + removedDedupe;
-  const settings = await getSettings();
-  if (!dryRun && !confirmOver && totalRemove > Math.floor(liveTotal * settings.safe_ratio)) {
-    await rollbackRun(runId);
-    const pct = ((totalRemove / liveTotal) * 100).toFixed(1);
-    const msg = `SAFETY_THRESHOLD:超过安全阈值 ${Math.round(settings.safe_ratio * 100)}%：本次将删除 ${totalRemove} / ${liveTotal} 条 (${pct}%)，已自动回滚。如确认请勾选"忽略阈值"重试。`;
-    await pool.query(
-      `UPDATE cleanup_runs SET status='failed', error_message=?, total_examined=?, finished_at=NOW() WHERE id=?`,
-      [msg, liveTotal, runId]
-    );
-    await persistSamples(runId, samples);
-    return;
-  }
-
+  await refreshRunCounts(runId, liveTotal || scanned);
+  await persistSamplesFromCandidates(runId);
   await pool.query(
-    `UPDATE cleanup_runs
-        SET status='completed', total_examined=?, removed_by_format=?, removed_by_dedupe=?, finished_at=NOW()
-      WHERE id=?`,
-    [liveTotal, removedSize + removedFmt, removedDedupe, runId]
+    "UPDATE cleanup_runs SET status='review_ready', total_examined=?, finished_at=NOW(), error_message=NULL WHERE id=?",
+    [liveTotal || scanned, runId]
   );
-  await persistSamples(runId, samples);
+  await pool.query('DELETE FROM cleanup_dedupe_keys WHERE run_id=?', [runId]).catch(() => {});
 }
 
-async function persistSamples(runId, samples) {
-  // 先清，再插（防 run 第二次接管时残留）
-  await pool.query('DELETE FROM cleanup_run_samples WHERE run_id = ?', [runId]).catch(() => {});
-  const list = samples.slice(0, SAMPLE_LIMIT);
-  if (!list.length) return;
-  const placeholders = list.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(',');
+async function pauseRun(runId) {
+  await refreshRunCounts(runId);
+  await persistSamplesFromCandidates(runId);
+  await pool.query("UPDATE cleanup_runs SET status='paused', paused_at=NOW() WHERE id=?", [runId]);
+}
+
+async function insertCandidates(rows) {
+  if (!rows.length) return 0;
+  let inserted = 0;
+  for (let i = 0; i < rows.length; i += BATCH_WRITE) {
+    const chunk = rows.slice(i, i + BATCH_WRITE);
+    const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(',');
+    const params = [];
+    for (const c of chunk) {
+      params.push(
+        c.run_id,
+        c.resource_id,
+        c.reason,
+        c.source_id,
+        String(c.file_name || '').slice(0, 500),
+        c.group_key ? String(c.group_key).slice(0, 255) : null,
+        Number(c.score) || 0,
+        c.ext ? String(c.ext).slice(0, 20) : null,
+        c.size_bytes == null ? null : Number(c.size_bytes),
+        c.winner_id || null,
+        c.winner_file_name ? String(c.winner_file_name).slice(0, 500) : null
+      );
+    }
+    const [r] = await pool.query(
+      `INSERT IGNORE INTO cleanup_candidates
+        (run_id, resource_id, reason, source_id, file_name, group_key, score, ext, size_bytes, winner_id, winner_file_name)
+       VALUES ${placeholders}`,
+      params
+    );
+    inserted += r.affectedRows || 0;
+  }
+  return inserted;
+}
+
+async function generateSizeCandidates({ runId, compiled, scopeIds }) {
+  const sf = compiled.sizeFilter;
+  let lastId = 0;
+  let examined = 0;
+  let lastReportAt = 0;
+  const scope = scopeWhere(scopeIds, 'r');
+  while (true) {
+    if (shouldPause(runId)) return examined;
+    const [rows] = await pool.query(
+      `SELECT r.id, r.source_id, r.file_name, r.file_size
+         FROM resources r
+        WHERE r.is_deleted = 0 ${scope.sql} AND r.id > ?
+        ORDER BY r.id ASC
+        LIMIT ?`,
+      [...scope.params, lastId, BATCH_SCAN]
+    );
+    if (!rows.length) break;
+    lastId = Number(rows[rows.length - 1].id);
+    examined += rows.length;
+
+    const candidates = [];
+    for (const row of rows) {
+      const bytes = parseFileSizeToBytes(row.file_size);
+      if (bytes == null) continue;
+      let kill = false;
+      if (sf.mode === 'remove_smaller_than') kill = bytes < sf.thresholdBytes;
+      else if (sf.mode === 'remove_larger_than') kill = bytes > sf.thresholdBytes;
+      else if (sf.mode === 'keep_only_between') kill = bytes < sf.minBytes || bytes > sf.maxBytes;
+      if (kill) {
+        candidates.push({
+          run_id: runId,
+          resource_id: row.id,
+          reason: 'size',
+          source_id: row.source_id,
+          file_name: row.file_name,
+          group_key: `${bytes} bytes`,
+          ext: getExt(row.file_name),
+          size_bytes: bytes
+        });
+      }
+    }
+    await insertCandidates(candidates);
+    if (Date.now() - lastReportAt > PROGRESS_FLUSH_MS) {
+      lastReportAt = Date.now();
+      await progress(runId, examined, lastId);
+    }
+  }
+  await progress(runId, examined, lastId);
+  return examined;
+}
+
+async function generateFormatCandidates({ runId, compiled, scopeIds }) {
+  const ff = compiled.formatFilter;
+  if (ff.mode === 'off' || !ff.set.size) return 0;
+  let lastId = 0;
+  let examined = 0;
+  let lastReportAt = 0;
+  const scope = scopeWhere(scopeIds, 'r');
+  while (true) {
+    if (shouldPause(runId)) return examined;
+    const [rows] = await pool.query(
+      `SELECT r.id, r.source_id, r.file_name
+         FROM resources r
+        WHERE r.is_deleted = 0 ${scope.sql} AND r.id > ?
+        ORDER BY r.id ASC
+        LIMIT ?`,
+      [...scope.params, lastId, BATCH_SCAN]
+    );
+    if (!rows.length) break;
+    lastId = Number(rows[rows.length - 1].id);
+    examined += rows.length;
+
+    const candidates = [];
+    for (const row of rows) {
+      const ext = getExt(row.file_name);
+      const inSet = ff.set.has(ext);
+      const kill = ff.mode === 'whitelist' ? !inSet : inSet;
+      if (kill) {
+        candidates.push({
+          run_id: runId,
+          resource_id: row.id,
+          reason: 'format',
+          source_id: row.source_id,
+          file_name: row.file_name,
+          ext
+        });
+      }
+    }
+    await insertCandidates(candidates);
+    if (Date.now() - lastReportAt > PROGRESS_FLUSH_MS) {
+      lastReportAt = Date.now();
+      await progress(runId, examined, lastId);
+    }
+  }
+  await progress(runId, examined, lastId);
+  return examined;
+}
+
+async function insertDedupeKeys(rows) {
+  if (!rows.length) return 0;
+  let inserted = 0;
+  for (let i = 0; i < rows.length; i += BATCH_WRITE) {
+    const chunk = rows.slice(i, i + BATCH_WRITE);
+    const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?)').join(',');
+    const params = [];
+    for (const k of chunk) {
+      params.push(
+        k.run_id,
+        k.resource_id,
+        k.source_id,
+        String(k.group_key || '').slice(0, 255),
+        Number(k.score) || 0,
+        String(k.file_name || '').slice(0, 500),
+        String(k.ext || '').slice(0, 20)
+      );
+    }
+    const [r] = await pool.query(
+      `INSERT INTO cleanup_dedupe_keys
+        (run_id, resource_id, source_id, group_key, score, file_name, ext)
+       VALUES ${placeholders}
+       ON DUPLICATE KEY UPDATE group_key=VALUES(group_key), score=VALUES(score), file_name=VALUES(file_name), ext=VALUES(ext)`,
+      params
+    );
+    inserted += r.affectedRows || 0;
+  }
+  return inserted;
+}
+
+async function generateDedupeCandidates({ runId, compiled, scopeIds, crossSource }) {
+  let lastId = 0;
+  let examined = 0;
+  let lastReportAt = 0;
+  const scope = scopeWhere(scopeIds, 'r');
+  while (true) {
+    if (shouldPause(runId)) return examined;
+    const [rows] = await pool.query(
+      `SELECT r.id, r.source_id, r.file_name, r.file_type
+         FROM resources r
+        WHERE r.is_deleted = 0 ${scope.sql} AND r.id > ?
+        ORDER BY r.id ASC
+        LIMIT ?`,
+      [...scope.params, lastId, BATCH_SCAN]
+    );
+    if (!rows.length) break;
+    lastId = Number(rows[rows.length - 1].id);
+    examined += rows.length;
+
+    const keys = [];
+    for (const row of rows) {
+      if (!compiled.qualifies(row.file_name)) continue;
+      const key = compiled.extractKey(row.file_name);
+      if (!key) continue;
+      keys.push({
+        run_id: runId,
+        resource_id: row.id,
+        source_id: row.source_id,
+        group_key: (crossSource ? '' : `s${row.source_id}|`) + key,
+        score: compiled.score(row.file_name, row.file_type),
+        file_name: row.file_name,
+        ext: getExt(row.file_name)
+      });
+    }
+    await insertDedupeKeys(keys);
+    if (Date.now() - lastReportAt > PROGRESS_FLUSH_MS) {
+      lastReportAt = Date.now();
+      await progress(runId, examined, lastId);
+    }
+  }
+  await progress(runId, examined, lastId);
+  await insertDedupeLosers(runId, compiled.tieBreaker);
+  return examined;
+}
+
+async function insertDedupeLosers(runId, tieBreaker) {
+  const idOrder = tieBreaker === 'id_asc' ? 'ASC' : 'DESC';
+  await pool.query(
+    `INSERT IGNORE INTO cleanup_candidates
+       (run_id, resource_id, reason, source_id, file_name, group_key, score, ext, winner_id, winner_file_name, status)
+     SELECT run_id, resource_id, 'dedupe', source_id, file_name, group_key, score, ext, winner_id, winner_file_name, 'candidate'
+       FROM (
+         SELECT k.*,
+                ROW_NUMBER() OVER (PARTITION BY k.group_key ORDER BY k.score DESC, k.resource_id ${idOrder}) AS rn,
+                FIRST_VALUE(k.resource_id) OVER (PARTITION BY k.group_key ORDER BY k.score DESC, k.resource_id ${idOrder}) AS winner_id,
+                FIRST_VALUE(k.file_name) OVER (PARTITION BY k.group_key ORDER BY k.score DESC, k.resource_id ${idOrder}) AS winner_file_name
+           FROM cleanup_dedupe_keys k
+          WHERE k.run_id = ?
+       ) ranked
+      WHERE rn > 1`,
+    [runId]
+  );
+}
+
+async function progress(runId, examined, lastId) {
+  await pool.query(
+    'UPDATE cleanup_runs SET total_examined=?, last_scanned_id=? WHERE id=?',
+    [examined, lastId, runId]
+  ).catch(() => {});
+}
+
+async function refreshRunCounts(runId, totalExamined = null) {
+  const [[row]] = await pool.query(
+    `SELECT COUNT(*) AS total,
+            SUM(reason IN ('size','format')) AS by_format,
+            SUM(reason='dedupe') AS by_dedupe
+       FROM cleanup_candidates
+      WHERE run_id=? AND status IN ('candidate','applied')`,
+    [runId]
+  );
+  await pool.query(
+    `UPDATE cleanup_runs
+        SET candidate_total=?, removed_by_format=?, removed_by_dedupe=?${totalExamined == null ? '' : ', total_examined=?'}
+      WHERE id=?`,
+    totalExamined == null
+      ? [Number(row.total || 0), Number(row.by_format || 0), Number(row.by_dedupe || 0), runId]
+      : [Number(row.total || 0), Number(row.by_format || 0), Number(row.by_dedupe || 0), Number(totalExamined || 0), runId]
+  );
+}
+
+async function persistSamplesFromCandidates(runId) {
+  await pool.query('DELETE FROM cleanup_run_samples WHERE run_id=?', [runId]).catch(() => {});
+  const [rows] = await pool.query(
+    `SELECT resource_id, reason, source_id, file_name, group_key, score, ext, winner_id, winner_file_name
+       FROM cleanup_candidates
+      WHERE run_id=? AND status IN ('candidate','applied')
+      ORDER BY FIELD(reason, 'dedupe', 'format', 'size'), resource_id ASC
+      LIMIT ?`,
+    [runId, SAMPLE_LIMIT]
+  );
+  if (!rows.length) return;
+  const placeholders = rows.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(',');
   const params = [];
-  list.forEach((s, idx) => {
+  rows.forEach((s, idx) => {
     params.push(
-      runId, idx,
-      s.reason || 'dedupe',
-      Number(s.id) || 0,
-      Number(s.source_id) || 0,
+      runId,
+      idx,
+      s.reason,
+      s.resource_id,
+      s.source_id,
       String(s.file_name || '').slice(0, 500),
-      String(s.group_key || '').slice(0, 255),
+      s.group_key ? String(s.group_key).slice(0, 255) : null,
       Number(s.score) || 0,
-      String(s.ext || '').slice(0, 20),
-      s.winner_id ? Number(s.winner_id) : null,
-      String(s.winner_file_name || '').slice(0, 500)
+      s.ext || null,
+      s.winner_id || null,
+      s.winner_file_name || null
     );
   });
   await pool.query(
@@ -382,250 +606,6 @@ async function persistSamples(runId, samples) {
   );
 }
 
-// 暂停信号：算法的循环每批检查一次
-function shouldPause(runId) {
-  const e = runningCleanups.get(runId);
-  return !!(e && e.pauseRequested);
-}
-
-// ===== 大小筛选 =====
-// remove_smaller_than: 小于 threshold 的全删（"小说扫盘抓到一堆 0 字节空文件"）
-// remove_larger_than: 大于 threshold 的全删（极少用）
-// keep_only_between:  保留 [min, max]，区间外全删
-async function runSizeFilter({ compiled, scopeIds, runId, dryRun, samples }) {
-  const sf = compiled.sizeFilter;
-  if (sf.mode === 'off') return { removed: 0, paused: false };
-
-  let removed = 0;
-  let lastId = 0;
-  let examined = 0;
-  let lastReportAt = 0;
-  while (true) {
-    if (shouldPause(runId)) return { removed, paused: true };
-    const scopeWhere = scopeIds.length
-      ? `AND r.source_id IN (${scopeIds.map(() => '?').join(',')})`
-      : '';
-    const [rows] = await pool.query(
-      `SELECT r.id, r.file_name, r.file_size, r.source_id
-         FROM resources r
-        WHERE r.is_deleted = 0 ${scopeWhere} AND r.id > ?
-        ORDER BY r.id ASC
-        LIMIT ?`,
-      [...scopeIds, lastId, BATCH_SCAN]
-    );
-    if (!rows.length) break;
-    lastId = rows[rows.length - 1].id;
-    examined += rows.length;
-
-    const idsToKill = [];
-    for (const row of rows) {
-      const bytes = parseFileSizeToBytes(row.file_size);
-      if (bytes == null) continue;          // 大小解不出来的保留（保守）
-      let kill = false;
-      if (sf.mode === 'remove_smaller_than') kill = bytes < sf.thresholdBytes;
-      else if (sf.mode === 'remove_larger_than') kill = bytes > sf.thresholdBytes;
-      else if (sf.mode === 'keep_only_between') kill = (bytes < sf.minBytes || bytes > sf.maxBytes);
-      if (kill) {
-        idsToKill.push(row.id);
-        if (samples.length < SAMPLE_LIMIT) {
-          samples.push({
-            reason: 'size',
-            id: row.id, file_name: row.file_name, source_id: row.source_id,
-            ext: getExt(row.file_name),
-            group_key: bytes + ' bytes'   // 借 group_key 显示实际大小，前端样例表能直接看
-          });
-        }
-      }
-    }
-    if (idsToKill.length) {
-      removed += idsToKill.length;
-      if (!dryRun) await applySoftDelete(runId, idsToKill, 'size');
-    }
-
-    if (Date.now() - lastReportAt > PROGRESS_FLUSH_MS) {
-      lastReportAt = Date.now();
-      pool.query(
-        `UPDATE cleanup_runs SET total_examined=?, removed_by_format=? WHERE id=?`,
-        [examined, removed, runId]
-      ).catch(() => {});
-    }
-  }
-  return { removed, paused: false };
-}
-
-// ===== 格式过滤 =====
-async function runFormatFilter({ compiled, scopeIds, runId, dryRun, samples }) {
-  const ff = compiled.formatFilter;
-  if (ff.mode === 'off' || !ff.set.size) return { removed: 0, paused: false };
-
-  let removed = 0;
-  let lastId = 0;
-  let examined = 0;
-  let lastReportAt = 0;
-  while (true) {
-    if (shouldPause(runId)) return { removed, paused: true };
-    const scopeWhere = scopeIds.length
-      ? `AND r.source_id IN (${scopeIds.map(() => '?').join(',')})`
-      : '';
-    const [rows] = await pool.query(
-      `SELECT r.id, r.file_name, r.source_id
-         FROM resources r
-        WHERE r.is_deleted = 0 ${scopeWhere} AND r.id > ?
-        ORDER BY r.id ASC
-        LIMIT ?`,
-      [...scopeIds, lastId, BATCH_SCAN]
-    );
-    if (!rows.length) break;
-    lastId = rows[rows.length - 1].id;
-    examined += rows.length;
-
-    const idsToKill = [];
-    for (const row of rows) {
-      const ext = getExt(row.file_name);
-      const inSet = ff.set.has(ext);
-      const shouldKill = ff.mode === 'whitelist' ? !inSet : inSet;
-      if (shouldKill) {
-        idsToKill.push(row.id);
-        if (samples.length < SAMPLE_LIMIT) {
-          samples.push({ reason: 'format', id: row.id, file_name: row.file_name, ext, source_id: row.source_id });
-        }
-      }
-    }
-    if (idsToKill.length) {
-      removed += idsToKill.length;
-      if (!dryRun) await applySoftDelete(runId, idsToKill, 'format');
-    }
-
-    if (Date.now() - lastReportAt > PROGRESS_FLUSH_MS) {
-      lastReportAt = Date.now();
-      pool.query(
-        `UPDATE cleanup_runs SET total_examined=?, removed_by_format=? WHERE id=?`,
-        [examined, removed, runId]
-      ).catch(() => {});
-    }
-  }
-  pool.query(
-    `UPDATE cleanup_runs SET total_examined=?, removed_by_format=? WHERE id=?`,
-    [examined, removed, runId]
-  ).catch(() => {});
-  return { removed, paused: false };
-}
-
-// ===== 全内存 Map 去重 =====
-//  - winners: Map<group_key, {id, score}>  每个 key 大约 60+8+8 = 76 字节
-//  - losers: number[]  每个 id 8 字节
-// 200 万行预估：~200MB 内存（仅 dedupe 阶段），完全跑完释放
-async function runDedupeInMemory({ compiled, scopeIds, crossSource, runId, dryRun, samples }) {
-  const tieAsc = compiled.tieBreaker === 'id_asc';
-  const winners = new Map();      // group_key -> {id, score, file_name}
-  const losers = [];              // [{id, group_key, score, winner_id}]
-  let examined = 0;
-  let lastId = 0;
-  let lastReportAt = 0;
-
-  while (true) {
-    if (shouldPause(runId)) {
-      // 暂停：直接退出循环（已经积累的 losers 不删——保持原子性）
-      return { removed: 0, paused: true };
-    }
-    const scopeWhere = scopeIds.length
-      ? `AND r.source_id IN (${scopeIds.map(() => '?').join(',')})`
-      : '';
-    const [rows] = await pool.query(
-      `SELECT r.id, r.file_name, r.file_type, r.source_id
-         FROM resources r
-        WHERE r.is_deleted = 0 ${scopeWhere} AND r.id > ?
-        ORDER BY r.id ASC
-        LIMIT ?`,
-      [...scopeIds, lastId, BATCH_SCAN]
-    );
-    if (!rows.length) break;
-    lastId = rows[rows.length - 1].id;
-    examined += rows.length;
-
-    for (const row of rows) {
-      if (!compiled.qualifies(row.file_name)) continue;
-      const k = compiled.extractKey(row.file_name);
-      if (!k) continue;
-      const groupKey = (crossSource ? '' : `s${row.source_id}|`) + k;
-      const score = compiled.score(row.file_name, row.file_type);
-
-      const cur = winners.get(groupKey);
-      if (!cur) {
-        winners.set(groupKey, { id: row.id, score, file_name: row.file_name });
-        continue;
-      }
-      const newBeatsOld = (score > cur.score)
-        || (score === cur.score && (tieAsc ? row.id < cur.id : row.id > cur.id));
-      if (newBeatsOld) {
-        // 旧 winner 变 loser
-        losers.push({ id: cur.id, group_key: groupKey, score: cur.score, winner_id: row.id, winner_file_name: row.file_name, loser_file_name: cur.file_name, source_id: row.source_id });
-        // 修正：上面 push 用的是 cur 的 source_id，但 cur 没存。简化：losers 不记 source_id，取样例时再查
-        winners.set(groupKey, { id: row.id, score, file_name: row.file_name });
-      } else {
-        losers.push({ id: row.id, group_key: groupKey, score, winner_id: cur.id, winner_file_name: cur.file_name, loser_file_name: row.file_name, source_id: row.source_id });
-      }
-    }
-
-    if (Date.now() - lastReportAt > PROGRESS_FLUSH_MS) {
-      lastReportAt = Date.now();
-      pool.query(
-        `UPDATE cleanup_runs SET total_examined=?, removed_by_dedupe=? WHERE id=?`,
-        [examined, losers.length, runId]
-      ).catch(() => {});
-    }
-  }
-
-  // 取样例（最多 SAMPLE_LIMIT - 已有的）
-  const need = Math.max(0, SAMPLE_LIMIT - samples.length);
-  for (let i = 0; i < Math.min(need, losers.length); i++) {
-    const L = losers[i];
-    samples.push({
-      reason: 'dedupe',
-      id: L.id,
-      file_name: L.loser_file_name,
-      source_id: L.source_id,
-      group_key: L.group_key,
-      score: L.score,
-      winner_id: L.winner_id,
-      winner_file_name: L.winner_file_name
-    });
-  }
-
-  // 应用软删除
-  if (!dryRun && losers.length) {
-    const ids = losers.map((L) => L.id);
-    for (let i = 0; i < ids.length; i += BATCH_UPDATE) {
-      if (shouldPause(runId)) return { removed: i, paused: true };
-      await applySoftDelete(runId, ids.slice(i, i + BATCH_UPDATE), 'dedupe');
-    }
-  }
-
-  // 最后一次写回最终进度
-  pool.query(
-    `UPDATE cleanup_runs SET total_examined=?, removed_by_dedupe=? WHERE id=?`,
-    [examined, losers.length, runId]
-  ).catch(() => {});
-
-  return { removed: losers.length, paused: false };
-}
-
-async function applySoftDelete(runId, ids, reason) {
-  if (!ids.length) return;
-  await pool.query(
-    `UPDATE resources SET is_deleted=1 WHERE id IN (${ids.map(() => '?').join(',')}) AND is_deleted=0`,
-    ids
-  );
-  const placeholders = ids.map(() => '(?, ?, ?)').join(',');
-  const params = [];
-  for (const rid of ids) params.push(runId, rid, reason);
-  await pool.query(
-    `INSERT IGNORE INTO cleanup_deleted (run_id, resource_id, reason) VALUES ${placeholders}`,
-    params
-  );
-}
-
-// ---------- 暂停 / 恢复 ----------
 function requestPause(runId) {
   const e = runningCleanups.get(Number(runId));
   if (!e) return false;
@@ -633,67 +613,123 @@ function requestPause(runId) {
   return true;
 }
 
-// 恢复就是按原 run 的规则 / 范围重新启动一个新 run（简单可靠；旧 run 标 'undone'）
 async function resumeRun(oldRunId) {
   const [[row]] = await pool.query('SELECT * FROM cleanup_runs WHERE id = ? LIMIT 1', [oldRunId]);
-  if (!row) throw new HttpError(404, '原 run 不存在');
-  if (row.status !== 'paused' && row.status !== 'failed') {
-    throw new HttpError(400, '只能从 paused/failed 状态恢复');
+  if (!row) throw new HttpError(404, 'cleanup run not found');
+  if (!['paused', 'failed'].includes(row.status)) {
+    throw new HttpError(400, 'only paused/failed cleanup runs can be resumed');
   }
   const config = typeof row.config_snapshot === 'string' ? JSON.parse(row.config_snapshot) : row.config_snapshot;
-  const scopeIds = row.scope_source_ids
-    ? row.scope_source_ids.split(',').map(Number).filter(Boolean)
-    : [];
-  // 旧 run 标 undone 收尾
-  await pool.query("UPDATE cleanup_runs SET status='undone' WHERE id=?", [oldRunId]);
-  // 用相同参数启动新 run（用新 rule_id；如果 rule 已删，用 snapshot）
-  // 这里直接复用 startCleanup 的入口需要 ruleId，但 rule 可能已被删；改成手工建 run + setImmediate
-  const [r] = await pool.query(
-    `INSERT INTO cleanup_runs (rule_id, rule_name_snapshot, config_snapshot, scope_source_ids, cross_source, dry_run, status, confirm_over)
-     VALUES (?, ?, ?, ?, ?, ?, 'running', ?)`,
-    [row.rule_id, row.rule_name_snapshot, JSON.stringify(config),
-     scopeIds.length ? scopeIds.join(',') : null,
-     row.cross_source ? 1 : 0, row.dry_run ? 1 : 0, row.confirm_over ? 1 : 0]
+  const scopeIds = row.scope_source_ids ? row.scope_source_ids.split(',').map(Number).filter(Boolean) : [];
+  const liveTotal = await countLiveResources(scopeIds);
+  await pool.query(
+    `UPDATE cleanup_runs
+        SET status='running', total_examined=?, candidate_total=0, applied_total=0,
+            removed_by_format=0, removed_by_dedupe=0, last_scanned_id=0,
+            error_message=NULL, finished_at=NULL, paused_at=NULL
+      WHERE id=?`,
+    [liveTotal, oldRunId]
   );
-  const newRunId = r.insertId;
-  runningCleanups.set(newRunId, { pauseRequested: false });
-
-  const scopeWhere = scopeIds.length
-    ? `AND r.source_id IN (${scopeIds.map(() => '?').join(',')})`
-    : '';
-  const [[liveRow]] = await pool.query(
-    `SELECT COUNT(*) AS total FROM resources r WHERE r.is_deleted = 0 ${scopeWhere}`,
-    scopeIds
-  );
-  const liveTotal = Number(liveRow.total || 0);
-
+  runningCleanups.set(Number(oldRunId), { pauseRequested: false });
   setImmediate(() => {
-    executeCleanup({
-      runId: newRunId, config, scopeIds,
-      crossSource: !!row.cross_source, dryRun: !!row.dry_run,
-      liveTotal, confirmOver: !!row.confirm_over
+    generateCandidates({
+      runId: Number(oldRunId),
+      config,
+      scopeIds,
+      crossSource: !!row.cross_source,
+      liveTotal
     })
       .catch(async (err) => {
-        console.error(`[cleanup #${newRunId}] failed:`, err);
-        const msg = String(err && err.message || err).slice(0, 1000);
+        console.error(`[cleanup #${oldRunId}] resume failed:`, err);
         await pool.query(
-          `UPDATE cleanup_runs SET status='failed', error_message=?, finished_at=NOW() WHERE id=?`,
-          [msg, newRunId]
+          "UPDATE cleanup_runs SET status='failed', error_message=?, finished_at=NOW() WHERE id=?",
+          [String(err && err.message || err).slice(0, 1000), oldRunId]
         ).catch(() => {});
       })
-      .finally(() => { runningCleanups.delete(newRunId); });
+      .finally(() => runningCleanups.delete(Number(oldRunId)));
   });
-  return { run_id: newRunId };
+  return { run_id: Number(oldRunId) };
 }
 
-// ---------- 撤销 ----------
+async function applyRun(runId, { confirmOver = false } = {}) {
+  const [[run]] = await pool.query('SELECT * FROM cleanup_runs WHERE id=? LIMIT 1', [runId]);
+  if (!run) throw new HttpError(404, 'cleanup run not found');
+  if (run.status !== 'review_ready') {
+    throw new HttpError(400, 'only review_ready cleanup runs can be applied');
+  }
+  const [[cnt]] = await pool.query(
+    "SELECT COUNT(*) AS total FROM cleanup_candidates WHERE run_id=? AND status='candidate'",
+    [runId]
+  );
+  const total = Number(cnt.total || 0);
+  if (!total) {
+    await pool.query("UPDATE cleanup_runs SET status='completed', dry_run=0, applied_total=0, finished_at=NOW() WHERE id=?", [runId]);
+    return { applied: 0 };
+  }
+  const liveTotal = Number(run.total_examined || 0) || await countLiveResources(
+    run.scope_source_ids ? String(run.scope_source_ids).split(',').map(Number).filter(Boolean) : []
+  );
+  const settings = await getSettings();
+  if (!confirmOver && total > Math.floor(liveTotal * settings.safe_ratio)) {
+    const pct = liveTotal ? ((total / liveTotal) * 100).toFixed(1) : '0.0';
+    const msg = `SAFETY_THRESHOLD: candidate set would delete ${total} / ${liveTotal} resources (${pct}%), over ${Math.round(settings.safe_ratio * 100)}%`;
+    await pool.query("UPDATE cleanup_runs SET error_message=? WHERE id=?", [msg, runId]);
+    throw new HttpError(422, msg);
+  }
+
+  runningCleanups.set(Number(runId), { pauseRequested: false });
+  await pool.query("UPDATE cleanup_runs SET status='applying', dry_run=0, confirm_over=?, error_message=NULL WHERE id=?", [confirmOver ? 1 : 0, runId]);
+  let applied = Number(run.applied_total || 0);
+  try {
+    while (true) {
+      if (shouldPause(runId)) {
+        await pool.query("UPDATE cleanup_runs SET status='paused', applied_total=?, paused_at=NOW() WHERE id=?", [applied, runId]);
+        return { applied, paused: true };
+      }
+      const [rows] = await pool.query(
+        "SELECT resource_id, reason FROM cleanup_candidates WHERE run_id=? AND status='candidate' ORDER BY resource_id ASC LIMIT ?",
+        [runId, BATCH_WRITE]
+      );
+      if (!rows.length) break;
+      const ids = rows.map((r) => Number(r.resource_id)).filter(Boolean);
+      if (!ids.length) break;
+      await pool.query(`UPDATE resources SET is_deleted=1 WHERE id IN (${ids.map(() => '?').join(',')}) AND is_deleted=0`, ids);
+      const placeholders = rows.map(() => '(?, ?, ?)').join(',');
+      const params = [];
+      for (const row of rows) params.push(runId, row.resource_id, row.reason);
+      await pool.query(
+        `INSERT IGNORE INTO cleanup_deleted (run_id, resource_id, reason) VALUES ${placeholders}`,
+        params
+      );
+      await pool.query(
+        `UPDATE cleanup_candidates SET status='applied', applied_at=NOW()
+          WHERE run_id=? AND resource_id IN (${ids.map(() => '?').join(',')})`,
+        [runId, ...ids]
+      );
+      await searchOutbox.enqueueDeletes(ids).catch((err) => {
+        console.warn('[cleanup] enqueue search deletes failed:', err.message);
+      });
+      applied += ids.length;
+      await pool.query('UPDATE cleanup_runs SET applied_total=? WHERE id=?', [applied, runId]).catch(() => {});
+    }
+    await refreshRunCounts(runId, liveTotal);
+    await pool.query(
+      "UPDATE cleanup_runs SET status='completed', applied_total=?, finished_at=NOW() WHERE id=?",
+      [applied, runId]
+    );
+    return { applied };
+  } finally {
+    runningCleanups.delete(Number(runId));
+  }
+}
+
 async function undoRun(runId) {
   const [[run]] = await pool.query('SELECT * FROM cleanup_runs WHERE id = ?', [runId]);
-  if (!run) throw new HttpError(404, 'Run 不存在');
-  if (run.dry_run) throw new HttpError(400, '试运行未删除任何数据，无需撤销');
-  if (run.status === 'undone') throw new HttpError(400, '已撤销，请勿重复操作');
+  if (!run) throw new HttpError(404, 'cleanup run not found');
+  if (run.dry_run) throw new HttpError(400, 'this run has not deleted resources');
+  if (run.status === 'undone') throw new HttpError(400, 'cleanup run already undone');
   await rollbackRun(runId);
-  await pool.query(`UPDATE cleanup_runs SET status='undone' WHERE id=?`, [runId]);
+  await pool.query("UPDATE cleanup_runs SET status='undone' WHERE id=?", [runId]);
   return { ok: true };
 }
 
@@ -701,26 +737,52 @@ async function rollbackRun(runId) {
   let lastId = 0;
   while (true) {
     const [rows] = await pool.query(
-      `SELECT resource_id FROM cleanup_deleted WHERE run_id = ? AND resource_id > ? ORDER BY resource_id ASC LIMIT ?`,
-      [runId, lastId, BATCH_UPDATE]
+      `SELECT resource_id FROM cleanup_deleted WHERE run_id=? AND resource_id > ? ORDER BY resource_id ASC LIMIT ?`,
+      [runId, lastId, BATCH_WRITE]
     );
     if (!rows.length) break;
-    lastId = rows[rows.length - 1].resource_id;
-    const ids = rows.map((x) => x.resource_id);
-    await pool.query(
-      `UPDATE resources SET is_deleted=0 WHERE id IN (${ids.map(() => '?').join(',')}) AND is_deleted=1`,
-      ids
-    );
+    lastId = Number(rows[rows.length - 1].resource_id);
+    const ids = rows.map((x) => Number(x.resource_id)).filter(Boolean);
+    if (!ids.length) break;
+    await pool.query(`UPDATE resources SET is_deleted=0 WHERE id IN (${ids.map(() => '?').join(',')}) AND is_deleted=1`, ids);
+    await searchOutbox.enqueueUpserts(ids).catch((err) => {
+      console.warn('[cleanup] enqueue search restore failed:', err.message);
+    });
   }
-  await pool.query('DELETE FROM cleanup_deleted WHERE run_id = ?', [runId]);
+  await pool.query('DELETE FROM cleanup_deleted WHERE run_id=?', [runId]);
+  await pool.query("UPDATE cleanup_candidates SET status='candidate', applied_at=NULL WHERE run_id=? AND status='applied'", [runId]).catch(() => {});
 }
 
-// ---------- 查询 ----------
+async function candidateSummary(runId) {
+  const [byReason] = await pool.query(
+    `SELECT reason, COUNT(*) AS total
+       FROM cleanup_candidates
+      WHERE run_id=? AND status IN ('candidate','applied')
+      GROUP BY reason ORDER BY total DESC`,
+    [runId]
+  );
+  const [bySource] = await pool.query(
+    `SELECT source_id, COUNT(*) AS total
+       FROM cleanup_candidates
+      WHERE run_id=? AND status IN ('candidate','applied')
+      GROUP BY source_id ORDER BY total DESC LIMIT 20`,
+    [runId]
+  );
+  const [byExt] = await pool.query(
+    `SELECT COALESCE(NULLIF(ext,''), '(none)') AS ext, COUNT(*) AS total
+       FROM cleanup_candidates
+      WHERE run_id=? AND status IN ('candidate','applied')
+      GROUP BY COALESCE(NULLIF(ext,''), '(none)') ORDER BY total DESC LIMIT 20`,
+    [runId]
+  );
+  return { by_reason: byReason, by_source: bySource, by_ext: byExt };
+}
+
 async function listRuns({ limit = 30 } = {}) {
   const [rows] = await pool.query(
     `SELECT id, rule_id, rule_name_snapshot, scope_source_ids, cross_source,
-            dry_run, status, total_examined, removed_by_format, removed_by_dedupe,
-            error_message, started_at, finished_at
+            dry_run, status, total_examined, candidate_total, applied_total,
+            removed_by_format, removed_by_dedupe, error_message, started_at, finished_at
        FROM cleanup_runs ORDER BY id DESC LIMIT ?`,
     [Math.min(Number(limit) || 30, 200)]
   );
@@ -730,31 +792,24 @@ async function listRuns({ limit = 30 } = {}) {
 async function getRun(runId) {
   const [[row]] = await pool.query(
     `SELECT id, rule_id, rule_name_snapshot, scope_source_ids, cross_source,
-            dry_run, confirm_over, status, total_examined, removed_by_format, removed_by_dedupe,
-            error_message, started_at, paused_at, finished_at
+            dry_run, confirm_over, status, total_examined, candidate_total, applied_total,
+            removed_by_format, removed_by_dedupe, error_message, started_at, paused_at, finished_at
        FROM cleanup_runs WHERE id = ? LIMIT 1`,
     [runId]
   );
   if (!row) return null;
-  const [samples] = await pool.query(
-    `SELECT idx, reason, resource_id AS id, source_id, file_name, group_key, score, ext, winner_id, winner_file_name
-       FROM cleanup_run_samples WHERE run_id = ? ORDER BY idx ASC LIMIT 100`,
-    [runId]
-  );
-
+  const samples = await getRunSamples(runId, 100);
   const aliveInProc = runningCleanups.has(Number(row.id));
   let displayStatus = row.status;
-  // 容器重启后 running 但进程内没了 → orphaned
-  if (row.status === 'running' && !aliveInProc) displayStatus = 'orphaned';
+  if (['running', 'applying'].includes(row.status) && !aliveInProc) displayStatus = 'orphaned';
 
-  // 安全阈值阻断错误：把前缀拆出来，给前端识别用
   let safetyBlocked = false;
   let errMsg = row.error_message || null;
   if (errMsg && errMsg.startsWith('SAFETY_THRESHOLD:')) {
     safetyBlocked = true;
-    errMsg = errMsg.replace(/^SAFETY_THRESHOLD:/, '');
+    errMsg = errMsg.replace(/^SAFETY_THRESHOLD:\s*/, '');
   }
-
+  const totalRemoved = Number(row.candidate_total || 0);
   return {
     id: row.id,
     rule_id: row.rule_id,
@@ -764,42 +819,63 @@ async function getRun(runId) {
     dry_run: !!row.dry_run,
     confirm_over: !!row.confirm_over,
     status: displayStatus,
-    is_running: displayStatus === 'running',
+    is_running: displayStatus === 'running' || displayStatus === 'applying',
+    is_review_ready: displayStatus === 'review_ready',
     safety_blocked: safetyBlocked,
-    total_examined: row.total_examined,
-    removed_by_format: row.removed_by_format,
-    removed_by_dedupe: row.removed_by_dedupe,
-    total_removed: (row.removed_by_format || 0) + (row.removed_by_dedupe || 0),
+    total_examined: Number(row.total_examined || 0),
+    candidate_total: Number(row.candidate_total || 0),
+    applied_total: Number(row.applied_total || 0),
+    removed_by_format: Number(row.removed_by_format || 0),
+    removed_by_dedupe: Number(row.removed_by_dedupe || 0),
+    total_removed: totalRemoved,
     error_message: errMsg,
     samples,
+    summary: await candidateSummary(runId),
     started_at: row.started_at,
     paused_at: row.paused_at,
     finished_at: row.finished_at
   };
 }
 
-// 拉某个 source 的"最近一次清理"——前端进 cleanup tab 自动恢复进度卡用
 async function getLatestRun() {
-  const [[row]] = await pool.query(
-    `SELECT id FROM cleanup_runs ORDER BY id DESC LIMIT 1`
-  );
-  if (!row) return null;
-  return getRun(row.id);
+  const [[row]] = await pool.query('SELECT id FROM cleanup_runs ORDER BY id DESC LIMIT 1');
+  return row ? getRun(row.id) : null;
 }
 
 async function getRunSamples(runId, limit = 50) {
   const cap = Math.min(Number(limit) || 50, 500);
   const [rows] = await pool.query(
+    `SELECT reason, resource_id AS id, source_id, file_name, group_key, score, ext, winner_id, winner_file_name, status
+       FROM cleanup_candidates
+      WHERE run_id=? AND status IN ('candidate','applied')
+      ORDER BY FIELD(reason, 'dedupe', 'format', 'size'), resource_id ASC
+      LIMIT ?`,
+    [runId, cap]
+  );
+  if (rows.length) return rows;
+  const [fallback] = await pool.query(
     `SELECT idx, reason, resource_id AS id, source_id, file_name, group_key, score, ext, winner_id, winner_file_name
        FROM cleanup_run_samples WHERE run_id = ? ORDER BY idx ASC LIMIT ?`,
     [runId, cap]
   );
-  return rows;
+  return fallback;
 }
 
 module.exports = {
-  listRules, getRule, createRule, updateRule, deleteRule,
-  getSettings, updateSettings,
-  startCleanup, requestPause, resumeRun, undoRun,
-  listRuns, getRun, getLatestRun, getRunSamples
+  listRules,
+  getRule,
+  createRule,
+  updateRule,
+  deleteRule,
+  getSettings,
+  updateSettings,
+  startCleanup,
+  applyRun,
+  requestPause,
+  resumeRun,
+  undoRun,
+  listRuns,
+  getRun,
+  getLatestRun,
+  getRunSamples
 };

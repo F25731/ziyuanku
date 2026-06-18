@@ -376,6 +376,10 @@ router.post('/cleanup/runs/:id/resume', adminRequired, asyncHandler(async (req, 
   const r = await cleanupService.resumeRun(Number(req.params.id));
   res.json({ code: 200, message: '已恢复', ...r });
 }));
+router.post('/cleanup/runs/:id/apply', adminRequired, asyncHandler(async (req, res) => {
+  const r = await cleanupService.applyRun(Number(req.params.id), { confirmOver: !!(req.body && req.body.confirmOver) });
+  res.json({ code: 200, message: r.paused ? '已暂停应用' : '候选已应用', ...r });
+}));
 router.post('/cleanup/runs/:id/undo', adminRequired, asyncHandler(async (req, res) => {
   await cleanupService.undoRun(Number(req.params.id));
   res.json({ code: 200, message: '已撤销，被删行已恢复' });

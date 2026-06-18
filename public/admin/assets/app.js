@@ -1024,11 +1024,11 @@ function dashboard() {
         this.loadCleanupRules();
       } catch (e) { this.showError('删除失败', e); }
     },
-    // dryRun = true 永远不删；dryRun = false 走立即执行（可选 confirmOver 跳过阈值）
+    // 三阶段：先生成候选；审核后再应用候选。startCleanup 不再直接删除资源。
     async runCleanupDry() { return this._startCleanup(true, false); },
     async runCleanupApply(confirmOver) {
       if (!confirmOver) {
-        if (!confirm('立即执行会软删除匹配的资源（可一键撤销）。继续？')) return;
+        if (!confirm('先生成候选集，不会立刻删除资源。候选确认后再点击“应用候选”。继续？')) return;
       }
       return this._startCleanup(false, !!confirmOver);
     },
@@ -1059,6 +1059,8 @@ function dashboard() {
           removed_by_format: 0,
           removed_by_dedupe: 0,
           total_removed: 0,
+          candidate_total: 0,
+          applied_total: 0,
           target_total: d.total_examined || 0,
           samples: []
         };
@@ -1087,8 +1089,10 @@ function dashboard() {
             this.loadCleanupRuns();
             if (r.status === 'failed' && !r.safety_blocked) {
               this.notify(r.error_message || '执行失败', 'error');
+            } else if (r.status === 'review_ready') {
+              this.notify('候选集已生成：' + (r.candidate_total || r.total_removed || 0) + ' 条');
             } else if (r.status === 'completed') {
-              this.notify(r.dry_run ? '试运行完成' : ('已执行：删除 ' + r.total_removed + ' 条'));
+              this.notify('已应用：删除 ' + (r.applied_total || r.total_removed || 0) + ' 条');
             } else if (r.status === 'paused') {
               this.notify('已暂停');
             }
@@ -1113,6 +1117,11 @@ function dashboard() {
     cleanupProgressPct() {
       const c = this.cleanup.currentRun;
       if (!c || !c.target_total) return 0;
+      if (c.status === 'review_ready' || c.status === 'completed') return 100;
+      if (c.status === 'applying') {
+        const total = Number(c.total_removed || c.candidate_total || 0);
+        return total > 0 ? Math.min(99, Math.floor((Number(c.applied_total || 0) / total) * 100)) : 0;
+      }
       return Math.min(99, Math.floor((c.total_examined / c.target_total) * 100));
     },
     dismissCleanupCard() {
@@ -1138,6 +1147,26 @@ function dashboard() {
         await this.loadLatestCleanupRun();
         if (d.run_id) this._startCleanupPolling(d.run_id);
       } catch (e) { this.showError('重启失败', e); }
+    },
+    async applyCleanupRun(confirmOver) {
+      const c = this.cleanup.currentRun;
+      if (!c || !c.id) return;
+      if (!confirmOver && !confirm('确认应用候选集并软删除这些资源？可以从运行历史撤销。')) return;
+      try {
+        const d = await api('/cleanup/runs/' + c.id + '/apply', {
+          method: 'POST',
+          body: { confirmOver: !!confirmOver }
+        });
+        this.notify(d.message || '候选已应用');
+        this._startCleanupPolling(c.id);
+      } catch (e) {
+        const msg = e && e.message ? String(e.message) : '';
+        if (!confirmOver && msg.includes('SAFETY_THRESHOLD')) {
+          await this._startCleanupPolling(c.id);
+          if (confirm('候选数量超过安全阈值。仍然应用这批候选？')) return this.applyCleanupRun(true);
+        }
+        this.showError('应用候选失败', e);
+      }
     },
     async undoCleanupRun(id) {
       if (!confirm('撤销这次清理（恢复被软删除的资源）？')) return;

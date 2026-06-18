@@ -642,7 +642,7 @@
       <section x-show="tab === 'cleanup'" x-transition>
         <div class="bg-gradient-to-br from-rose-600 via-pink-600 to-fuchsia-600 rounded-2xl p-6 mb-6 text-white shadow-xl">
           <h2 class="text-2xl font-bold">数据清理</h2>
-          <p class="text-sm text-rose-100 mt-2">扫盘后跑这里：按规则去重、按扩展名过滤。所有操作都是软删除（is_deleted=1），可一键撤销。</p>
+          <p class="text-sm text-rose-100 mt-2">扫盘后跑这里：先生成候选集，再审核，最后分批软删除；可一键撤销。</p>
         </div>
 
         <!-- 常驻进度卡（在跑/最近一次的状态全靠它显示，不再用全屏遮罩） -->
@@ -652,42 +652,59 @@
                  'ring-2 ring-blue-200': cleanup.currentRun.is_running,
                  'ring-2 ring-amber-200': cleanup.currentRun.status === 'paused',
                  'ring-2 ring-rose-200': cleanup.currentRun.status === 'failed' || cleanup.currentRun.safety_blocked,
-                 'ring-2 ring-emerald-200': cleanup.currentRun.status === 'completed'
+                 'ring-2 ring-emerald-200': cleanup.currentRun.status === 'completed' || cleanup.currentRun.status === 'review_ready'
                }">
             <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
               <div class="flex items-center gap-3">
                 <svg x-show="cleanup.currentRun.is_running" class="animate-spin w-5 h-5 text-rose-600" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg>
                 <div>
                   <div class="font-bold text-slate-800">
-                    <span x-show="cleanup.currentRun.is_running" x-text="cleanup.currentRun.dry_run ? '正在试运行：' + cleanup.currentRun.rule_name : '正在执行清理：' + cleanup.currentRun.rule_name"></span>
+                    <span x-show="cleanup.currentRun.is_running" x-text="cleanup.currentRun.status === 'applying' ? '正在应用候选：' + cleanup.currentRun.rule_name : '正在生成候选：' + cleanup.currentRun.rule_name"></span>
                     <span x-show="cleanup.currentRun.status === 'paused'" class="text-amber-600">已暂停：<span x-text="cleanup.currentRun.rule_name"></span></span>
-                    <span x-show="cleanup.currentRun.status === 'completed'" class="text-emerald-600">✓ 完成：<span x-text="cleanup.currentRun.rule_name"></span></span>
+                    <span x-show="cleanup.currentRun.status === 'review_ready'" class="text-emerald-600">✓ 候选已生成：<span x-text="cleanup.currentRun.rule_name"></span></span>
+                    <span x-show="cleanup.currentRun.status === 'completed'" class="text-emerald-600">✓ 已应用：<span x-text="cleanup.currentRun.rule_name"></span></span>
                     <span x-show="cleanup.currentRun.status === 'failed' && !cleanup.currentRun.safety_blocked" class="text-rose-600">失败：<span x-text="cleanup.currentRun.rule_name"></span></span>
-                    <span x-show="cleanup.currentRun.safety_blocked" class="text-rose-600">⚠ 超过阈值已回滚：<span x-text="cleanup.currentRun.rule_name"></span></span>
+                    <span x-show="cleanup.currentRun.safety_blocked" class="text-rose-600">⚠ 超过阈值未应用：<span x-text="cleanup.currentRun.rule_name"></span></span>
                     <span x-show="cleanup.currentRun.status === 'orphaned'" class="text-slate-500">中断（容器重启过）</span>
                   </div>
-                  <div class="text-xs text-slate-400" x-text="'Run #' + cleanup.currentRun.id + ' · ' + (cleanup.currentRun.dry_run ? '试运行' : '正式执行') + (cleanup.currentRun.cross_source ? ' · 跨库' : '')"></div>
+                  <div class="text-xs text-slate-400" x-text="'Run #' + cleanup.currentRun.id + ' · 三阶段清理' + (cleanup.currentRun.cross_source ? ' · 跨库' : '')"></div>
                 </div>
               </div>
               <div class="flex items-center gap-2">
                 <button x-show="cleanup.currentRun.is_running" @click="pauseCleanupRun" class="px-3 py-1.5 rounded border border-amber-300 text-amber-700 hover:bg-amber-50 text-xs">⏸ 暂停</button>
                 <button x-show="cleanup.currentRun.status === 'paused' || cleanup.currentRun.status === 'failed' || cleanup.currentRun.status === 'orphaned'" @click="resumeCleanupRun" class="px-3 py-1.5 rounded border border-emerald-300 text-emerald-700 hover:bg-emerald-50 text-xs">▶ 重新启动</button>
+                <button x-show="cleanup.currentRun.status === 'review_ready' && cleanup.currentRun.total_removed > 0" @click="applyCleanupRun(false)" class="px-3 py-1.5 rounded bg-rose-600 hover:bg-rose-700 text-white text-xs">应用候选</button>
                 <button x-show="!cleanup.currentRun.dry_run && cleanup.currentRun.status === 'completed' && cleanup.currentRun.total_removed > 0" @click="undoCleanupRun(cleanup.currentRun.id)" class="px-3 py-1.5 rounded border border-rose-300 text-rose-600 hover:bg-rose-50 text-xs">撤销</button>
-                <button x-show="cleanup.currentRun.safety_blocked" @click="runCleanupApply(true)" class="px-3 py-1.5 rounded bg-rose-600 hover:bg-rose-700 text-white text-xs">忽略阈值再跑一次</button>
+                <button x-show="cleanup.currentRun.safety_blocked" @click="applyCleanupRun(true)" class="px-3 py-1.5 rounded bg-rose-600 hover:bg-rose-700 text-white text-xs">忽略阈值应用候选</button>
                 <button x-show="!cleanup.currentRun.is_running" @click="dismissCleanupCard" title="收起卡片（不影响数据；可在历史里再展开）" class="w-7 h-7 flex items-center justify-center rounded text-slate-400 hover:bg-slate-100 text-lg leading-none">×</button>
               </div>
             </div>
 
             <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm mb-3">
               <div class="bg-slate-50 rounded-lg p-3"><div class="text-xs text-slate-500">已扫描</div><div class="font-bold text-slate-700" x-text="(cleanup.currentRun.total_examined || 0).toLocaleString()"></div></div>
-              <div class="bg-slate-50 rounded-lg p-3"><div class="text-xs text-slate-500">格式过滤</div><div class="font-bold text-rose-600" x-text="(cleanup.currentRun.removed_by_format || 0).toLocaleString()"></div></div>
-              <div class="bg-slate-50 rounded-lg p-3"><div class="text-xs text-slate-500">去重删除</div><div class="font-bold text-rose-600" x-text="(cleanup.currentRun.removed_by_dedupe || 0).toLocaleString()"></div></div>
-              <div class="bg-slate-50 rounded-lg p-3"><div class="text-xs text-slate-500">合计删除</div><div class="font-bold text-rose-700" x-text="(cleanup.currentRun.total_removed || 0).toLocaleString()"></div></div>
+              <div class="bg-slate-50 rounded-lg p-3"><div class="text-xs text-slate-500">格式/大小候选</div><div class="font-bold text-rose-600" x-text="(cleanup.currentRun.removed_by_format || 0).toLocaleString()"></div></div>
+              <div class="bg-slate-50 rounded-lg p-3"><div class="text-xs text-slate-500">去重候选</div><div class="font-bold text-rose-600" x-text="(cleanup.currentRun.removed_by_dedupe || 0).toLocaleString()"></div></div>
+              <div class="bg-slate-50 rounded-lg p-3"><div class="text-xs text-slate-500">已应用/候选</div><div class="font-bold text-rose-700"><span x-text="(cleanup.currentRun.applied_total || 0).toLocaleString()"></span>/<span x-text="(cleanup.currentRun.total_removed || 0).toLocaleString()"></span></div></div>
             </div>
             <div class="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden" x-show="cleanup.currentRun.is_running">
               <div class="h-full bg-rose-500 transition-all" :style="'width:' + cleanupProgressPct() + '%'"></div>
             </div>
             <div x-show="cleanup.currentRun.error_message" class="mt-3 p-3 rounded-lg bg-rose-50 border border-rose-200 text-rose-700 text-xs" x-text="cleanup.currentRun.error_message"></div>
+
+            <div x-show="cleanup.currentRun.summary && cleanup.currentRun.summary.by_reason && cleanup.currentRun.summary.by_reason.length" class="mt-4 grid md:grid-cols-2 gap-3 text-xs">
+              <div class="rounded-lg border border-slate-100 bg-slate-50 p-3">
+                <div class="font-medium text-slate-600 mb-2">候选原因</div>
+                <template x-for="x in cleanup.currentRun.summary.by_reason" :key="x.reason">
+                  <div class="flex justify-between gap-3 py-0.5"><span x-text="x.reason"></span><b x-text="Number(x.total || 0).toLocaleString()"></b></div>
+                </template>
+              </div>
+              <div class="rounded-lg border border-slate-100 bg-slate-50 p-3">
+                <div class="font-medium text-slate-600 mb-2">扩展名 Top</div>
+                <template x-for="x in (cleanup.currentRun.summary.by_ext || []).slice(0, 8)" :key="x.ext">
+                  <div class="flex justify-between gap-3 py-0.5"><span x-text="x.ext"></span><b x-text="Number(x.total || 0).toLocaleString()"></b></div>
+                </template>
+              </div>
+            </div>
 
             <template x-if="cleanup.currentRun.samples && cleanup.currentRun.samples.length">
               <div class="mt-4">
@@ -749,11 +766,11 @@
               <label class="flex items-center gap-2 text-sm"><input type="checkbox" x-model="cleanup.runForm.crossSource" class="rounded"><span>跨库去重 <span class="text-xs text-slate-400">（合并不同网盘的同一份资源）</span></span></label>
               <div class="flex gap-2">
                 <button @click="runCleanupDry" :disabled="!cleanup.runForm.ruleId || cleanup.busy" class="flex-1 px-3 py-2 rounded-lg bg-amber-500 hover:bg-amber-600 text-white text-sm disabled:opacity-50 disabled:cursor-not-allowed">
-                  <span x-show="!cleanup.busy">试运行（不删）</span>
+                  <span x-show="!cleanup.busy">生成候选</span>
                   <span x-show="cleanup.busy">启动中…</span>
                 </button>
                 <button @click="runCleanupApply(false)" :disabled="!cleanup.runForm.ruleId || cleanup.busy" class="flex-1 px-3 py-2 rounded-lg bg-rose-600 hover:bg-rose-700 text-white text-sm disabled:opacity-50 disabled:cursor-not-allowed">
-                  <span x-show="!cleanup.busy">立即执行</span>
+                  <span x-show="!cleanup.busy">生成候选并进入审核</span>
                   <span x-show="cleanup.busy">启动中…</span>
                 </button>
               </div>
@@ -793,12 +810,12 @@
                   <tr>
                     <td class="px-3 py-2" x-text="run.rule_name_snapshot"></td>
                     <td class="px-3 py-2 text-center text-xs text-slate-500" x-text="run.scope_source_ids ? (run.scope_source_ids.split(',').length + ' 个库') : '全部'"></td>
-                    <td class="px-3 py-2 text-center text-xs"><span class="px-1.5 py-0.5 rounded" :class="run.dry_run ? 'bg-amber-100 text-amber-700' : 'bg-rose-100 text-rose-700'" x-text="run.dry_run ? '试运行' : '执行'"></span><span x-show="run.cross_source" class="ml-1 px-1.5 py-0.5 rounded bg-purple-100 text-purple-700">跨库</span></td>
+                    <td class="px-3 py-2 text-center text-xs"><span class="px-1.5 py-0.5 rounded bg-blue-100 text-blue-700">候选</span><span x-show="run.cross_source" class="ml-1 px-1.5 py-0.5 rounded bg-purple-100 text-purple-700">跨库</span></td>
                     <td class="px-3 py-2 text-center text-slate-500" x-text="run.total_examined"></td>
-                    <td class="px-3 py-2 text-center text-rose-600" x-text="(run.removed_by_format + run.removed_by_dedupe)"></td>
+                    <td class="px-3 py-2 text-center text-rose-600" x-text="(run.candidate_total || (run.removed_by_format + run.removed_by_dedupe))"></td>
                     <td class="px-3 py-2 text-center text-xs text-slate-500" x-text="durationOf(run)"></td>
-                    <td class="px-3 py-2 text-center text-xs"><span class="px-1.5 py-0.5 rounded" :class="{'bg-emerald-100 text-emerald-700': run.status==='completed', 'bg-rose-100 text-rose-700': run.status==='failed', 'bg-slate-200 text-slate-500': run.status==='undone', 'bg-blue-100 text-blue-700': run.status==='running'}" x-text="run.status"></span></td>
-                    <td class="px-3 py-2 text-right"><button x-show="run.status==='completed' && !run.dry_run" @click="undoCleanupRun(run.id)" class="text-rose-500 hover:underline text-xs">撤销</button></td>
+                    <td class="px-3 py-2 text-center text-xs"><span class="px-1.5 py-0.5 rounded" :class="{'bg-emerald-100 text-emerald-700': run.status==='completed' || run.status==='review_ready', 'bg-rose-100 text-rose-700': run.status==='failed', 'bg-slate-200 text-slate-500': run.status==='undone', 'bg-blue-100 text-blue-700': run.status==='running' || run.status==='applying'}" x-text="run.status"></span></td>
+                    <td class="px-3 py-2 text-right"><button x-show="run.status==='review_ready' && (run.candidate_total || 0) > 0" @click="cleanup.currentRun = {...run, rule_name: run.rule_name_snapshot, total_removed: run.candidate_total, target_total: run.total_examined}; applyCleanupRun(false)" class="text-rose-500 hover:underline text-xs mr-2">应用</button><button x-show="run.status==='completed' && !run.dry_run" @click="undoCleanupRun(run.id)" class="text-rose-500 hover:underline text-xs">撤销</button></td>
                   </tr>
                 </template>
                 <template x-if="!cleanup.runs.length"><tr><td colspan="8" class="px-3 py-8 text-center text-slate-400 text-sm">还没有运行历史</td></tr></template>
