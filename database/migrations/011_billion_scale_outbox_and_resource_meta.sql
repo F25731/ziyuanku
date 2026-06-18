@@ -1,8 +1,6 @@
--- Billion-scale write path: resource metadata and async search index outbox.
-
-ALTER TABLE `resources`
-  ADD COLUMN `file_size_bytes` bigint(20) unsigned DEFAULT NULL,
-  ADD COLUMN `file_ext` varchar(32) DEFAULT NULL;
+-- Billion-scale write path: async search index outbox.
+-- Large resources-table column/index changes must be run manually during a
+-- maintenance window; keeping startup migrations lightweight prevents downtime.
 
 CREATE TABLE IF NOT EXISTS `search_index_outbox` (
   `resource_id` bigint(20) unsigned NOT NULL,

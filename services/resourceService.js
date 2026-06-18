@@ -5,6 +5,23 @@ const HttpError = require('../utils/httpError');
 const { parseFileSizeToBytes, getFileExt } = require('../utils/resourceMeta');
 
 const SEARCH_REQUIRE_EXTERNAL = String(process.env.SEARCH_REQUIRE_EXTERNAL || '0') === '1';
+let resourceMetaColumnsPromise = null;
+
+async function hasResourceMetaColumns() {
+  if (!resourceMetaColumnsPromise) {
+    resourceMetaColumnsPromise = pool.query(
+      `SELECT COLUMN_NAME
+         FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'resources'
+          AND COLUMN_NAME IN ('file_size_bytes', 'file_ext')`
+    ).then(([rows]) => {
+      const names = new Set(rows.map((r) => r.COLUMN_NAME));
+      return names.has('file_size_bytes') && names.has('file_ext');
+    }).catch(() => false);
+  }
+  return resourceMetaColumnsPromise;
+}
 
 // 把用户输入的关键词转成 MySQL FULLTEXT BOOLEAN MODE 表达式
 // 多个空白分隔的词都用 + 前缀强制 AND，并按 ngram 拆词后的"短语"包起来更稳
@@ -183,6 +200,7 @@ async function upsertResources(sourceId, files) {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    const hasMetaColumns = await hasResourceMetaColumns();
 
     const values = files.map((f) => [
       sourceId,
@@ -190,28 +208,40 @@ async function upsertResources(sourceId, files) {
       f.file_id || null,
       (f.file_name || '').slice(0, 500),
       f.file_size || '',
-      parseFileSizeToBytes(f.file_size),
       f.file_type || '',
-      getFileExt(f.file_name || ''),
       f.file_time || '',
       f.share_url || null,
       f.share_pwd || null,
       f.sync_hash || null,
       0
     ]);
+    if (hasMetaColumns) {
+      for (let i = 0; i < files.length; i++) {
+        values[i].splice(5, 0, parseFileSizeToBytes(files[i].file_size));
+        values[i].splice(7, 0, getFileExt(files[i].file_name || ''));
+      }
+    }
+
+    const insertColumns = hasMetaColumns
+      ? `source_id, parent_folder_id, file_id, file_name, file_size, file_size_bytes, file_type, file_ext, file_time,
+          share_url, share_pwd, sync_hash, is_deleted`
+      : `source_id, parent_folder_id, file_id, file_name, file_size, file_type, file_time,
+          share_url, share_pwd, sync_hash, is_deleted`;
+    const metaUpdates = hasMetaColumns
+      ? `file_size_bytes = VALUES(file_size_bytes),
+         file_ext = VALUES(file_ext),`
+      : '';
 
     const [result] = await conn.query(
       `INSERT INTO resources
-         (source_id, parent_folder_id, file_id, file_name, file_size, file_size_bytes, file_type, file_ext, file_time,
-          share_url, share_pwd, sync_hash, is_deleted)
+         (${insertColumns})
        VALUES ?
        ON DUPLICATE KEY UPDATE
          parent_folder_id = VALUES(parent_folder_id),
          file_name = VALUES(file_name),
          file_size = VALUES(file_size),
-         file_size_bytes = VALUES(file_size_bytes),
          file_type = VALUES(file_type),
-         file_ext = VALUES(file_ext),
+         ${metaUpdates}
          file_time = VALUES(file_time),
          share_url = VALUES(share_url),
          share_pwd = VALUES(share_pwd),

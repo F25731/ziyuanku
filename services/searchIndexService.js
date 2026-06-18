@@ -161,7 +161,7 @@ async function bulkIndexBySourceFileIds(sourceId, fileIds) {
   const ids = Array.from(new Set(fileIds.map((x) => String(x || '').trim()).filter(Boolean)));
   if (!ids.length) return false;
   const [rows] = await pool.query(
-    `SELECT id, source_id, file_id, file_name, file_size, file_size_bytes, file_type, file_ext, file_time, share_url, is_deleted, created_at, updated_at
+    `SELECT id, source_id, file_id, file_name, file_size, file_type, file_time, share_url, is_deleted, created_at, updated_at
        FROM resources
       WHERE source_id = ? AND file_id IN (?)`,
     [sourceId, ids]

@@ -16,7 +16,7 @@ async function main() {
 
   while (true) {
     const [rows] = await pool.query(
-      `SELECT id, source_id, file_id, file_name, file_size, file_size_bytes, file_type, file_ext, file_time, share_url, is_deleted, created_at, updated_at
+      `SELECT id, source_id, file_id, file_name, file_size, file_type, file_time, share_url, is_deleted, created_at, updated_at
          FROM resources
         WHERE id > ?
         ORDER BY id ASC
