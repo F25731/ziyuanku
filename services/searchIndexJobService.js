@@ -1,7 +1,7 @@
 const { pool } = require('../config/db');
 const searchIndex = require('./searchIndexService');
 
-const DEFAULT_BATCH = Math.max(100, Number(process.env.SEARCH_REINDEX_BATCH || 1000));
+const DEFAULT_BATCH = Math.max(50, Number(process.env.SEARCH_REINDEX_BATCH || 200));
 const DEFAULT_ATTEMPTS = Math.max(1, Number(process.env.MEILI_RETRY_ATTEMPTS || 5));
 const OUTBOX_MAX_ATTEMPTS = Math.max(1, Number(process.env.SEARCH_OUTBOX_MAX_ATTEMPTS || 10));
 
@@ -84,7 +84,7 @@ async function createJob({ mode = 'full', sourceId = null, batchSize = DEFAULT_B
   sourceId = sourceId ? Number(sourceId) : null;
   const startId = mode === 'incremental' ? await getIncrementalStartId(sourceId) : 0;
   const totalResources = await countResources({ sourceId, startId });
-  const bs = Math.min(10000, Math.max(100, Number(batchSize) || DEFAULT_BATCH));
+  const bs = Math.min(5000, Math.max(50, Number(batchSize) || DEFAULT_BATCH));
   const attempts = Math.min(20, Math.max(1, Number(maxAttempts) || DEFAULT_ATTEMPTS));
 
   const [r] = await pool.query(

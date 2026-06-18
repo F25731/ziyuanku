@@ -208,7 +208,7 @@ function dashboard() {
       activeJob: null,
       jobs: [],
       timer: null,
-      form: { batchSize: 1000, maxAttempts: 5, sourceId: 0 }
+      form: { batchSize: 200, maxAttempts: 5, sourceId: 0 }
     },
     linkModal: { open: false, fileName: '', url: '', expireText: '', cached: false, loading: false, error: '', detail: '' },
     errorModal: { open: false, title: '', message: '', detail: '' },

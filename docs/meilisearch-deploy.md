@@ -27,6 +27,14 @@ git pull
 docker compose -f docker-compose.yml -f docker-compose.search.yml up -d --build
 ```
 
+For million-level libraries, the search compose file defaults Meilisearch to `MEILI_MEMORY_LIMIT=2g` and `MEILI_BATCH_SIZE=200`. If your server has more RAM, you can raise it in `.env`:
+
+```env
+MEILI_MEMORY_LIMIT=3g
+MEILI_BATCH_SIZE=200
+MEILI_TASK_TIMEOUT_MS=600000
+```
+
 Check status:
 
 ```bash
@@ -51,6 +59,15 @@ docker compose -f docker-compose.yml -f docker-compose.search.yml exec app npm r
 ```
 
 Full reindex waits for each Meilisearch task by default and retries transient write failures such as connection resets. This is slower than fire-and-forget writes, but safer for million-level and larger imports.
+
+If a previous run flooded Meilisearch with thousands of queued tasks and the container keeps restarting, stop the app/search worker, remove only the Meilisearch volume, and rebuild the index from MySQL:
+
+```bash
+cd /opt/lanzou-hub
+docker compose -f docker-compose.yml -f docker-compose.search.yml stop app search-worker meilisearch
+docker volume rm lanzou-hub_meili_data
+docker compose -f docker-compose.yml -f docker-compose.search.yml up -d --build meilisearch app search-worker
+```
 
 Resume after interruption:
 

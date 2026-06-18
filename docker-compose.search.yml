@@ -7,9 +7,11 @@ services:
       MEILI_ENV: production
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
       MEILI_NO_ANALYTICS: "true"
+      MEILI_LOG_LEVEL: ${MEILI_LOG_LEVEL:-WARN}
       MEILI_DB_PATH: /meili_data
       MEILI_DUMP_DIR: /meili_dumps
       MEILI_SNAPSHOT_DIR: /meili_snapshots
+    mem_limit: ${MEILI_MEMORY_LIMIT:-2g}
     volumes:
       - meili_data:/meili_data
       - meili_dumps:/meili_dumps
@@ -17,7 +19,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 768M
+          memory: ${MEILI_MEMORY_LIMIT:-2g}
     networks: [internal]
 
   app:
@@ -33,6 +35,9 @@ services:
       MEILI_URL: http://meilisearch:7700
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
       MEILI_INDEX: ${MEILI_INDEX:-lrh_resources}
+      MEILI_BATCH_SIZE: ${MEILI_BATCH_SIZE:-200}
+      MEILI_TASK_TIMEOUT_MS: ${MEILI_TASK_TIMEOUT_MS:-600000}
+      SEARCH_TIMEOUT_MS: ${SEARCH_TIMEOUT_MS:-30000}
       SEARCH_OUTBOX_WORKER_ENABLED: "0"
 
   search-worker:
@@ -63,8 +68,9 @@ services:
       MEILI_URL: http://meilisearch:7700
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
       MEILI_INDEX: ${MEILI_INDEX:-lrh_resources}
-      MEILI_BATCH_SIZE: ${MEILI_BATCH_SIZE:-1000}
-      SEARCH_TIMEOUT_MS: ${SEARCH_TIMEOUT_MS:-5000}
+      MEILI_BATCH_SIZE: ${MEILI_BATCH_SIZE:-200}
+      MEILI_TASK_TIMEOUT_MS: ${MEILI_TASK_TIMEOUT_MS:-600000}
+      SEARCH_TIMEOUT_MS: ${SEARCH_TIMEOUT_MS:-30000}
       SEARCH_OUTBOX_BATCH: ${SEARCH_OUTBOX_BATCH:-500}
       SEARCH_OUTBOX_INTERVAL_MS: ${SEARCH_OUTBOX_INTERVAL_MS:-5000}
       SEARCH_OUTBOX_MAX_ATTEMPTS: ${SEARCH_OUTBOX_MAX_ATTEMPTS:-10}
