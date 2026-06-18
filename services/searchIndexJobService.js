@@ -134,6 +134,17 @@ async function runJob(id) {
       "UPDATE search_index_jobs SET status='running', started_at=COALESCE(started_at, NOW()), finished_at=NULL WHERE id=?",
       [id]
     );
+    const ready = await searchIndex.waitUntilReady(90000);
+    if (!ready) {
+      const err = searchIndex.getLastError() || 'Meilisearch is not ready';
+      await pool.query(
+        `UPDATE search_index_jobs
+            SET status='failed', last_error=?, finished_at=NOW()
+          WHERE id=?`,
+        [err.slice(0, 1000), id]
+      );
+      return;
+    }
 
     while (!ctx.pause) {
       job = await getJob(id);
@@ -166,6 +177,15 @@ async function runJob(id) {
       let ok = false;
       let lastErr = '';
       for (let attempt = 1; attempt <= Number(job.max_attempts || DEFAULT_ATTEMPTS); attempt++) {
+        if (!(await searchIndex.waitUntilReady(60000))) {
+          lastErr = searchIndex.getLastError() || 'Meilisearch is not ready';
+          await pool.query(
+            'UPDATE search_index_jobs SET attempts=attempts+1, last_error=? WHERE id=?',
+            [lastErr.slice(0, 1000), id]
+          );
+          await sleep(Math.min(60000, 10000 + attempt * attempt * 1000));
+          continue;
+        }
         ok = await searchIndex.bulkIndexRows(rows);
         if (ok) break;
         lastErr = searchIndex.getLastError() || 'bulk index returned false';

@@ -48,7 +48,7 @@ function formatError(err) {
 
 function isRetryableError(err) {
   if (!err) return false;
-  if (['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'EAI_AGAIN'].includes(err.code)) return true;
+  if (['ECONNREFUSED', 'ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'EAI_AGAIN'].includes(err.code)) return true;
   const status = err.response && Number(err.response.status);
   return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
 }
@@ -60,6 +60,7 @@ function sleep(ms) {
 function coolDown(err, context = '') {
   disabledUntil = Date.now() + 15000;
   lastError = formatError(err);
+  if (isRetryableError(err)) ensured = false;
   console.warn(`[meili] temporarily disabled${context ? ` ${context}` : ''}: ${lastError}`);
 }
 
@@ -111,6 +112,27 @@ async function getOverview() {
     overview.tasks = { error: formatError(err) };
   }
   return overview;
+}
+
+async function waitUntilReady(timeoutMs = 60000) {
+  if (!isEnabled()) return false;
+  const deadline = Date.now() + Math.max(1000, Number(timeoutMs) || 60000);
+  let errText = '';
+  while (Date.now() < deadline) {
+    try {
+      const { data } = await client().get('/health');
+      if (!data || data.status === 'available') {
+        lastError = '';
+        return true;
+      }
+      errText = data.status || 'not available';
+    } catch (err) {
+      errText = formatError(err);
+    }
+    await sleep(1000);
+  }
+  lastError = errText || 'Meilisearch is not ready';
+  return false;
 }
 
 function encodeCursor(offset) {
@@ -367,5 +389,6 @@ module.exports = {
   searchResources,
   getLastError,
   getConfig,
-  getOverview
+  getOverview,
+  waitUntilReady
 };
