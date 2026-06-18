@@ -1,6 +1,7 @@
 const ICON = {
   dashboard: '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2 7-7 7 7 2 2M5 10v10a1 1 0 001 1h3m10-11v10a1 1 0 01-1 1h-3m-6 0h6"/></svg>',
   resources: '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9 4h4"/></svg>',
+  search: '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7h16M4 12h10M4 17h7m8-3l2 2m-1-5a4 4 0 11-8 0 4 4 0 018 0z"/></svg>',
   sources: '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 3a2 2 0 00-2 2v12a2 2 0 002 2h14a2 2 0 002-2V5a2 2 0 00-2-2H5zm4 6l3 3-3 3m5-6l-3 3 3 3"/></svg>',
   apikeys: '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 11-4 0 2 2 0 014 0zm2 0a4 4 0 11-8 0 4 4 0 018 0zM3 21l6-6m2 2l3-3m-3 3l3 3"/></svg>',
   cleanup: '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6M9 7V4a1 1 0 011-1h4a1 1 0 011 1v3M4 7h16"/></svg>',
@@ -148,6 +149,7 @@ function dashboard() {
     navs: [
       { key: 'dashboard', label: '仪表盘', desc: '资源库运行总览', icon: ICON.dashboard },
       { key: 'resources', label: '资源管理', desc: '库内所有资源的检索和维护', icon: ICON.resources },
+      { key: 'searchindex', label: '搜索索引', desc: 'Meilisearch 配置、状态、重建与增量补扫', icon: ICON.search },
       { key: 'sources',   label: '数据来源', desc: '蓝奏账号、分享链接来源配置', icon: ICON.sources },
       { key: 'apikeys',   label: 'API Key', desc: '对外开放的调用密钥，接入软件站时签发', icon: ICON.apikeys },
       { key: 'cleanup',   label: '数据清理', desc: '扫盘后去重、按格式过滤；可撤销', icon: ICON.cleanup || ICON.apikeys },
@@ -197,6 +199,17 @@ function dashboard() {
       settings: { safe_ratio: 0.3, safeRatioPct: 30, savedMsg: '' }
     },
     cleanupRuleModal: { open: false, id: null, name: '', description: '', enabled: true, configText: '', parseError: '' },
+    searchIndex: {
+      loading: false,
+      config: {},
+      meili: {},
+      mysql: {},
+      outbox: {},
+      activeJob: null,
+      jobs: [],
+      timer: null,
+      form: { batchSize: 1000, maxAttempts: 5, sourceId: 0 }
+    },
     linkModal: { open: false, fileName: '', url: '', expireText: '', cached: false, loading: false, error: '', detail: '' },
     errorModal: { open: false, title: '', message: '', detail: '' },
     batchResolve: { running: false, total: 0, done: 0, success: 0, failed: 0, canceled: false, summary: false, sources: 0 },
@@ -205,7 +218,7 @@ function dashboard() {
     // 全局进度条：活跃请求计数器，>0 时显示顶部蓝色进度条
     activeReq: 0,
     // 每个 tab 自己的 loading 状态，true = 显示中间转圈
-    tabLoading: { resources: false, sources: false, apikeys: false, synclogs: false, calllogs: false, dashboard: false },
+    tabLoading: { resources: false, searchindex: false, sources: false, apikeys: false, synclogs: false, calllogs: false, dashboard: false },
     // 搜索防抖计时器
     _searchDebounce: null,
     searchEngine: '', // 'meili' / 'mysql'，搜完后显示
@@ -229,6 +242,13 @@ function dashboard() {
       this.loadStats();
       this.$watch('tab', (v) => {
         if (v === 'resources') this.loadResources(1);
+        if (v === 'searchindex') {
+          this.loadSourcesLite();
+          this.loadSearchIndexStatus();
+          this._startSearchIndexPolling();
+        } else {
+          this._stopSearchIndexPolling();
+        }
         if (v === 'sources') this.loadSources();
         if (v === 'apikeys') this.loadApiKeys();
         if (v === 'synclogs') this.loadSyncLogs();
@@ -778,6 +798,89 @@ function dashboard() {
         this.callLogs = d.items || [];
       } catch (e) { this.notify(e.message, 'error'); }
       finally { this.tabLoading.calllogs = false; }
+    },
+
+    // ---------- Meilisearch 搜索索引 ----------
+    async loadSearchIndexStatus(silent = false) {
+      if (!silent) this.tabLoading.searchindex = true;
+      try {
+        const d = await api('/search/status');
+        this.searchIndex.config = d.config || {};
+        this.searchIndex.meili = d.meili || {};
+        this.searchIndex.mysql = d.mysql || {};
+        this.searchIndex.outbox = d.outbox || {};
+        this.searchIndex.activeJob = d.active_job || null;
+        this.searchIndex.jobs = d.jobs || [];
+      } catch (e) {
+        if (!silent) this.showError('加载搜索索引状态失败', e);
+      } finally {
+        if (!silent) this.tabLoading.searchindex = false;
+      }
+    },
+    _startSearchIndexPolling() {
+      this._stopSearchIndexPolling();
+      this.searchIndex.timer = setInterval(() => this.loadSearchIndexStatus(true), 2500);
+    },
+    _stopSearchIndexPolling() {
+      if (this.searchIndex.timer) {
+        clearInterval(this.searchIndex.timer);
+        this.searchIndex.timer = null;
+      }
+    },
+    searchJobPct(job) {
+      if (!job || !job.total_resources) return 0;
+      return Math.min(100, Math.round((Number(job.total_seen || 0) / Number(job.total_resources || 1)) * 100));
+    },
+    searchJobStatusText(status) {
+      return ({ queued: '排队中', running: '运行中', completed: '已完成', failed: '失败', paused: '已暂停' })[status] || status || '-';
+    },
+    async startSearchIndexJob(mode) {
+      if (mode === 'full' && !confirm('全量重建会从资源表头部重新扫描并覆盖写入 Meilisearch，继续？')) return;
+      const f = this.searchIndex.form;
+      try {
+        const d = await api('/search/jobs', {
+          method: 'POST',
+          body: {
+            mode,
+            batchSize: f.batchSize,
+            maxAttempts: f.maxAttempts,
+            sourceId: f.sourceId || null
+          }
+        });
+        this.notify(d.message || '任务已启动');
+        await this.loadSearchIndexStatus(true);
+      } catch (e) {
+        this.showError('启动索引任务失败', e);
+      }
+    },
+    async pauseSearchIndexJob(job) {
+      if (!job || !job.id) return;
+      try {
+        await api('/search/jobs/' + job.id + '/pause', { method: 'POST' });
+        this.notify('已请求暂停');
+        await this.loadSearchIndexStatus(true);
+      } catch (e) {
+        this.showError('暂停失败', e);
+      }
+    },
+    async resumeSearchIndexJob(job) {
+      if (!job || !job.id) return;
+      try {
+        const d = await api('/search/jobs/' + job.id + '/resume', { method: 'POST' });
+        this.notify(d.message || '已继续');
+        await this.loadSearchIndexStatus(true);
+      } catch (e) {
+        this.showError('继续失败', e);
+      }
+    },
+    async retrySearchOutbox() {
+      try {
+        const d = await api('/search/outbox/retry-failed', { method: 'POST' });
+        this.notify('已重置失败队列：' + (d.changed || 0) + ' 条');
+        await this.loadSearchIndexStatus(true);
+      } catch (e) {
+        this.showError('重试失败队列失败', e);
+      }
     },
 
     // ---------- 数据清理 ----------

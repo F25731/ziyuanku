@@ -18,6 +18,7 @@ const {
 } = require('../services/apiKeyService');
 const cleanupService = require('../services/cleanupService');
 const statsService = require('../services/statsService');
+const searchIndexJobService = require('../services/searchIndexJobService');
 
 const router = express.Router();
 
@@ -89,6 +90,46 @@ router.get('/resources/:id/link', asyncHandler(async (req, res) => {
       context: ctx
     });
   }
+}));
+
+// ---------- Meilisearch search index ----------
+router.get('/search/status', asyncHandler(async (req, res) => {
+  const data = await searchIndexJobService.getStatus();
+  res.json({ code: 200, ...data });
+}));
+
+router.post('/search/jobs', adminRequired, asyncHandler(async (req, res) => {
+  const body = req.body || {};
+  const result = await searchIndexJobService.createJob({
+    mode: body.mode,
+    sourceId: body.sourceId,
+    batchSize: body.batchSize,
+    maxAttempts: body.maxAttempts
+  });
+  res.json({
+    code: 200,
+    message: result.already_running ? '已有索引任务正在运行' : '索引任务已启动',
+    ...result
+  });
+}));
+
+router.post('/search/jobs/:id/pause', adminRequired, asyncHandler(async (req, res) => {
+  const job = await searchIndexJobService.pauseJob(Number(req.params.id));
+  res.json({ code: 200, message: '已请求暂停', job });
+}));
+
+router.post('/search/jobs/:id/resume', adminRequired, asyncHandler(async (req, res) => {
+  const result = await searchIndexJobService.resumeJob(Number(req.params.id));
+  res.json({
+    code: 200,
+    message: result.already_running ? '已有索引任务正在运行' : '索引任务已继续',
+    ...result
+  });
+}));
+
+router.post('/search/outbox/retry-failed', adminRequired, asyncHandler(async (req, res) => {
+  const result = await searchIndexJobService.retryFailedOutbox();
+  res.json({ code: 200, message: '已重置失败队列', ...result });
 }));
 
 // ---------- 来源（蓝奏账号）管理 ----------

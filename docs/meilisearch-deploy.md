@@ -36,6 +36,16 @@ docker compose -f docker-compose.yml -f docker-compose.search.yml logs --tail=80
 
 ## Rebuild the index
 
+You can now manage this from the admin panel:
+
+```text
+Admin -> 搜索索引
+```
+
+The panel shows Meilisearch health, indexed documents, MySQL resource count, outbox queue size, current scan job, and job history. It can start full rebuilds, incremental scans, pause a running job, resume from the saved checkpoint, and retry failed outbox items.
+
+CLI rebuild is still available:
+
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.search.yml exec app npm run reindex:search
 ```

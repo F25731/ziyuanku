@@ -222,6 +222,158 @@
         </div>
       </section>
 
+      <!-- 搜索索引 / Meilisearch -->
+      <section x-show="tab === 'searchindex'" x-transition>
+        <div class="bg-white rounded-xl shadow-sm border border-slate-100 p-5 mb-6 relative">
+          <div x-show="tabLoading.searchindex" class="absolute inset-0 z-10 bg-white/70 backdrop-blur-sm flex items-center justify-center rounded-xl">
+            <svg class="animate-spin w-8 h-8 text-blue-500" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg>
+          </div>
+
+          <div class="flex flex-wrap items-start justify-between gap-4 mb-5">
+            <div>
+              <h2 class="text-xl font-bold text-slate-800">Meilisearch 搜索索引</h2>
+              <p class="text-xs text-slate-500 mt-1">只索引 id、file_name、source_id、file_type；详情仍回 MySQL 查询。</p>
+            </div>
+            <div class="flex flex-wrap gap-2">
+              <button @click="loadSearchIndexStatus()" class="px-3 py-2 rounded-lg border border-slate-200 hover:bg-slate-50 text-sm">刷新</button>
+              <button @click="startSearchIndexJob('incremental')" class="px-3 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-sm">增量扫库</button>
+              <button @click="startSearchIndexJob('full')" class="px-3 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm">全量重建</button>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-2 lg:grid-cols-5 gap-3 mb-5">
+            <div class="rounded-lg border border-slate-100 bg-slate-50 p-4">
+              <div class="text-xs text-slate-500">引擎</div>
+              <div class="mt-1 font-bold" :class="searchIndex.config.enabled ? 'text-emerald-600' : 'text-rose-600'" x-text="searchIndex.config.enabled ? 'Meilisearch' : '未启用'"></div>
+            </div>
+            <div class="rounded-lg border border-slate-100 bg-slate-50 p-4">
+              <div class="text-xs text-slate-500">健康</div>
+              <div class="mt-1 font-bold" :class="searchIndex.meili.health && searchIndex.meili.health.ok ? 'text-emerald-600' : 'text-rose-600'" x-text="searchIndex.meili.health && searchIndex.meili.health.ok ? '在线' : '异常'"></div>
+            </div>
+            <div class="rounded-lg border border-slate-100 bg-slate-50 p-4">
+              <div class="text-xs text-slate-500">索引文档</div>
+              <div class="mt-1 font-bold text-slate-800" x-text="searchIndex.meili.index && searchIndex.meili.index.numberOfDocuments != null ? searchIndex.meili.index.numberOfDocuments : '-'"></div>
+            </div>
+            <div class="rounded-lg border border-slate-100 bg-slate-50 p-4">
+              <div class="text-xs text-slate-500">MySQL 资源</div>
+              <div class="mt-1 font-bold text-slate-800" x-text="searchIndex.mysql.resources ?? '-'"></div>
+            </div>
+            <div class="rounded-lg border border-slate-100 bg-slate-50 p-4">
+              <div class="text-xs text-slate-500">待同步队列</div>
+              <div class="mt-1 font-bold text-slate-800" x-text="searchIndex.outbox.total ?? '-'"></div>
+            </div>
+          </div>
+
+          <div class="grid lg:grid-cols-3 gap-4">
+            <div class="rounded-lg border border-slate-100 p-4">
+              <h3 class="font-semibold text-slate-700 mb-3">配置</h3>
+              <div class="space-y-2 text-xs text-slate-600">
+                <div class="flex justify-between gap-3"><span>URL</span><span class="font-mono text-right break-all" x-text="searchIndex.config.url || '-'"></span></div>
+                <div class="flex justify-between gap-3"><span>Index</span><span class="font-mono" x-text="searchIndex.config.index || '-'"></span></div>
+                <div class="flex justify-between gap-3"><span>Master Key</span><span x-text="searchIndex.config.has_master_key ? '已配置' : '未配置'"></span></div>
+                <div class="flex justify-between gap-3"><span>写入批量</span><span x-text="searchIndex.config.batch_size || '-'"></span></div>
+                <div class="flex justify-between gap-3"><span>重试次数</span><span x-text="searchIndex.config.retry_attempts || '-'"></span></div>
+              </div>
+            </div>
+
+            <div class="rounded-lg border border-slate-100 p-4">
+              <h3 class="font-semibold text-slate-700 mb-3">扫库参数</h3>
+              <div class="grid grid-cols-2 gap-3 text-sm">
+                <label class="block">
+                  <span class="text-xs text-slate-500">批量大小</span>
+                  <input type="number" min="100" max="10000" step="100" x-model.number="searchIndex.form.batchSize" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200">
+                </label>
+                <label class="block">
+                  <span class="text-xs text-slate-500">批次最大尝试</span>
+                  <input type="number" min="1" max="20" x-model.number="searchIndex.form.maxAttempts" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200">
+                </label>
+                <label class="block col-span-2">
+                  <span class="text-xs text-slate-500">限定来源</span>
+                  <select x-model.number="searchIndex.form.sourceId" class="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200">
+                    <option :value="0">全部来源</option>
+                    <template x-for="s in sourcesLite" :key="s.id">
+                      <option :value="s.id" x-text="'#' + s.id + ' ' + s.title"></option>
+                    </template>
+                  </select>
+                </label>
+              </div>
+            </div>
+
+            <div class="rounded-lg border border-slate-100 p-4">
+              <h3 class="font-semibold text-slate-700 mb-3">增量队列</h3>
+              <div class="grid grid-cols-2 gap-2 text-xs text-slate-600">
+                <div>Upsert：<b x-text="searchIndex.outbox.upserts ?? 0"></b></div>
+                <div>Delete：<b x-text="searchIndex.outbox.deletes ?? 0"></b></div>
+                <div>重试中：<b x-text="searchIndex.outbox.retrying ?? 0"></b></div>
+                <div>失败：<b class="text-rose-600" x-text="searchIndex.outbox.failed ?? 0"></b></div>
+              </div>
+              <button @click="retrySearchOutbox()" class="mt-4 px-3 py-2 rounded-lg border border-rose-200 text-rose-600 hover:bg-rose-50 text-sm">重试失败队列</button>
+            </div>
+          </div>
+        </div>
+
+        <div x-show="searchIndex.activeJob" class="bg-white rounded-xl shadow-sm border border-slate-100 p-5 mb-6">
+          <div class="flex flex-wrap items-center justify-between gap-3 mb-3">
+            <div>
+              <h3 class="font-semibold text-slate-700">当前任务</h3>
+              <p class="text-xs text-slate-500">
+                <span x-text="'#' + searchIndex.activeJob?.id"></span>
+                <span class="mx-1">·</span>
+                <span x-text="searchIndex.activeJob?.mode === 'full' ? '全量' : '增量'"></span>
+                <span class="mx-1">·</span>
+                <span x-text="searchJobStatusText(searchIndex.activeJob?.status)"></span>
+              </p>
+            </div>
+            <div class="flex gap-2">
+              <button x-show="searchIndex.activeJob && searchIndex.activeJob.status === 'running'" @click="pauseSearchIndexJob(searchIndex.activeJob)" class="px-3 py-2 rounded-lg border border-amber-200 text-amber-700 hover:bg-amber-50 text-sm">暂停</button>
+              <button x-show="searchIndex.activeJob && ['paused','failed'].includes(searchIndex.activeJob.status)" @click="resumeSearchIndexJob(searchIndex.activeJob)" class="px-3 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-sm">继续</button>
+            </div>
+          </div>
+          <div class="h-3 bg-slate-100 rounded-full overflow-hidden">
+            <div class="h-full bg-gradient-to-r from-blue-500 to-emerald-500 transition-all" :style="'width:' + searchJobPct(searchIndex.activeJob) + '%'"></div>
+          </div>
+          <div class="mt-3 grid grid-cols-2 md:grid-cols-5 gap-3 text-xs text-slate-600">
+            <div>进度：<b x-text="searchJobPct(searchIndex.activeJob) + '%'"></b></div>
+            <div>已扫：<b x-text="searchIndex.activeJob?.total_seen || 0"></b></div>
+            <div>已写：<b x-text="searchIndex.activeJob?.total_indexed || 0"></b></div>
+            <div>断点 ID：<b x-text="searchIndex.activeJob?.last_id || 0"></b></div>
+            <div>尝试：<b x-text="searchIndex.activeJob?.attempts || 0"></b></div>
+          </div>
+          <div x-show="searchIndex.activeJob && searchIndex.activeJob.last_error" class="mt-3 p-3 rounded-lg bg-rose-50 border border-rose-100 text-xs text-rose-700 break-all" x-text="searchIndex.activeJob?.last_error"></div>
+        </div>
+
+        <div class="bg-white rounded-xl shadow-sm border border-slate-100 overflow-hidden">
+          <div class="p-4 border-b border-slate-100 flex items-center justify-between">
+            <h3 class="font-semibold text-slate-700">任务历史</h3>
+            <span class="text-xs text-slate-400">失败或暂停的任务可断点继续</span>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm min-w-[760px]">
+              <thead class="bg-slate-50 text-slate-500 text-xs uppercase">
+                <tr><th class="px-4 py-3 text-left">ID</th><th class="px-4 py-3">模式</th><th class="px-4 py-3">状态</th><th class="px-4 py-3">进度</th><th class="px-4 py-3">断点</th><th class="px-4 py-3">已写</th><th class="px-4 py-3">错误</th><th class="px-4 py-3 text-right">操作</th></tr>
+              </thead>
+              <tbody class="divide-y divide-slate-100">
+                <template x-for="j in searchIndex.jobs" :key="j.id">
+                  <tr class="hover:bg-slate-50">
+                    <td class="px-4 py-3 text-slate-500" x-text="j.id"></td>
+                    <td class="px-4 py-3 text-center" x-text="j.mode === 'full' ? '全量' : '增量'"></td>
+                    <td class="px-4 py-3 text-center"><span class="px-2 py-0.5 rounded bg-slate-100 text-xs" x-text="searchJobStatusText(j.status)"></span></td>
+                    <td class="px-4 py-3 text-center" x-text="searchJobPct(j) + '%'"></td>
+                    <td class="px-4 py-3 text-center" x-text="j.last_id"></td>
+                    <td class="px-4 py-3 text-center" x-text="j.total_indexed"></td>
+                    <td class="px-4 py-3 max-w-xs truncate text-rose-600" :title="j.last_error || ''" x-text="j.last_error || '-'"></td>
+                    <td class="px-4 py-3 text-right">
+                      <button x-show="['paused','failed'].includes(j.status)" @click="resumeSearchIndexJob(j)" class="text-emerald-600 hover:text-emerald-700 text-xs">继续</button>
+                      <span x-show="!['paused','failed'].includes(j.status)" class="text-slate-300 text-xs">-</span>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
       <!-- 来源 / 蓝奏账号 -->
       <section x-show="tab === 'sources'" x-transition>
         <div class="mb-4"><button @click="openSourceModal()" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium">+ 新增来源</button></div>

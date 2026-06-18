@@ -67,6 +67,52 @@ function getLastError() {
   return lastError;
 }
 
+function getConfig() {
+  return {
+    engine: ENGINE,
+    enabled: isEnabled(),
+    url: BASE_URL,
+    index: INDEX,
+    has_master_key: !!MASTER_KEY,
+    batch_size: BULK_BATCH,
+    retry_attempts: RETRY_ATTEMPTS,
+    retry_base_ms: RETRY_BASE_MS,
+    task_timeout_ms: TASK_TIMEOUT_MS,
+    wait_tasks: String(process.env.MEILI_WAIT_TASKS || '0') === '1',
+    disabled_until: disabledUntil,
+    last_error: lastError
+  };
+}
+
+async function getOverview() {
+  const config = getConfig();
+  if (!config.enabled) {
+    return { config, health: { ok: false, message: 'Meilisearch is not enabled' }, index: null };
+  }
+  const c = client();
+  const overview = { config, health: { ok: false }, index: null, tasks: null };
+  try {
+    const { data } = await c.get('/health');
+    overview.health = { ok: true, ...data };
+  } catch (err) {
+    overview.health = { ok: false, error: formatError(err) };
+    return overview;
+  }
+  try {
+    const { data } = await c.get(`/indexes/${encodeURIComponent(INDEX)}/stats`);
+    overview.index = data;
+  } catch (err) {
+    overview.index = { error: formatError(err) };
+  }
+  try {
+    const { data } = await c.get('/tasks?limit=5');
+    overview.tasks = data;
+  } catch (err) {
+    overview.tasks = { error: formatError(err) };
+  }
+  return overview;
+}
+
 function encodeCursor(offset) {
   const n = Math.max(0, Number(offset) || 0);
   return Buffer.from(JSON.stringify({ offset: n })).toString('base64url');
@@ -319,5 +365,7 @@ module.exports = {
   bulkIndexBySourceFileIds,
   deleteResource,
   searchResources,
-  getLastError
+  getLastError,
+  getConfig,
+  getOverview
 };
