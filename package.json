@@ -13,7 +13,6 @@
     "backfill:call-stats": "node scripts/backfill_call_stats.js",
     "search:outbox": "node scripts/process_search_outbox.js",
     "search:worker": "node scripts/process_search_worker.js",
-    "cleanup:worker": "node scripts/process_cleanup_jobs.js",
     "backfill:resource-meta": "node scripts/backfill_resource_meta.js"
   },
   "engines": {
