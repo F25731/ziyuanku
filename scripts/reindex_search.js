@@ -29,12 +29,12 @@ function writeCheckpoint(data) {
 
 async function main() {
   if (!searchIndex.isEnabled()) {
-    throw new Error('Manticore is not configured; set SEARCH_ENGINE=manticore and MANTICORE_URL first');
+    throw new Error('Meilisearch is not configured; set SEARCH_ENGINE=meilisearch and MEILI_HOST first');
   }
   const ready = await searchIndex.ensureIndex();
   if (!ready) {
     const reason = typeof searchIndex.getLastError === 'function' ? searchIndex.getLastError() : '';
-    throw new Error(`Manticore index is not ready${reason ? `: ${reason}` : ''}`);
+    throw new Error(`Meilisearch index is not ready${reason ? `: ${reason}` : ''}`);
   }
 
   if (process.argv.includes('--reset')) {

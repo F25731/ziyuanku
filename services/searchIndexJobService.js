@@ -2,7 +2,7 @@ const { pool } = require('../config/db');
 const searchIndex = require('./searchIndexService');
 
 const DEFAULT_BATCH = Math.max(50, Number(process.env.SEARCH_REINDEX_BATCH || 1000));
-const DEFAULT_ATTEMPTS = Math.max(1, Number(process.env.MANTICORE_RETRY_ATTEMPTS || 5));
+const DEFAULT_ATTEMPTS = Math.max(1, Number(process.env.MEILI_RETRY_ATTEMPTS || 5));
 const OUTBOX_MAX_ATTEMPTS = Math.max(1, Number(process.env.SEARCH_OUTBOX_MAX_ATTEMPTS || 10));
 const STALE_SECONDS = Math.max(60, Number(process.env.SEARCH_JOB_STALE_SECONDS || 600));
 
@@ -85,7 +85,7 @@ async function listJobs(limit = 20) {
 
 async function createJob({ mode = 'full', sourceId = null, batchSize = DEFAULT_BATCH, maxAttempts = DEFAULT_ATTEMPTS } = {}) {
   if (!searchIndex.isEnabled()) {
-    throw new Error('Manticore is not enabled; set SEARCH_ENGINE=manticore and MANTICORE_URL first');
+    throw new Error('Meilisearch is not enabled; set SEARCH_ENGINE=meilisearch and MEILI_HOST first');
   }
   const active = await getActiveJob();
   if (active) {
@@ -171,7 +171,7 @@ async function runJob(id) {
     );
     const ready = await searchIndex.waitUntilReady(90000);
     if (!ready) {
-      const err = searchIndex.getLastError() || 'Manticore is not ready';
+      const err = searchIndex.getLastError() || 'Meilisearch is not ready';
       await pool.query(
         `UPDATE search_index_jobs
             SET status='failed', last_error=?, finished_at=NOW()
@@ -184,7 +184,7 @@ async function runJob(id) {
     if (job && job.mode === 'full' && Number(job.start_id || 0) === 0 && Number(job.last_id || 0) === 0 && Number(job.total_seen || 0) === 0) {
       const resetOk = typeof searchIndex.resetIndex === 'function' ? await searchIndex.resetIndex() : true;
       if (!resetOk) {
-        const err = searchIndex.getLastError() || 'Manticore index reset failed';
+        const err = searchIndex.getLastError() || 'Meilisearch index reset failed';
         await pool.query(
           `UPDATE search_index_jobs
               SET status='failed', last_error=?, finished_at=NOW()
@@ -227,7 +227,7 @@ async function runJob(id) {
       let lastErr = '';
       for (let attempt = 1; attempt <= Number(job.max_attempts || DEFAULT_ATTEMPTS); attempt++) {
         if (!(await searchIndex.waitUntilReady(60000))) {
-          lastErr = searchIndex.getLastError() || 'Manticore is not ready';
+          lastErr = searchIndex.getLastError() || 'Meilisearch is not ready';
           await pool.query(
             'UPDATE search_index_jobs SET attempts=attempts+1, last_error=? WHERE id=?',
             [lastErr.slice(0, 1000), id]

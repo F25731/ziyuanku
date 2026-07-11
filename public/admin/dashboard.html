@@ -222,7 +222,7 @@
         </div>
       </section>
 
-      <!-- 搜索索引 / Manticore -->
+      <!-- 搜索索引 / Meilisearch -->
       <section x-show="tab === 'searchindex'" x-transition>
         <div class="bg-white rounded-xl shadow-sm border border-slate-100 p-5 mb-6 relative">
           <div x-show="tabLoading.searchindex" class="absolute inset-0 z-10 bg-white/70 backdrop-blur-sm flex items-center justify-center rounded-xl">
@@ -231,7 +231,7 @@
 
           <div class="flex flex-wrap items-start justify-between gap-4 mb-5">
             <div>
-              <h2 class="text-xl font-bold text-slate-800">Manticore 搜索索引</h2>
+              <h2 class="text-xl font-bold text-slate-800">Meilisearch 搜索索引</h2>
               <p class="text-xs text-slate-500 mt-1">只索引 id、file_name、source_id、file_type；详情仍回 MySQL 查询。</p>
             </div>
             <div class="flex flex-wrap gap-2">
@@ -244,7 +244,7 @@
           <div class="grid grid-cols-2 lg:grid-cols-5 gap-3 mb-5">
             <div class="rounded-lg border border-slate-100 bg-slate-50 p-4">
               <div class="text-xs text-slate-500">引擎</div>
-              <div class="mt-1 font-bold" :class="searchIndex.config.enabled ? 'text-emerald-600' : 'text-rose-600'" x-text="searchIndex.config.enabled ? 'Manticore' : '未启用'"></div>
+              <div class="mt-1 font-bold" :class="searchIndex.config.enabled ? 'text-emerald-600' : 'text-rose-600'" x-text="searchIndex.config.enabled ? 'Meilisearch' : '未启用'"></div>
             </div>
             <div class="rounded-lg border border-slate-100 bg-slate-50 p-4">
               <div class="text-xs text-slate-500">健康</div>

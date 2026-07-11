@@ -1,53 +1,37 @@
 const axios = require('axios');
-const mysql = require('mysql2/promise');
 const { pool } = require('../config/db');
 
 const ENGINE = String(process.env.SEARCH_ENGINE || 'mysql').toLowerCase();
-const BASE_URL = String(process.env.MANTICORE_URL || '').replace(/\/+$/, '');
-const INDEX = process.env.MANTICORE_INDEX || process.env.SEARCH_INDEX || 'lrh_resources';
+const BASE_URL = String(process.env.MEILI_HOST || process.env.MEILISEARCH_HOST || '').replace(/\/+$/, '');
+const MASTER_KEY = process.env.MEILI_MASTER_KEY || process.env.MEILISEARCH_MASTER_KEY || '';
+const INDEX = process.env.MEILI_INDEX || process.env.SEARCH_INDEX || 'lrh_resources';
 const TIMEOUT = Math.max(1000, Number(process.env.SEARCH_TIMEOUT_MS || 30000));
-const BULK_BATCH = Math.max(50, Number(process.env.MANTICORE_BATCH_SIZE || 500));
-const RETRY_ATTEMPTS = Math.max(1, Number(process.env.MANTICORE_RETRY_ATTEMPTS || 5));
-const RETRY_BASE_MS = Math.max(100, Number(process.env.MANTICORE_RETRY_BASE_MS || 500));
+const BULK_BATCH = Math.max(50, Number(process.env.MEILI_BATCH_SIZE || 500));
+const RETRY_ATTEMPTS = Math.max(1, Number(process.env.MEILI_RETRY_ATTEMPTS || 5));
+const RETRY_BASE_MS = Math.max(100, Number(process.env.MEILI_RETRY_BASE_MS || 500));
+const MAX_TOTAL_HITS = Math.max(1000, Number(process.env.MEILI_MAX_TOTAL_HITS || 20000));
 
 let ensured = false;
 let disabledUntil = 0;
 let lastError = '';
-let sqlPool = null;
 
 function isEnabled() {
-  return ENGINE === 'manticore' && !!BASE_URL;
+  return (ENGINE === 'meilisearch' || ENGINE === 'meili') && !!BASE_URL;
 }
 
 function shouldSkip() {
   return !isEnabled() || Date.now() < disabledUntil;
 }
 
-function client() {
-  return axios.create({ baseURL: BASE_URL, timeout: TIMEOUT });
-}
-
-function getSqlConfig() {
-  let host = process.env.MANTICORE_SQL_HOST || 'manticore';
-  try {
-    if (!process.env.MANTICORE_SQL_HOST && BASE_URL) host = new URL(BASE_URL).hostname || host;
-  } catch (_) {}
+function headers(extra = {}) {
   return {
-    host,
-    port: Number(process.env.MANTICORE_SQL_PORT || 9306),
-    user: process.env.MANTICORE_SQL_USER || 'manticore',
-    password: process.env.MANTICORE_SQL_PASSWORD || '',
-    database: process.env.MANTICORE_SQL_DATABASE || 'manticore',
-    waitForConnections: true,
-    connectionLimit: Math.max(1, Number(process.env.MANTICORE_SQL_POOL_LIMIT || 5)),
-    queueLimit: 0,
-    enableKeepAlive: true
+    ...(MASTER_KEY ? { Authorization: `Bearer ${MASTER_KEY}` } : {}),
+    ...extra
   };
 }
 
-function manticoreSqlPool() {
-  if (!sqlPool) sqlPool = mysql.createPool(getSqlConfig());
-  return sqlPool;
+function client(timeout = TIMEOUT) {
+  return axios.create({ baseURL: BASE_URL, timeout, headers: headers() });
 }
 
 function sleep(ms) {
@@ -82,7 +66,7 @@ function coolDown(err, context = '') {
   disabledUntil = Date.now() + 15000;
   lastError = formatError(err);
   if (isRetryableError(err)) ensured = false;
-  console.warn(`[manticore] temporarily disabled${context ? ` ${context}` : ''}: ${lastError}`);
+  console.warn(`[meilisearch] temporarily disabled${context ? ` ${context}` : ''}: ${lastError}`);
 }
 
 function getLastError() {
@@ -91,12 +75,8 @@ function getLastError() {
 
 function safeIndexName(name = INDEX) {
   const s = String(name || '').trim();
-  if (!/^[A-Za-z0-9_]+$/.test(s)) throw new Error('invalid Manticore index name');
+  if (!/^[A-Za-z0-9_-]+$/.test(s)) throw new Error('invalid Meilisearch index name');
   return s;
-}
-
-function sqlString(value) {
-  return `'${String(value == null ? '' : value).replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
 }
 
 function encodeCursor(offset) {
@@ -119,23 +99,39 @@ function decodeCursor(cursor) {
 
 function toDoc(row) {
   return {
+    id: Number(row.id),
     file_name: row.file_name || '',
     source_id: Number(row.source_id) || 0,
     file_type: row.file_type || ''
   };
 }
 
-async function sql(query) {
-  try {
-    const { data } = await client().post('/sql?mode=raw', query, {
-      headers: { 'Content-Type': 'text/plain' }
-    });
-    if (Array.isArray(data)) return data[0] || { data: [] };
-    return data;
-  } catch (httpErr) {
-    const [rows] = await manticoreSqlPool().query(query);
-    return Array.isArray(rows) ? { data: rows } : rows;
+async function request(config, timeout = TIMEOUT) {
+  return client(timeout).request({
+    ...config,
+    headers: headers(config.headers || {})
+  });
+}
+
+async function waitForTask(taskUid, timeoutMs = 90000) {
+  if (taskUid == null) return true;
+  const deadline = Date.now() + Math.max(1000, Number(timeoutMs) || 90000);
+  let errText = '';
+  while (Date.now() < deadline) {
+    try {
+      const { data } = await request({ method: 'GET', url: `/tasks/${taskUid}` });
+      if (data.status === 'succeeded') return true;
+      if (data.status === 'failed' || data.status === 'canceled') {
+        lastError = trimMessage(data.error || data);
+        return false;
+      }
+    } catch (err) {
+      errText = formatError(err);
+    }
+    await sleep(500);
   }
+  lastError = errText || `Meilisearch task ${taskUid} timed out`;
+  return false;
 }
 
 async function waitUntilReady(timeoutMs = 60000) {
@@ -144,15 +140,17 @@ async function waitUntilReady(timeoutMs = 60000) {
   let errText = '';
   while (Date.now() < deadline) {
     try {
-      await sql('SHOW TABLES');
-      lastError = '';
-      return true;
+      const { data } = await request({ method: 'GET', url: '/health' });
+      if (!data || data.status === 'available') {
+        lastError = '';
+        return true;
+      }
     } catch (err) {
       errText = formatError(err);
-      await sleep(1000);
     }
+    await sleep(1000);
   }
-  lastError = errText || 'Manticore is not ready';
+  lastError = errText || 'Meilisearch is not ready';
   return false;
 }
 
@@ -161,13 +159,32 @@ async function ensureIndex() {
   if (shouldSkip()) return false;
   try {
     const index = safeIndexName();
-    await sql(
-      `CREATE TABLE IF NOT EXISTS ${index} (` +
-      'file_name text, ' +
-      'source_id bigint, ' +
-      'file_type string' +
-      ') charset_table=\'non_cjk,cjk\' ngram_len=\'1\' min_infix_len=\'2\''
-    );
+    try {
+      await request({ method: 'GET', url: `/indexes/${encodeURIComponent(index)}` });
+    } catch (err) {
+      if (!err.response || err.response.status !== 404) throw err;
+      const { data } = await request({
+        method: 'POST',
+        url: '/indexes',
+        data: { uid: index, primaryKey: 'id' }
+      });
+      await waitForTask(data.taskUid, 90000);
+    }
+
+    const { data } = await request({
+      method: 'PATCH',
+      url: `/indexes/${encodeURIComponent(index)}/settings`,
+      data: {
+        searchableAttributes: ['file_name'],
+        displayedAttributes: ['id', 'file_name', 'source_id', 'file_type'],
+        filterableAttributes: ['source_id', 'file_type'],
+        sortableAttributes: ['id'],
+        pagination: { maxTotalHits: MAX_TOTAL_HITS },
+        typoTolerance: { enabled: true }
+      }
+    });
+    await waitForTask(data.taskUid, 90000);
+
     ensured = true;
     lastError = '';
     return true;
@@ -179,8 +196,14 @@ async function ensureIndex() {
 
 async function resetIndex() {
   if (shouldSkip()) return false;
+  const index = safeIndexName();
   try {
-    await sql(`DROP TABLE IF EXISTS ${safeIndexName()}`);
+    try {
+      const { data } = await request({ method: 'DELETE', url: `/indexes/${encodeURIComponent(index)}` });
+      await waitForTask(data.taskUid, 90000);
+    } catch (err) {
+      if (!err.response || err.response.status !== 404) throw err;
+    }
     ensured = false;
     return ensureIndex();
   } catch (err) {
@@ -189,26 +212,23 @@ async function resetIndex() {
   }
 }
 
-async function postBulkWithRetry(lines) {
+async function withRetry(label, fn) {
   let lastErr = null;
   for (let attempt = 1; attempt <= RETRY_ATTEMPTS; attempt++) {
     try {
-      return await client().post('/json/bulk', lines.join('\n') + '\n', {
-        headers: { 'Content-Type': 'application/x-ndjson' },
-        timeout: Math.max(TIMEOUT, 60000)
-      });
+      return await fn();
     } catch (err) {
       lastErr = err;
       if (attempt >= RETRY_ATTEMPTS || !isRetryableError(err)) throw err;
       const delay = RETRY_BASE_MS * attempt * attempt;
-      console.warn(`[manticore] retrying bulk index attempt=${attempt + 1}/${RETRY_ATTEMPTS} delay_ms=${delay}: ${formatError(err)}`);
+      console.warn(`[meilisearch] retrying ${label} attempt=${attempt + 1}/${RETRY_ATTEMPTS} delay_ms=${delay}: ${formatError(err)}`);
       await sleep(delay);
     }
   }
   throw lastErr;
 }
 
-async function bulkIndexRows(rows) {
+async function bulkIndexRows(rows, options = {}) {
   if (!Array.isArray(rows) || !rows.length || shouldSkip()) return false;
   const ok = await ensureIndex();
   if (!ok) return false;
@@ -217,17 +237,19 @@ async function bulkIndexRows(rows) {
   for (let i = 0; i < rows.length; i += BULK_BATCH) {
     const docs = rows.slice(i, i + BULK_BATCH)
       .filter((row) => !Number(row.is_deleted || 0))
-      .map((row) => ({ id: Number(row.id), doc: toDoc(row) }))
-      .filter((doc) => doc.id && doc.doc.file_name);
+      .map(toDoc)
+      .filter((doc) => doc.id && doc.file_name);
     if (!docs.length) continue;
 
-    const lines = docs.map((doc) => JSON.stringify({
-      replace: { index, id: doc.id, doc: doc.doc }
-    }));
     try {
-      const { data } = await postBulkWithRetry(lines);
-      if (Array.isArray(data && data.errors) && data.errors.length) {
-        throw new Error(`bulk errors: ${trimMessage(data.errors)}`);
+      const { data } = await withRetry('bulk index', () => request({
+        method: 'POST',
+        url: `/indexes/${encodeURIComponent(index)}/documents?primaryKey=id`,
+        data: docs
+      }, Math.max(TIMEOUT, 60000)));
+      if (options.waitTasks !== false) {
+        const taskOk = await waitForTask(data.taskUid, Math.max(TIMEOUT, 90000));
+        if (!taskOk) throw new Error(lastError || `Meilisearch task ${data.taskUid} failed`);
       }
     } catch (err) {
       const firstId = docs[0] && docs[0].id;
@@ -257,7 +279,11 @@ async function deleteResource(id) {
   const ok = await ensureIndex();
   if (!ok) return false;
   try {
-    await sql(`DELETE FROM ${safeIndexName()} WHERE id = ${Number(id)}`);
+    const { data } = await request({
+      method: 'DELETE',
+      url: `/indexes/${encodeURIComponent(safeIndexName())}/documents/${Number(id)}`
+    });
+    await waitForTask(data.taskUid, 60000);
     return true;
   } catch (err) {
     coolDown(err, `while deleting id=${id}`);
@@ -281,19 +307,19 @@ async function fetchResourcesByIds(ids) {
   return uniq.map((id) => byId.get(id)).filter(Boolean);
 }
 
-function buildWhere({ q, sourceId, allowedSourceIds }) {
-  const parts = [`MATCH(${sqlString(q)})`];
+function buildFilter({ sourceId, allowedSourceIds }) {
+  const parts = [];
   if (sourceId) {
     const sid = Number(sourceId);
     if (Array.isArray(allowedSourceIds) && allowedSourceIds.length > 0 && !allowedSourceIds.includes(sid)) {
-      return { blocked: true, where: '' };
+      return { blocked: true, filter: null };
     }
     parts.push(`source_id = ${sid}`);
   } else if (Array.isArray(allowedSourceIds) && allowedSourceIds.length > 0) {
     const ids = allowedSourceIds.map(Number).filter(Boolean);
-    if (ids.length) parts.push(`source_id IN (${ids.join(',')})`);
+    if (ids.length) parts.push(`source_id IN [${ids.join(', ')}]`);
   }
-  return { blocked: false, where: parts.join(' AND ') };
+  return { blocked: false, filter: parts.length ? parts : null };
 }
 
 async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = null, allowedSourceIds = null, cap = 0, cursor = null, skipTotal = false }) {
@@ -303,7 +329,7 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
   const ok = await ensureIndex();
   if (!ok) return null;
 
-  const { blocked, where } = buildWhere({ q, sourceId, allowedSourceIds });
+  const { blocked, filter } = buildFilter({ sourceId, allowedSourceIds });
   const capN = Math.max(0, Number(cap) || 0);
   if (blocked) {
     return {
@@ -312,7 +338,7 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
       capped: false,
       cap_limit: capN,
       processing_ms: 0,
-      engine: 'manticore_scope_block',
+      engine: 'meilisearch_scope_block',
       next_cursor: null,
       has_more: false
     };
@@ -328,28 +354,37 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
       capped: true,
       cap_limit: capN,
       processing_ms: 0,
-      engine: 'manticore',
+      engine: 'meilisearch',
       next_cursor: null,
       has_more: false
     };
   }
 
   const limit = capN > 0 ? Math.min(requestedSize + 1, capN - offset + 1) : requestedSize + 1;
-  const maxMatches = Math.max(1000, capN || Number(process.env.MANTICORE_MAX_MATCHES || 20000));
   const t0 = Date.now();
   try {
-    const data = await sql(
-      `SELECT id FROM ${safeIndexName()} WHERE ${where} LIMIT ${offset}, ${limit} OPTION max_matches=${maxMatches}`
-    );
-    const rows = Array.isArray(data && data.data) ? data.data : [];
-    const hasMore = rows.length > requestedSize;
-    const visibleRows = hasMore ? rows.slice(0, requestedSize) : rows;
-    const ids = visibleRows.map((h) => Number(h.id)).filter(Boolean);
+    const { data } = await request({
+      method: 'POST',
+      url: `/indexes/${encodeURIComponent(safeIndexName())}/search`,
+      data: {
+        q,
+        offset,
+        limit,
+        filter,
+        attributesToRetrieve: ['id'],
+        showRankingScore: false
+      }
+    });
+
+    const hits = Array.isArray(data.hits) ? data.hits : [];
+    const hasMore = hits.length > requestedSize;
+    const visibleHits = hasMore ? hits.slice(0, requestedSize) : hits;
+    const ids = visibleHits.map((h) => Number(h.id)).filter(Boolean);
     const items = await fetchResourcesByIds(ids);
-    const rawTotal = Number(data && data.total_found || data && data.total || 0);
+    const rawTotal = Number(data.estimatedTotalHits || data.totalHits || 0);
     const total = skipTotal ? null : (capN > 0 ? Math.min(rawTotal, capN) : rawTotal);
     const capped = !!(capN > 0 && rawTotal > capN);
-    const nextOffset = offset + visibleRows.length;
+    const nextOffset = offset + visibleHits.length;
 
     return {
       total,
@@ -357,7 +392,7 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
       capped,
       cap_limit: capN,
       processing_ms: Date.now() - t0,
-      engine: 'manticore',
+      engine: 'meilisearch',
       next_cursor: hasMore ? encodeCursor(nextOffset) : null,
       has_more: hasMore
     };
@@ -369,23 +404,35 @@ async function searchResources({ q = '', page = 1, pageSize = 20, sourceId = nul
 
 async function getDocCount() {
   try {
-    const data = await sql(`SELECT COUNT(*) AS total FROM ${safeIndexName()}`);
-    const rows = Array.isArray(data && data.data) ? data.data : [];
-    return Number(rows[0] && rows[0].total || 0);
+    const { data } = await request({ method: 'GET', url: `/indexes/${encodeURIComponent(safeIndexName())}/stats` });
+    return Number(data.numberOfDocuments || 0);
   } catch (err) {
     return null;
+  }
+}
+
+async function getTaskSummary() {
+  try {
+    const { data } = await request({ method: 'GET', url: '/tasks?limit=100&statuses=enqueued,processing' });
+    const results = Array.isArray(data.results) ? data.results : [];
+    return {
+      processing: results.filter((t) => t.status === 'processing').length,
+      enqueued: results.filter((t) => t.status === 'enqueued').length
+    };
+  } catch (_) {
+    return { processing: 0, enqueued: 0 };
   }
 }
 
 async function getOverview() {
   const config = getConfig();
   if (!config.enabled) {
-    return { config, health: { ok: false, message: 'Manticore is not enabled' }, index: null };
+    return { config, health: { ok: false, message: 'Meilisearch is not enabled' }, index: null };
   }
   const overview = { config, health: { ok: false }, index: null, tasks: null, task_summary: { processing: 0, enqueued: 0 } };
   try {
-    await sql('SHOW TABLES');
-    overview.health = { ok: true, status: 'available' };
+    const { data } = await request({ method: 'GET', url: '/health' });
+    overview.health = { ok: !data || data.status === 'available', status: data && data.status || 'available' };
   } catch (err) {
     overview.health = { ok: false, error: formatError(err) };
     return overview;
@@ -396,6 +443,7 @@ async function getOverview() {
     isIndexing: false,
     fieldDistribution: count == null ? {} : { id: count, file_name: count, source_id: count, file_type: count }
   };
+  overview.task_summary = await getTaskSummary();
   return overview;
 }
 
@@ -405,10 +453,11 @@ function getConfig() {
     enabled: isEnabled(),
     url: BASE_URL,
     index: INDEX,
-    has_master_key: false,
+    has_master_key: !!MASTER_KEY,
     batch_size: BULK_BATCH,
     retry_attempts: RETRY_ATTEMPTS,
     retry_base_ms: RETRY_BASE_MS,
+    max_total_hits: MAX_TOTAL_HITS,
     disabled_until: disabledUntil,
     last_error: lastError
   };

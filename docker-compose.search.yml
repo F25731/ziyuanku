@@ -1,26 +1,19 @@
 services:
-  manticore:
-    image: manticoresearch/manticore:latest
-    container_name: lrh-manticore
+  meilisearch:
+    image: getmeili/meilisearch:latest
+    container_name: lrh-meilisearch
     restart: unless-stopped
     environment:
-      EXTRA: 1
+      MEILI_ENV: production
+      MEILI_NO_ANALYTICS: "true"
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
       TZ: Asia/Shanghai
-    ulimits:
-      nproc: 65535
-      nofile:
-        soft: 65535
-        hard: 65535
-      memlock:
-        soft: -1
-        hard: -1
-    mem_limit: ${MANTICORE_MEMORY_LIMIT:-2g}
     volumes:
-      - manticore_data:/var/lib/manticore
+      - meili_data:/meili_data
     deploy:
       resources:
         limits:
-          memory: ${MANTICORE_MEMORY_LIMIT:-2g}
+          memory: ${MEILI_MEMORY_LIMIT:-512m}
     networks: [internal]
 
   app:
@@ -29,15 +22,16 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      manticore:
+      meilisearch:
         condition: service_started
     environment:
-      SEARCH_ENGINE: manticore
-      MANTICORE_URL: http://manticore:9308
-      MANTICORE_INDEX: ${MANTICORE_INDEX:-lrh_resources}
-      MANTICORE_BATCH_SIZE: ${MANTICORE_BATCH_SIZE:-1000}
-      MANTICORE_RETRY_ATTEMPTS: ${MANTICORE_RETRY_ATTEMPTS:-5}
-      MANTICORE_MAX_MATCHES: ${MANTICORE_MAX_MATCHES:-20000}
+      SEARCH_ENGINE: meilisearch
+      MEILI_HOST: http://meilisearch:7700
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      MEILI_INDEX: ${MEILI_INDEX:-lrh_resources}
+      MEILI_BATCH_SIZE: ${MEILI_BATCH_SIZE:-1000}
+      MEILI_RETRY_ATTEMPTS: ${MEILI_RETRY_ATTEMPTS:-5}
+      MEILI_MAX_TOTAL_HITS: ${MEILI_MAX_TOTAL_HITS:-20000}
       SEARCH_TIMEOUT_MS: ${SEARCH_TIMEOUT_MS:-30000}
       SEARCH_OUTBOX_WORKER_ENABLED: "0"
 
@@ -48,7 +42,7 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
-      manticore:
+      meilisearch:
         condition: service_started
       app:
         condition: service_started
@@ -65,12 +59,13 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_PASSWORD: ""
-      SEARCH_ENGINE: manticore
-      MANTICORE_URL: http://manticore:9308
-      MANTICORE_INDEX: ${MANTICORE_INDEX:-lrh_resources}
-      MANTICORE_BATCH_SIZE: ${MANTICORE_BATCH_SIZE:-1000}
-      MANTICORE_RETRY_ATTEMPTS: ${MANTICORE_RETRY_ATTEMPTS:-5}
-      MANTICORE_MAX_MATCHES: ${MANTICORE_MAX_MATCHES:-20000}
+      SEARCH_ENGINE: meilisearch
+      MEILI_HOST: http://meilisearch:7700
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      MEILI_INDEX: ${MEILI_INDEX:-lrh_resources}
+      MEILI_BATCH_SIZE: ${MEILI_BATCH_SIZE:-1000}
+      MEILI_RETRY_ATTEMPTS: ${MEILI_RETRY_ATTEMPTS:-5}
+      MEILI_MAX_TOTAL_HITS: ${MEILI_MAX_TOTAL_HITS:-20000}
       SEARCH_TIMEOUT_MS: ${SEARCH_TIMEOUT_MS:-30000}
       SEARCH_OUTBOX_BATCH: ${SEARCH_OUTBOX_BATCH:-500}
       SEARCH_OUTBOX_INTERVAL_MS: ${SEARCH_OUTBOX_INTERVAL_MS:-5000}
@@ -86,4 +81,4 @@ services:
     networks: [internal]
 
 volumes:
-  manticore_data:
+  meili_data:

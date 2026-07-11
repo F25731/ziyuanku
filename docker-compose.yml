@@ -64,7 +64,7 @@ services:
     environment:
       NODE_ENV: production
       # 1.9G 总内存的轻量服务器：mysql ~300M、redis ~30M，app 给 Node 上限 768M
-      # 默认用 MySQL FULLTEXT；启用 docker-compose.search.yml 后搜索走轻量 Manticore
+      # 默认用 MySQL FULLTEXT；启用 docker-compose.search.yml 后搜索走 Meilisearch
       NODE_OPTIONS: --max-old-space-size=768
       PORT: 3000
       TZ: Asia/Shanghai
@@ -92,11 +92,12 @@ services:
       STATS_TREND_CACHE_TTL: ${STATS_TREND_CACHE_TTL:-300}
       STATS_RESOURCE_EXACT: ${STATS_RESOURCE_EXACT:-0}
       SEARCH_ENGINE: ${SEARCH_ENGINE:-mysql}
-      MANTICORE_URL: ${MANTICORE_URL:-}
-      MANTICORE_INDEX: ${MANTICORE_INDEX:-lrh_resources}
-      MANTICORE_BATCH_SIZE: ${MANTICORE_BATCH_SIZE:-1000}
-      MANTICORE_RETRY_ATTEMPTS: ${MANTICORE_RETRY_ATTEMPTS:-5}
-      MANTICORE_MAX_MATCHES: ${MANTICORE_MAX_MATCHES:-20000}
+      MEILI_HOST: ${MEILI_HOST:-}
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-}
+      MEILI_INDEX: ${MEILI_INDEX:-lrh_resources}
+      MEILI_BATCH_SIZE: ${MEILI_BATCH_SIZE:-1000}
+      MEILI_RETRY_ATTEMPTS: ${MEILI_RETRY_ATTEMPTS:-5}
+      MEILI_MAX_TOTAL_HITS: ${MEILI_MAX_TOTAL_HITS:-20000}
       SEARCH_TIMEOUT_MS: ${SEARCH_TIMEOUT_MS:-5000}
       SEARCH_CACHE_ENABLED: ${SEARCH_CACHE_ENABLED:-1}
       SEARCH_CACHE_TTL: ${SEARCH_CACHE_TTL:-60}

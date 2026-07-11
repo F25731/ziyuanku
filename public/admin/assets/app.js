@@ -92,7 +92,7 @@ function dashboard() {
     navs: [
       { key: 'dashboard', label: '仪表盘', desc: '资源库运行总览', icon: ICON.dashboard },
       { key: 'resources', label: '资源管理', desc: '库内所有资源的检索和维护', icon: ICON.resources },
-      { key: 'searchindex', label: '搜索索引', desc: 'Manticore 配置、状态、重建与增量补扫', icon: ICON.search },
+      { key: 'searchindex', label: '搜索索引', desc: 'Meilisearch 配置、状态、重建与增量补扫', icon: ICON.search },
       { key: 'sources',   label: '数据来源', desc: '蓝奏账号、分享链接来源配置', icon: ICON.sources },
       { key: 'apikeys',   label: 'API Key', desc: '对外开放的调用密钥，接入软件站时签发', icon: ICON.apikeys },
       { key: 'synclogs',  label: '同步日志', desc: '每次拉取蓝奏账号的记录', icon: ICON.synclogs },
@@ -153,7 +153,7 @@ function dashboard() {
     tabLoading: { resources: false, searchindex: false, sources: false, apikeys: false, synclogs: false, calllogs: false, dashboard: false },
     // 搜索防抖计时器
     _searchDebounce: null,
-    searchEngine: '', // 'manticore' / 'mysql'，搜完后显示
+    searchEngine: '', // 'meilisearch' / 'mysql'，搜完后显示
     searchMs: 0,
 
     docs: window.LRH_DOCS || { endpoints: [], examples: {}, errors: [], notes: [] },
@@ -724,7 +724,7 @@ function dashboard() {
       finally { this.tabLoading.calllogs = false; }
     },
 
-    // ---------- Manticore 搜索索引 ----------
+    // ---------- Meilisearch 搜索索引 ----------
     async loadSearchIndexStatus(silent = false) {
       if (!silent) this.tabLoading.searchindex = true;
       try {
@@ -759,7 +759,7 @@ function dashboard() {
       return ({ queued: '排队中', running: '运行中', completed: '已完成', failed: '失败', paused: '已暂停', apply_queued: '应用排队中', applying: '应用中' })[status] || status || '-';
     },
     async startSearchIndexJob(mode) {
-      if (mode === 'full' && !confirm('全量重建会从资源表头部重新扫描并覆盖写入 Manticore，继续？')) return;
+      if (mode === 'full' && !confirm('全量重建会从资源表头部重新扫描并覆盖写入 Meilisearch，继续？')) return;
       const f = this.searchIndex.form;
       try {
         const d = await api('/search/jobs', {
