@@ -36,6 +36,9 @@ If the server has more RAM, you can raise the Meilisearch memory limit in `.env`
 ```env
 MEILI_MEMORY_LIMIT=1g
 MEILI_BATCH_SIZE=2000
+MEILI_MAX_INDEXING_MEMORY=256Mb
+MEILI_MAX_INDEXING_THREADS=1
+MEILI_EXPERIMENTAL_REDUCE_INDEXING_MEMORY_USAGE=true
 ```
 
 ## Verify
